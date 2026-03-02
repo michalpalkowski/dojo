@@ -16,5 +16,8 @@ dojo_cairo_macros = { path = "../macros", version = "1.8.0" }
 
 [lib]
 
+[features]
+sharding = []
+
 [[target.starknet-contract]]
 sierra = true

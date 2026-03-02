@@ -87,4 +87,10 @@ mod tests {
         mod storage;
         mod world;
     }
+
+    mod sharding {
+        mod slot;
+        mod component;
+        mod request;
+    }
 }

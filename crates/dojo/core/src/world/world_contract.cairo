@@ -17,6 +17,22 @@ impl PermissionDisplay of Display<Permission> {
     }
 }
 
+use dojo::sharding::crdt::CRDType;
+use starknet::ContractAddress;
+
+/// Subset of sharding component methods exposed for the sharding proxy.
+/// The proxy calls these to update/cancel shard state after settlement.
+#[starknet::interface]
+pub trait IShardingProxy<T> {
+    fn initialize_shard(
+        ref self: T,
+        sharding_contract_address: ContractAddress,
+        contract_slots_changes: Span<CRDType>,
+    );
+    fn update_shard_state(ref self: T, storage_changes: Array<(felt252, felt252)>);
+    fn cancel_shard_state(ref self: T, slots: Span<felt252>);
+}
+
 #[starknet::contract]
 pub mod world {
     use core::array::ArrayTrait;
@@ -52,6 +68,13 @@ pub mod world {
     use starknet::{ClassHash, ContractAddress, SyscallResultTrait, get_caller_address, get_tx_info};
     use super::Permission;
 
+    use dojo::sharding::component::sharding_component as sharding_cpt;
+    use dojo::sharding::crdt::CRDType;
+    use dojo::sharding::request::{ShardModel, CRDVariant};
+    use dojo::sharding::slot::compute_dojo_field_slot;
+
+    component!(path: sharding_cpt, storage: sharding, event: ShardingEvent);
+
     pub const WORLD: felt252 = 0;
     pub const DOJO_INIT_SELECTOR: felt252 = selector!("dojo_init");
     pub const WORLD_VERSION: felt252 = '1.8.0';
@@ -80,6 +103,8 @@ pub mod world {
         StoreDelRecord: StoreDelRecord,
         WriterUpdated: WriterUpdated,
         OwnerUpdated: OwnerUpdated,
+        #[flat]
+        ShardingEvent: sharding_cpt::Event,
     }
 
     #[derive(Drop, starknet::Event)]
@@ -284,6 +309,8 @@ pub mod world {
         writers: Map<(felt252, ContractAddress), bool>,
         owner_count: Map<felt252, u64>,
         initialized_contracts: Map<felt252, bool>,
+        #[substorage(v0)]
+        sharding: sharding_cpt::Storage,
     }
 
     /// Constructor for the world contract.
@@ -1144,6 +1171,70 @@ pub mod world {
         fn resource(self: @ContractState, selector: felt252) -> Resource {
             self.resources.read(selector)
         }
+
+        fn request_sharding(
+            ref self: ContractState, proxy: ContractAddress, models: Span<ShardModel>,
+        ) {
+            let world_addr = starknet::get_contract_address();
+            let mut all_slots: Array<CRDType> = ArrayTrait::new();
+
+            for model in models {
+                let model = *model;
+
+                // Verify model is registered.
+                match self.resources.read(model.selector) {
+                    Resource::Model(_) => {},
+                    _ => {
+                        panic_with_byte_array(
+                            @errors::resource_conflict(
+                                @format!("{}", model.selector), @"model",
+                            ),
+                        )
+                    },
+                };
+
+                // Caller must have writer permission for this model.
+                self.assert_caller_permissions(model.selector, Permission::Writer);
+
+                // Compute entity_id from keys.
+                let entity_id = entity_id_from_serialized_keys(model.keys);
+
+                // Use caller-provided layout to compute storage slots.
+                // The layout MUST come from Model::<M>::layout() called locally in the
+                // game contract. Cross-contract IStoredResource::layout() calls can
+                // return different field selectors due to per-class compilation differences.
+                if let Layout::Struct(fields) = model.layout {
+                    for field in fields {
+                        let field = *field;
+                        let slot = compute_dojo_field_slot(
+                            model.selector, entity_id, field.selector,
+                        );
+                        let crd_type = match model.crdt {
+                            CRDVariant::Set => CRDType::Set((world_addr, slot)),
+                            CRDVariant::Add => CRDType::Add((world_addr, slot)),
+                            CRDVariant::Lock => CRDType::Lock((world_addr, slot)),
+                            CRDVariant::SetLock => CRDType::SetLock((world_addr, slot)),
+                            // PN-Counter: both P and N fields are G-Counters (Add).
+                            CRDVariant::PNCounter => CRDType::Add((world_addr, slot)),
+                        };
+                        all_slots.append(crd_type);
+                    }
+                } else {
+                    panic_with_byte_array(
+                        @format!(
+                            "Model {} has unsupported layout (expected Struct)", model.selector,
+                        ),
+                    );
+                }
+            };
+
+            // Forward all computed slots to the sharding component.
+            self.sharding.initialize_shard(proxy, all_slots.span());
+        }
+
+        fn end_shard(ref self: ContractState) {
+            self.sharding.end_shard();
+        }
     }
 
     #[abi(embed_v0)]
@@ -1158,6 +1249,33 @@ pub mod world {
             replace_class_syscall(new_class_hash).unwrap();
 
             self.emit(WorldUpgraded { class_hash: new_class_hash });
+        }
+    }
+
+    // Instantiate the component impl (not ABI-exposed) so self.sharding.xxx() works.
+    impl ShardingComponentImpl = sharding_cpt::ContractComponentImpl<ContractState>;
+
+    /// Sharding component methods callable by the sharding proxy.
+    /// Access control is handled inside the component (caller == sharding_contract_address).
+    /// `request_sharding` and `end_shard` are exposed via IWorld with model-level access control.
+    #[abi(embed_v0)]
+    impl ShardingProxyImpl of super::IShardingProxy<ContractState> {
+        fn initialize_shard(
+            ref self: ContractState,
+            sharding_contract_address: ContractAddress,
+            contract_slots_changes: Span<CRDType>,
+        ) {
+            self.sharding.initialize_shard(sharding_contract_address, contract_slots_changes);
+        }
+
+        fn update_shard_state(
+            ref self: ContractState, storage_changes: Array<(felt252, felt252)>,
+        ) {
+            self.sharding.update_shard_state(storage_changes);
+        }
+
+        fn cancel_shard_state(ref self: ContractState, slots: Span<felt252>) {
+            self.sharding.cancel_shard_state(slots);
         }
     }
 

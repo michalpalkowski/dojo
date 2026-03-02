@@ -99,6 +99,16 @@ pub mod utils {
     pub use serde::{deserialize_unwrap, serialize_inline};
 }
 
+pub mod sharding {
+    pub mod slot;
+    pub use slot::compute_dojo_field_slot;
+
+    pub mod crdt;
+    pub mod interface;
+    pub mod component;
+    pub mod request;
+}
+
 pub mod world {
     pub(crate) mod errors;
 

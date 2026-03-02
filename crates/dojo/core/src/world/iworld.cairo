@@ -2,6 +2,7 @@
 
 use dojo::meta::Layout;
 use dojo::model::{ModelIndex, ResourceMetadata};
+use dojo::sharding::request::ShardModel;
 use starknet::{ClassHash, ContractAddress};
 use super::resource::Resource;
 
@@ -345,6 +346,22 @@ pub trait IWorld<T> {
     /// * `resource` - The selector of the resource.
     /// * `contract` - The address of the contract to revoke writer permission from.
     fn revoke_writer(ref self: T, resource: felt252, contract: ContractAddress);
+
+    /// Requests sharding for the given models.
+    ///
+    /// Auto-computes storage slots from model layouts and forwards to the sharding proxy.
+    /// Caller must have writer permission for each model being sharded.
+    ///
+    /// # Arguments
+    ///
+    /// * `proxy` - The address of the sharding proxy contract.
+    /// * `models` - The models to shard with their CRDT strategies.
+    fn request_sharding(ref self: T, proxy: ContractAddress, models: Span<ShardModel>);
+
+    /// Ends the current shard session.
+    ///
+    /// Forwards to the sharding proxy to finalize the shard.
+    fn end_shard(ref self: T);
 }
 
 #[starknet::interface]
