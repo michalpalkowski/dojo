@@ -17,18 +17,12 @@ impl PermissionDisplay of Display<Permission> {
     }
 }
 
-use dojo::sharding::crdt::CRDType;
-use starknet::ContractAddress;
-
-/// Subset of sharding component methods exposed for the sharding proxy.
-/// The proxy calls these to update/cancel shard state after settlement.
+/// Methods exposed for the sharding proxy (operator's contract).
+/// Called by the proxy after settlement to apply or cancel storage changes.
+/// Access control is enforced inside the sharding component:
+/// caller must equal the `sharding_contract_address` set during `request_sharding`.
 #[starknet::interface]
 pub trait IShardingProxy<T> {
-    fn initialize_shard(
-        ref self: T,
-        sharding_contract_address: ContractAddress,
-        contract_slots_changes: Span<CRDType>,
-    );
     fn update_shard_state(ref self: T, storage_changes: Array<(felt252, felt252)>);
     fn cancel_shard_state(ref self: T, slots: Span<felt252>);
 }
@@ -1255,19 +1249,11 @@ pub mod world {
     // Instantiate the component impl (not ABI-exposed) so self.sharding.xxx() works.
     impl ShardingComponentImpl = sharding_cpt::ContractComponentImpl<ContractState>;
 
-    /// Sharding component methods callable by the sharding proxy.
-    /// Access control is handled inside the component (caller == sharding_contract_address).
-    /// `request_sharding` and `end_shard` are exposed via IWorld with model-level access control.
+    /// Sharding component methods callable by the sharding proxy (operator's contract).
+    /// Access control is enforced inside the component: caller must equal the
+    /// `sharding_contract_address` set when `request_sharding` was first called.
     #[abi(embed_v0)]
     impl ShardingProxyImpl of super::IShardingProxy<ContractState> {
-        fn initialize_shard(
-            ref self: ContractState,
-            sharding_contract_address: ContractAddress,
-            contract_slots_changes: Span<CRDType>,
-        ) {
-            self.sharding.initialize_shard(sharding_contract_address, contract_slots_changes);
-        }
-
         fn update_shard_state(
             ref self: ContractState, storage_changes: Array<(felt252, felt252)>,
         ) {

@@ -10,11 +10,6 @@ pub trait IContractComponent<TContractState> {
     );
     fn update_shard_state(ref self: TContractState, storage_changes: Array<(slot_key, slot_value)>);
     fn cancel_shard_state(ref self: TContractState, slots: Span<felt252>);
-    fn request_sharding(
-        ref self: TContractState,
-        sharding_contract_address: ContractAddress,
-        storage_slots: Span<CRDType>,
-    );
     fn end_shard(ref self: TContractState);
 }
 
@@ -197,14 +192,6 @@ pub mod sharding_component {
                     self.slots.write(slot_key, (crd_type, new_init_count));
                 }
             }
-        }
-
-        fn request_sharding(
-            ref self: ComponentState<TContractState>,
-            sharding_contract_address: ContractAddress,
-            storage_slots: Span<CRDType>,
-        ) {
-            self.initialize_shard(sharding_contract_address, storage_slots);
         }
 
         fn end_shard(ref self: ComponentState<TContractState>) {
