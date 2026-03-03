@@ -1,7 +1,7 @@
 use dojo::model::{Model, ModelStorage, ModelStorageTest};
 use dojo::sharding::component::{IContractComponentDispatcher, IContractComponentDispatcherTrait};
 use dojo::sharding::compute_dojo_field_slot;
-use dojo::sharding::request::IntoShardModel;
+use dojo::sharding::request::{IntoShardModel, IntoShardField, ShardModel};
 use dojo::utils::entity_id_from_keys;
 use dojo::world::IWorldDispatcherTrait;
 use dojo_snf_test::declare_and_deploy;
@@ -211,6 +211,56 @@ fn test_request_sharding_pn_counter_burn_only() {
     let result: Foo = world.read_model(bob);
     assert(result.a == 1000, 'PN burn: P should be unchanged');
     assert(result.b == 500, 'PN burn: N delta incorrect');
+}
+
+/// Test: per-field CRDT — field `a` as Add (delta merge), field `b` as Set (overwrite).
+///
+/// This tests the new per-field CRDT feature where different fields of the same model
+/// can use different merge strategies.
+#[test]
+fn test_per_field_crdt_mixed() {
+    let (mut world, model_selector) = deploy_world_and_foo();
+    let world_address = world.dispatcher.contract_address;
+
+    let bob: ContractAddress = 0xb0b.try_into().unwrap();
+    let foo = Foo { caller: bob, a: 100, b: 200 };
+    world.write_model_test(@foo);
+
+    let proxy_address = declare_and_deploy("mock_sharding_proxy");
+
+    // Per-field: field a → Add, field b → Set.
+    let (sel_a, sel_b) = foo_field_selectors();
+    let models = [
+        ShardModel {
+            selector: model_selector,
+            keys: [bob.into()].span(),
+            fields: [sel_a.as_add(), sel_b.as_set()].span(),
+        },
+    ]
+        .span();
+    world.dispatcher.request_sharding(proxy_address, models);
+
+    // Mainchain changes a from 100 → 120 while shard is active.
+    let foo_updated = Foo { caller: bob, a: 120, b: 200 };
+    world.write_model_test(@foo_updated);
+
+    // Shard saw initial a=100, produced shard a=150 (delta=50).
+    // Shard overwrites b=999 (Set).
+    let entity_id = entity_id_from_keys(@bob);
+    let slot_a = compute_dojo_field_slot(model_selector, entity_id, sel_a);
+    let slot_b = compute_dojo_field_slot(model_selector, entity_id, sel_b);
+
+    let sharding = IContractComponentDispatcher { contract_address: world_address };
+
+    snforge_std::start_cheat_caller_address(world_address, proxy_address);
+    sharding.update_shard_state(array![(slot_a, 150), (slot_b, 999)]);
+    snforge_std::stop_cheat_caller_address(world_address);
+
+    // a: current(120) + (shard(150) - initial(100)) = 170 (Add delta)
+    // b: 999 (Set overwrite)
+    let result: Foo = world.read_model(bob);
+    assert(result.a == 170, 'Add delta incorrect');
+    assert(result.b == 999, 'Set should overwrite');
 }
 
 /// Test: end_shard forwards to the proxy.

@@ -1193,32 +1193,21 @@ pub mod world {
                 // Compute entity_id from keys.
                 let entity_id = entity_id_from_serialized_keys(model.keys);
 
-                // Use caller-provided layout to compute storage slots.
-                // The layout MUST come from Model::<M>::layout() called locally in the
-                // game contract. Cross-contract IStoredResource::layout() calls can
-                // return different field selectors due to per-class compilation differences.
-                if let Layout::Struct(fields) = model.layout {
-                    for field in fields {
-                        let field = *field;
-                        let slot = compute_dojo_field_slot(
-                            model.selector, entity_id, field.selector,
-                        );
-                        let crd_type = match model.crdt {
-                            CRDVariant::Set => CRDType::Set((world_addr, slot)),
-                            CRDVariant::Add => CRDType::Add((world_addr, slot)),
-                            CRDVariant::Lock => CRDType::Lock((world_addr, slot)),
-                            CRDVariant::SetLock => CRDType::SetLock((world_addr, slot)),
-                            // PN-Counter: both P and N fields are G-Counters (Add).
-                            CRDVariant::PNCounter => CRDType::Add((world_addr, slot)),
-                        };
-                        all_slots.append(crd_type);
-                    }
-                } else {
-                    panic_with_byte_array(
-                        @format!(
-                            "Model {} has unsupported layout (expected Struct)", model.selector,
-                        ),
+                // Each ShardField carries its own field selector and CRDT variant.
+                // The caller is responsible for providing correct selectors (from
+                // Model::<M>::layout() called locally, or via IntoShardField helpers).
+                for shard_field in model.fields {
+                    let shard_field = *shard_field;
+                    let slot = compute_dojo_field_slot(
+                        model.selector, entity_id, shard_field.selector,
                     );
+                    let crd_type = match shard_field.crdt {
+                        CRDVariant::Set => CRDType::Set((world_addr, slot)),
+                        CRDVariant::Add => CRDType::Add((world_addr, slot)),
+                        CRDVariant::Lock => CRDType::Lock((world_addr, slot)),
+                        CRDVariant::SetLock => CRDType::SetLock((world_addr, slot)),
+                    };
+                    all_slots.append(crd_type);
                 }
             };
 
