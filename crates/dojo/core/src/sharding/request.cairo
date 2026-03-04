@@ -1,4 +1,5 @@
 use dojo::meta::Layout;
+use dojo::sharding::slot::PACKED_SLOT_BASE;
 
 /// Lightweight CRDT variant selector (no address/slot — just the type).
 ///
@@ -92,17 +93,30 @@ pub struct ShardModel {
 
 /// Expands a model `Layout` into `Span<ShardField>` with a uniform CRDT for all fields.
 ///
-/// Only supports `Layout::Struct` — panics on other layout types.
-/// Used internally by `IntoShardModel` helpers.
+/// Supports `Layout::Struct` (per-field selectors) and `Layout::Fixed` (packed models).
+/// For packed models, generates sentinel selectors (`PACKED_SLOT_BASE + offset`) that
+/// `request_sharding` maps to the correct packed storage slots.
 fn expand_layout(layout: Layout, crdt: CRDVariant) -> Span<ShardField> {
-    if let Layout::Struct(fields) = layout {
-        let mut result: Array<ShardField> = ArrayTrait::new();
-        for field in fields {
-            result.append(ShardField { selector: (*field).selector, crdt });
-        };
-        result.span()
-    } else {
-        panic!("ShardModel: expected Layout::Struct")
+    match layout {
+        Layout::Struct(fields) => {
+            let mut result: Array<ShardField> = ArrayTrait::new();
+            for field in fields {
+                result.append(ShardField { selector: (*field).selector, crdt });
+            };
+            result.span()
+        },
+        Layout::Fixed(sizes) => {
+            let mut sizes = sizes;
+            let num_slots = dojo::storage::packing::calculate_packed_size(ref sizes);
+            let mut result: Array<ShardField> = ArrayTrait::new();
+            let mut i: u32 = 0;
+            while i < num_slots {
+                result.append(ShardField { selector: PACKED_SLOT_BASE + i.into(), crdt });
+                i += 1;
+            };
+            result.span()
+        },
+        _ => panic!("ShardModel: unsupported layout type"),
     }
 }
 

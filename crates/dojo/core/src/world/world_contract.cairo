@@ -65,7 +65,9 @@ pub mod world {
     use dojo::sharding::component::sharding_component as sharding_cpt;
     use dojo::sharding::crdt::CRDType;
     use dojo::sharding::request::{ShardModel, CRDVariant};
-    use dojo::sharding::slot::compute_dojo_field_slot;
+    use dojo::sharding::slot::{
+        PACKED_SLOT_BASE, compute_dojo_field_slot, compute_dojo_packed_slot, is_packed_selector,
+    };
 
     component!(path: sharding_cpt, storage: sharding, event: ShardingEvent);
 
@@ -1194,13 +1196,18 @@ pub mod world {
                 let entity_id = entity_id_from_serialized_keys(model.keys);
 
                 // Each ShardField carries its own field selector and CRDT variant.
-                // The caller is responsible for providing correct selectors (from
-                // Model::<M>::layout() called locally, or via IntoShardField helpers).
+                // Selectors in the PACKED_SLOT_BASE range indicate packed model offsets;
+                // all other selectors are per-field (Layout::Struct).
                 for shard_field in model.fields {
                     let shard_field = *shard_field;
-                    let slot = compute_dojo_field_slot(
-                        model.selector, entity_id, shard_field.selector,
-                    );
+                    let slot = if is_packed_selector(shard_field.selector) {
+                        let offset = shard_field.selector - PACKED_SLOT_BASE;
+                        compute_dojo_packed_slot(model.selector, entity_id) + offset
+                    } else {
+                        compute_dojo_field_slot(
+                            model.selector, entity_id, shard_field.selector,
+                        )
+                    };
                     let crd_type = match shard_field.crdt {
                         CRDVariant::Set => CRDType::Set((world_addr, slot)),
                         CRDVariant::Add => CRDType::Add((world_addr, slot)),
