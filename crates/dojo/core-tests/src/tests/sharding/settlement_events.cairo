@@ -244,7 +244,7 @@ fn test_settlement_per_field_mixed_crdt_events() {
 }
 
 /// Test: Building-like multi-key model — StoreSetRecord includes composite keys.
-/// Mimics Eternum's Building model: 4 keys (outer_col, outer_row, inner_col, inner_row),
+/// Mimics a multi-key model with two composite keys (col, row),
 /// fields stored per-slot (Layout::Struct). Verifies that:
 /// 1. Entity keys (composite) are correctly stored and emitted
 /// 2. Values are in Serde format (one felt252 per field)

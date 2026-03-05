@@ -108,6 +108,7 @@ fn expand_layout(layout: Layout, crdt: CRDVariant) -> Span<ShardField> {
         Layout::Fixed(sizes) => {
             let mut sizes = sizes;
             let num_slots = dojo::storage::packing::calculate_packed_size(ref sizes);
+            assert(num_slots <= 256, 'ShardModel: packed too large');
             let mut result: Array<ShardField> = ArrayTrait::new();
             let mut i: u32 = 0;
             while i < num_slots {

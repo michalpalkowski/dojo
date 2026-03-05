@@ -1171,6 +1171,8 @@ pub mod world {
         fn request_sharding(
             ref self: ContractState, proxy: ContractAddress, models: Span<ShardModel>,
         ) {
+            assert(models.len() != 0, 'request_sharding: empty models');
+
             let world_addr = starknet::get_contract_address();
             let mut all_slots: Array<CRDType> = ArrayTrait::new();
 

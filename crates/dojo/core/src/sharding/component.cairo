@@ -82,6 +82,8 @@ pub mod sharding_component {
         pub const TYPE_CHANGE_WHILE_ACTIVE: felt252 = 'Component: Type change active';
         pub const ADD_DELTA_UNDERFLOW: felt252 = 'Component: Add delta underflow';
         pub const ARITHMETIC_OVERFLOW: felt252 = 'Component: Arithmetic overflow';
+        pub const SHARDING_PROXY_MISMATCH: felt252 = 'Component: Proxy mismatch';
+        pub const DUPLICATE_SLOT: felt252 = 'Component: Duplicate slot';
     }
 
     #[embeddable_as(ContractComponentImpl)]
@@ -93,6 +95,13 @@ pub mod sharding_component {
             sharding_contract_address: ContractAddress,
             contract_slots_changes: Span<CRDType>,
         ) {
+            // Guard: if a proxy is already active, it must be the same address.
+            let current_proxy = self.sharding_contract_address.read();
+            if !current_proxy.is_zero() {
+                assert(
+                    current_proxy == sharding_contract_address, Errors::SHARDING_PROXY_MISMATCH,
+                );
+            }
             self.sharding_contract_address.write(sharding_contract_address);
 
             // Validate and lock slots
@@ -152,10 +161,21 @@ pub mod sharding_component {
             // contract_component only applies changes to its own registered slots.
             // Unregistered slots are silently ignored — this is by design, not an error.
             let mut locked_changes: Array<(felt252, felt252)> = ArrayTrait::new();
+            let mut seen_keys: Array<felt252> = ArrayTrait::new();
             for slot_entry in storage_changes.span() {
                 let (storage_key, storage_value) = *slot_entry;
                 let (_, init_count) = self.slots.read(storage_key);
                 if init_count != 0 {
+                    // Guard against duplicate slots in a single settlement.
+                    let mut is_dup = false;
+                    for seen in seen_keys.span() {
+                        if *seen == storage_key {
+                            is_dup = true;
+                            break;
+                        }
+                    };
+                    assert(!is_dup, Errors::DUPLICATE_SLOT);
+                    seen_keys.append(storage_key);
                     locked_changes.append((storage_key, storage_value));
                 }
             }
