@@ -41,6 +41,17 @@ pub mod sharding_component {
         /// Snapshot of Add slot values at initialization time.
         /// Used to compute delta = (shard_value - initial) during settlement.
         initial_add_values: Map<slot_value, felt252>,
+        /// Metadata for Torii event emission at settlement time.
+        /// Maps slot hash → (model_selector, entity_id, member_selector).
+        /// Stored at request_sharding time, read+cleared at settlement time.
+        slot_model_selector: Map<felt252, felt252>,
+        slot_entity_id: Map<felt252, felt252>,
+        slot_member_selector: Map<felt252, felt252>,
+        /// Entity keys for StoreSetRecord emission (settlement needs keys to create new entities in Torii).
+        /// Maps entity_id → serialized keys. Stored at request_sharding time.
+        entity_keys_len: Map<felt252, u32>,
+        /// Maps combine_key(entity_id, index) → key value.
+        entity_keys_data: Map<felt252, felt252>,
     }
 
     #[event]
@@ -225,6 +236,102 @@ pub mod sharding_component {
             }
             let sharding_dispatcher = IShardingDispatcher { contract_address: sharding_address };
             sharding_dispatcher.end_shard();
+        }
+    }
+
+    #[generate_trait]
+    pub impl MetadataImpl<
+        TContractState, +HasComponent<TContractState>,
+    > of MetadataTrait<TContractState> {
+        /// Store per-slot metadata for Torii event emission at settlement time.
+        /// Called by World.request_sharding() after computing each slot.
+        fn store_slot_metadata(
+            ref self: ComponentState<TContractState>,
+            slot: felt252,
+            model_selector: felt252,
+            entity_id: felt252,
+            member_selector: felt252,
+        ) {
+            self.slot_model_selector.write(slot, model_selector);
+            self.slot_entity_id.write(slot, entity_id);
+            self.slot_member_selector.write(slot, member_selector);
+        }
+
+        /// Read per-slot metadata. Returns (model_selector, entity_id, member_selector).
+        /// A model_selector of 0 indicates no metadata stored for this slot.
+        fn read_slot_metadata(
+            self: @ComponentState<TContractState>, slot: felt252,
+        ) -> (felt252, felt252, felt252) {
+            (
+                self.slot_model_selector.read(slot),
+                self.slot_entity_id.read(slot),
+                self.slot_member_selector.read(slot),
+            )
+        }
+
+        /// Clear per-slot metadata after settlement or cancel.
+        fn clear_slot_metadata(ref self: ComponentState<TContractState>, slot: felt252) {
+            self.slot_model_selector.write(slot, 0);
+            self.slot_entity_id.write(slot, 0);
+            self.slot_member_selector.write(slot, 0);
+        }
+
+        /// Store entity keys for StoreSetRecord emission at settlement time.
+        /// Only stores once per entity_id (idempotent — skips if already stored).
+        fn store_entity_keys(
+            ref self: ComponentState<TContractState>,
+            entity_id: felt252,
+            keys: Span<felt252>,
+        ) {
+            // Skip if already stored for this entity
+            if self.entity_keys_len.read(entity_id) != 0 {
+                return;
+            }
+            let len: u32 = keys.len();
+            self.entity_keys_len.write(entity_id, len);
+            let mut i: u32 = 0;
+            while i < len {
+                let data_key = dojo::utils::combine_key(entity_id, i.into());
+                self.entity_keys_data.write(data_key, *keys[i]);
+                i += 1;
+            }
+        }
+
+        /// Read entity keys. Returns empty span if not stored.
+        fn read_entity_keys(
+            self: @ComponentState<TContractState>,
+            entity_id: felt252,
+        ) -> Span<felt252> {
+            let len = self.entity_keys_len.read(entity_id);
+            if len == 0 {
+                return [].span();
+            }
+            let mut keys: Array<felt252> = ArrayTrait::new();
+            let mut i: u32 = 0;
+            while i < len {
+                let data_key = dojo::utils::combine_key(entity_id, i.into());
+                keys.append(self.entity_keys_data.read(data_key));
+                i += 1;
+            };
+            keys.span()
+        }
+
+        /// Clear entity keys after settlement.
+        fn clear_entity_keys(
+            ref self: ComponentState<TContractState>,
+            entity_id: felt252,
+        ) {
+            let len = self.entity_keys_len.read(entity_id);
+            if len == 0 {
+                return;
+            }
+            let mut i: u32 = 0;
+            while i < len {
+                let data_key = dojo::utils::combine_key(entity_id, i.into());
+                self.entity_keys_data.write(data_key, 0);
+                i += 1;
+            };
+            self.entity_keys_len.write(entity_id, 0);
         }
     }
 

@@ -125,6 +125,9 @@ pub mod world {
 
     mod world_contract;
     pub use world_contract::world;
+    pub use world_contract::{
+        IShardingProxy, IShardingProxyDispatcher, IShardingProxyDispatcherTrait,
+    };
 
     pub mod storage;
     pub use storage::{WorldStorage, WorldStorageTrait};

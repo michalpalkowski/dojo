@@ -36,10 +36,11 @@ mod tests {
         pub use helpers::{
             Abilities, Case, Character, DOJO_NSH, EnumOne, Foo, IFooSetter, IFooSetterDispatcher,
             IFooSetterDispatcherTrait, Ibar, IbarDispatcher, IbarDispatcherTrait, MyEnum,
-            MyNestedEnum, NotCopiable, SimpleEvent, Stats, Sword, Weapon, WithOptionAndEnums, bar,
-            deploy_world, deploy_world_and_bar, deploy_world_and_foo,
-            deploy_world_with_all_kind_of_resources, e_SimpleEvent, foo_setter, m_Foo,
-            m_FooInvalidName, test_contract, test_contract_with_dojo_init_args,
+            MyNestedEnum, NotCopiable, Score, SimpleEvent, Stats, Sword, Tile, Weapon,
+            WithOptionAndEnums, bar, deploy_world, deploy_world_and_bar, deploy_world_and_foo,
+            deploy_world_with_all_kind_of_resources, deploy_world_with_score,
+            deploy_world_with_tile, e_SimpleEvent, foo_setter, m_Foo, m_FooInvalidName,
+            test_contract, test_contract_with_dojo_init_args,
         };
 
         mod event;
@@ -92,5 +93,6 @@ mod tests {
         mod slot;
         mod component;
         mod request;
+        mod settlement_events;
     }
 }

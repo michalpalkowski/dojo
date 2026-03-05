@@ -40,6 +40,28 @@ pub struct Foo {
     pub b: u128,
 }
 
+/// Building-like model with composite keys (mirrors Eternum's Building).
+#[derive(Copy)]
+#[dojo::model]
+pub struct Tile {
+    #[key]
+    pub col: u32,
+    #[key]
+    pub row: u32,
+    pub category: u8,
+    pub entity_id: u32,
+}
+
+/// Simple packed model (mirrors Eternum's TradeCount, Quantity, etc.).
+#[derive(IntrospectPacked, Copy)]
+#[dojo::model]
+pub struct Score {
+    #[key]
+    pub player: ContractAddress,
+    pub points: u128,
+    pub level: u32,
+}
+
 #[dojo::model]
 pub struct NotCopiable {
     #[key]
@@ -342,6 +364,22 @@ pub fn deploy_world_and_foo() -> (WorldStorage, felt252) {
     };
 
     (spawn_test_world([namespace_def].span()), Model::<Foo>::selector(DOJO_NSH))
+}
+
+pub fn deploy_world_with_tile() -> (WorldStorage, felt252) {
+    let namespace_def = NamespaceDef {
+        namespace: "dojo",
+        resources: [TestResource::Model("Tile")].span(),
+    };
+    (spawn_test_world([namespace_def].span()), Model::<Tile>::selector(DOJO_NSH))
+}
+
+pub fn deploy_world_with_score() -> (WorldStorage, felt252) {
+    let namespace_def = NamespaceDef {
+        namespace: "dojo",
+        resources: [TestResource::Model("Score")].span(),
+    };
+    (spawn_test_world([namespace_def].span()), Model::<Score>::selector(DOJO_NSH))
 }
 
 /// Deploys an empty world with the `dojo` namespace and registers the `foo` model.

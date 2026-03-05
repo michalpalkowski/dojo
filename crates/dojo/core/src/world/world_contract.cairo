@@ -1208,6 +1208,13 @@ pub mod world {
                             model.selector, entity_id, shard_field.selector,
                         )
                     };
+                    // Store metadata for Torii event emission at settlement time.
+                    self.sharding.store_slot_metadata(
+                        slot, model.selector, entity_id, shard_field.selector,
+                    );
+                    // Store entity keys (idempotent) for StoreSetRecord emission.
+                    self.sharding.store_entity_keys(entity_id, model.keys);
+
                     let crd_type = match shard_field.crdt {
                         CRDVariant::Set => CRDType::Set((world_addr, slot)),
                         CRDVariant::Add => CRDType::Add((world_addr, slot)),
@@ -1242,8 +1249,9 @@ pub mod world {
         }
     }
 
-    // Instantiate the component impl (not ABI-exposed) so self.sharding.xxx() works.
+    // Instantiate the component impls (not ABI-exposed) so self.sharding.xxx() works.
     impl ShardingComponentImpl = sharding_cpt::ContractComponentImpl<ContractState>;
+    impl ShardingMetadataImpl = sharding_cpt::MetadataImpl<ContractState>;
 
     /// Sharding component methods callable by the sharding proxy (operator's contract).
     /// Access control is enforced inside the component: caller must equal the
@@ -1253,11 +1261,170 @@ pub mod world {
         fn update_shard_state(
             ref self: ContractState, storage_changes: Array<(felt252, felt252)>,
         ) {
+            // 1. Collect metadata BEFORE CRDT merge (need slot list before component filters)
+            let mut slot_metas: Array<(felt252, felt252, felt252, felt252)> = ArrayTrait::new();
+            for entry in storage_changes.span() {
+                let (slot, _) = *entry;
+                let (model, entity, member) = self.sharding.read_slot_metadata(slot);
+                if model != 0 {
+                    slot_metas.append((slot, model, entity, member));
+                }
+            };
+
+            // 2. CRDT merge — component handles filtering, merge, unlock (UNCHANGED)
             self.sharding.update_shard_state(storage_changes);
+
+
+            // 3. Emit properly serialized Torii events.
+            //    StoreUpdateMember values must be Serde-serialized (not raw storage),
+            //    so we use Dojo's read_model_member / read_model_entity which handle
+            //    layout-aware deserialization (unpacking Fixed, recursing Struct, etc.).
+
+            // Deduplicate: track emitted (model, entity, member) triples.
+            // When entity keys are stored (registered via request_sharding), we emit
+            // one StoreSetRecord per (model, entity) — normalize member to 0.
+            // Otherwise emit one StoreUpdateMember per (model, entity, member).
+            let mut emitted: Array<(felt252, felt252, felt252)> = ArrayTrait::new();
+
+            // Model layout cache: avoid repeated cross-contract calls.
+            let mut layout_cache: Array<(felt252, Layout)> = ArrayTrait::new();
+
+            // Track entity_ids that need keys cleared after all emissions.
+            let mut entities_to_clear: Array<felt252> = ArrayTrait::new();
+
+            for meta in slot_metas.span() {
+                let (slot, model_sel, entity_id, member_sel) = *meta;
+                self.sharding.clear_slot_metadata(slot);
+
+                // Check if entity keys were stored during request_sharding.
+                // If so, emit StoreSetRecord (Torii needs keys to create NEW entities).
+                // Otherwise, emit StoreUpdateMember (updates existing entities).
+                let keys = self.sharding.read_entity_keys(entity_id);
+                let has_keys = keys.len() > 0;
+                let dedup_member = if has_keys { 0 } else { member_sel };
+
+                // Skip if already emitted for this (model, entity, member)
+                let mut skip = false;
+                for e in emitted.span() {
+                    let (em, ee, emem) = *e;
+                    if em == model_sel && ee == entity_id && emem == dedup_member {
+                        skip = true;
+                        break;
+                    }
+                };
+                if skip {
+                    continue;
+                }
+                emitted.append((model_sel, entity_id, dedup_member));
+
+                // Get model layout from cache or model contract.
+                let mut found_layout: Option<Layout> = Option::None;
+                for entry in layout_cache.span() {
+                    let (cached_sel, cached_layout) = *entry;
+                    if cached_sel == model_sel {
+                        found_layout = Option::Some(cached_layout);
+                        break;
+                    }
+                };
+                let model_layout: Option<Layout> = match found_layout {
+                    Option::Some(l) => Option::Some(l),
+                    Option::None => {
+                        match self.resources.read(model_sel) {
+                            Resource::Model((addr, _)) => {
+                                let l = IStoredResourceDispatcher { contract_address: addr }
+                                    .layout();
+                                layout_cache.append((model_sel, l));
+                                Option::Some(l)
+                            },
+                            _ => Option::None,
+                        }
+                    },
+                };
+
+                if has_keys {
+                    // Entity has stored keys: read post-merge values using Dojo's
+                    // layout-aware reader and emit one StoreSetRecord so Torii can
+                    // create/update the entity with proper indexed key columns.
+                    //
+                    // read_model_entity handles all layout types (Fixed packing,
+                    // nested Struct recursion, etc.) and produces correct Serde values.
+                    let values = match model_layout {
+                        Option::Some(layout) => {
+                            storage::entity_model::read_model_entity(
+                                model_sel, entity_id, layout,
+                            )
+                        },
+                        Option::None => {
+                            // Fallback: raw slot reads (shouldn't happen if model is registered)
+                            let mut raw_values: Array<felt252> = ArrayTrait::new();
+                            for inner in slot_metas.span() {
+                                let (inner_slot, inner_model, inner_entity, _) = *inner;
+                                if inner_model == model_sel && inner_entity == entity_id {
+                                    let val = starknet::syscalls::storage_read_syscall(
+                                        0, inner_slot.try_into().unwrap(),
+                                    )
+                                        .unwrap_syscall();
+                                    raw_values.append(val);
+                                }
+                            };
+                            raw_values.span()
+                        },
+                    };
+
+                    self
+                        .emit(
+                            StoreSetRecord {
+                                selector: model_sel,
+                                entity_id,
+                                keys,
+                                values,
+                            },
+                        );
+                    entities_to_clear.append(entity_id);
+                } else {
+                    // No stored keys: emit per-field StoreUpdateMember.
+                    let member_layout = match model_layout {
+                        Option::Some(ml) => dojo::utils::find_model_field_layout(ml, member_sel),
+                        Option::None => Option::None,
+                    };
+                    let values = match member_layout {
+                        Option::Some(ml) => {
+                            storage::entity_model::read_model_member(
+                                model_sel, entity_id, member_sel, ml,
+                            )
+                        },
+                        Option::None => {
+                            // Fallback: raw storage read (works for single-felt252 fields)
+                            let final_value = starknet::syscalls::storage_read_syscall(
+                                0, slot.try_into().unwrap(),
+                            )
+                                .unwrap_syscall();
+                            [final_value].span()
+                        },
+                    };
+                    self
+                        .emit(
+                            StoreUpdateMember {
+                                selector: model_sel,
+                                entity_id,
+                                member_selector: member_sel,
+                                values,
+                            },
+                        );
+                }
+            };
+
+            // Clear all entity keys after emissions are done.
+            for eid in entities_to_clear.span() {
+                self.sharding.clear_entity_keys(*eid);
+            };
         }
 
         fn cancel_shard_state(ref self: ContractState, slots: Span<felt252>) {
             self.sharding.cancel_shard_state(slots);
+            for slot in slots {
+                self.sharding.clear_slot_metadata(*slot);
+            };
         }
     }
 
