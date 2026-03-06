@@ -80,13 +80,7 @@ pub mod sharding_component {
                 let (prev_crd_type, init_count) = self.slots.read(crd_type.slot());
 
                 if init_count != 0 {
-                    // Slot is active — SetLock and Lock are exclusive (no stacking)
-                    let is_locking = match prev_crd_type {
-                        CRDType::SetLock(_) | CRDType::Lock(_) => true,
-                        _ => false,
-                    };
-                    assert(!is_locking, Errors::SLOT_LOCKED);
-                    // Set and Add allow same-type stacking only
+                    assert(!prev_crd_type.is_exclusive(), Errors::SLOT_LOCKED);
                     assert(
                         prev_crd_type.is_same_variant(crd_type), Errors::TYPE_CHANGE_WHILE_ACTIVE,
                     );
@@ -148,31 +142,7 @@ pub mod sharding_component {
 
             for slot_entry in locked_changes.span() {
                 let (storage_key, _) = *slot_entry;
-
-                let (crd_type, init_count) = self.slots.read(storage_key);
-
-                let is_lock = match crd_type {
-                    CRDType::Lock(_) => true,
-                    _ => false,
-                };
-
-                if is_lock {
-                    self
-                        .slots
-                        .write(storage_key, (CRDType::Set((contract_address, storage_key)), 0));
-                } else {
-                    let new_init_count = init_count - 1;
-                    if new_init_count == 0 {
-                        self
-                            .slots
-                            .write(storage_key, (CRDType::Set((contract_address, storage_key)), 0));
-                        if let CRDType::Add(_) = crd_type {
-                            self.initial_add_values.write(storage_key, 0);
-                        }
-                    } else {
-                        self.slots.write(storage_key, (crd_type, new_init_count));
-                    }
-                }
+                self.unlock_slot(storage_key, contract_address);
             }
         }
 
@@ -184,30 +154,17 @@ pub mod sharding_component {
 
             for slot_key in slots {
                 let slot_key = *slot_key;
-
-                let (crd_type, init_count) = self.slots.read(slot_key);
+                let (_, init_count) = self.slots.read(slot_key);
                 if init_count == 0 {
                     continue;
                 }
-
-                let new_init_count = init_count - 1;
-                if new_init_count == 0 {
-                    self.slots.write(slot_key, (CRDType::Set((contract_address, slot_key)), 0));
-                    if let CRDType::Add(_) = crd_type {
-                        self.initial_add_values.write(slot_key, 0);
-                    }
-                } else {
-                    // Other shards still active on this slot — just decrement
-                    self.slots.write(slot_key, (crd_type, new_init_count));
-                }
+                self.unlock_slot(slot_key, contract_address);
             }
         }
 
         fn end_shard(ref self: ComponentState<TContractState>) {
             let sharding_address = self.sharding_contract_address.read();
-            if sharding_address.is_zero() {
-                return;
-            }
+            assert(!sharding_address.is_zero(), Errors::NOT_INITIALIZED);
             let sharding_dispatcher = IShardingDispatcher { contract_address: sharding_address };
             sharding_dispatcher.end_shard();
         }
@@ -304,6 +261,26 @@ pub mod sharding_component {
     pub impl InternalImpl<
         TContractState, +HasComponent<TContractState>,
     > of InternalTrait<TContractState> {
+        /// Decrement init_count and reset slot to base Set when fully unlocked.
+        /// Lock/SetLock are exclusive (init_count can only be 1), so they always fully reset.
+        fn unlock_slot(
+            ref self: ComponentState<TContractState>,
+            slot_key: felt252,
+            contract_address: ContractAddress,
+        ) {
+            let (crd_type, init_count) = self.slots.read(slot_key);
+            let base_set = CRDType::Set((contract_address, slot_key));
+
+            if crd_type.is_lock() || init_count - 1 == 0 {
+                self.slots.write(slot_key, (base_set, 0));
+                if let CRDType::Add(_) = crd_type {
+                    self.initial_add_values.write(slot_key, 0);
+                }
+            } else {
+                self.slots.write(slot_key, (crd_type, init_count - 1));
+            }
+        }
+
         fn update_shard(
             ref self: ComponentState<TContractState>,
             storage_changes: Array<(felt252, felt252)>,

@@ -1297,82 +1297,49 @@ pub mod world {
                 Felt252DictTrait::insert(ref emitted, dedup_key, 1);
 
                 let cached_idx = Felt252DictTrait::get(ref layout_dict, model_sel);
-                let model_layout: Option<Layout> = if cached_idx != 0 {
+                let layout = if cached_idx != 0 {
                     let idx: u32 = (cached_idx - 1).try_into().unwrap();
-                    Option::Some(*layouts_store[idx])
+                    *layouts_store[idx]
                 } else {
-                    match self.resources.read(model_sel) {
-                        Resource::Model((addr, _)) => {
-                            let l = IStoredResourceDispatcher { contract_address: addr }
-                                .layout();
-                            let store_idx: felt252 = (layouts_store.len() + 1).into();
-                            layouts_store.append(l);
-                            Felt252DictTrait::insert(ref layout_dict, model_sel, store_idx);
-                            Option::Some(l)
-                        },
-                        _ => Option::None,
-                    }
+                    let addr = match self.resources.read(model_sel) {
+                        Resource::Model((addr, _)) => addr,
+                        _ => panic_with_byte_array(
+                            @errors::resource_conflict(@format!("{model_sel}"), @"model"),
+                        ),
+                    };
+                    let model_layout = IStoredResourceDispatcher { contract_address: addr }.layout();
+                    let store_idx: felt252 = (layouts_store.len() + 1).into();
+                    layouts_store.append(model_layout);
+                    Felt252DictTrait::insert(ref layout_dict, model_sel, store_idx);
+                    model_layout
                 };
 
                 if has_keys {
-                    let values = match model_layout {
-                        Option::Some(layout) => {
-                            storage::entity_model::read_model_entity(
-                                model_sel, entity_id, layout,
-                            )
-                        },
-                        Option::None => {
-                            let mut raw_values: Array<felt252> = ArrayTrait::new();
-                            for inner in slot_metas.span() {
-                                let (inner_slot, inner_model, inner_entity, _) = *inner;
-                                if inner_model == model_sel && inner_entity == entity_id {
-                                    let val = starknet::syscalls::storage_read_syscall(
-                                        0, inner_slot.try_into().unwrap(),
-                                    )
-                                        .unwrap_syscall();
-                                    raw_values.append(val);
-                                }
-                            };
-                            raw_values.span()
-                        },
-                    };
-
+                    let values = storage::entity_model::read_model_entity(
+                        model_sel, entity_id, layout,
+                    );
                     self
                         .emit(
                             StoreSetRecord {
-                                selector: model_sel,
-                                entity_id,
-                                keys,
-                                values,
+                                selector: model_sel, entity_id, keys, values,
                             },
                         );
                     entities_to_clear.append(entity_id);
                 } else {
-                    let member_layout = match model_layout {
-                        Option::Some(ml) => dojo::utils::find_model_field_layout(ml, member_sel),
-                        Option::None => Option::None,
-                    };
-                    let values = match member_layout {
-                        Option::Some(ml) => {
+                    let values = match dojo::utils::find_model_field_layout(layout, member_sel) {
+                        Option::Some(member_layout) => {
                             storage::entity_model::read_model_member(
-                                model_sel, entity_id, member_sel, ml,
+                                model_sel, entity_id, member_sel, member_layout,
                             )
                         },
-                        Option::None => {
-                            let final_value = starknet::syscalls::storage_read_syscall(
-                                0, slot.try_into().unwrap(),
-                            )
-                                .unwrap_syscall();
-                            [final_value].span()
-                        },
+                        Option::None => panic_with_byte_array(
+                            @format!("Shard settlement: field layout not found for member {member_sel}"),
+                        ),
                     };
                     self
                         .emit(
                             StoreUpdateMember {
-                                selector: model_sel,
-                                entity_id,
-                                member_selector: member_sel,
-                                values,
+                                selector: model_sel, entity_id, member_selector: member_sel, values,
                             },
                         );
                 }

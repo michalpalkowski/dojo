@@ -15,6 +15,8 @@ pub enum CRDType {
 pub trait CRDTypeTrait {
     fn assert_is_base_set(self: CRDType);
     fn is_same_variant(self: CRDType, other: CRDType) -> bool;
+    fn is_lock(self: CRDType) -> bool;
+    fn is_exclusive(self: CRDType) -> bool;
     fn contract_address(self: CRDType) -> ContractAddress;
     fn slot(self: CRDType) -> SlotValue;
 }
@@ -34,6 +36,20 @@ pub impl CRDTypeImpl of CRDTypeTrait {
             (CRDType::SetLock(_), CRDType::SetLock(_)) => true,
             (CRDType::Set(_), CRDType::Set(_)) => true,
             (CRDType::Lock(_), CRDType::Lock(_)) => true,
+            _ => false,
+        }
+    }
+
+    fn is_lock(self: CRDType) -> bool {
+        match self {
+            CRDType::Lock(_) => true,
+            _ => false,
+        }
+    }
+
+    fn is_exclusive(self: CRDType) -> bool {
+        match self {
+            CRDType::SetLock(_) | CRDType::Lock(_) => true,
             _ => false,
         }
     }
