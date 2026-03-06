@@ -20,8 +20,6 @@ pub trait CRDTypeTrait {
 }
 
 pub impl CRDTypeImpl of CRDTypeTrait {
-    /// Asserts this type is the base `Set` state (init_count == 0).
-    /// Set can transition to any type — this is the only valid starting point.
     fn assert_is_base_set(self: CRDType) {
         let is_valid = match self {
             CRDType::Set(_) => true,

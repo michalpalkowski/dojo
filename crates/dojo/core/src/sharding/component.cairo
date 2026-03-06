@@ -8,15 +8,8 @@ pub trait IContractComponent<TContractState> {
         sharding_contract_address: ContractAddress,
         contract_slots_changes: Span<CRDType>,
     );
-    /// Apply storage changes from a settled shard and unlock the slots.
-    /// Caller must be the registered sharding contract (proxy).
-    /// The proxy already verifies shard_id — the game contract trusts the proxy.
     fn update_shard_state(ref self: TContractState, storage_changes: Array<(SlotKey, SlotValue)>);
-    /// Cancel (unlock) slots without applying shard values.
-    /// Caller must be the registered sharding contract (proxy).
     fn cancel_shard_state(ref self: TContractState, slots: Span<felt252>);
-    /// Signal end of shard to the sharding proxy.
-    /// The proxy emits `ShardFinished` which the operator watches.
     fn end_shard(ref self: TContractState);
 }
 
@@ -39,19 +32,14 @@ pub mod sharding_component {
     pub struct Storage {
         slots: Map<SlotValue, (CRDType, InitCount)>,
         sharding_contract_address: ContractAddress,
-        /// Snapshot of Add slot values at initialization time.
-        /// Used to compute delta = (shard_value - initial) during settlement.
+        /// Add CRDT snapshots for delta computation: delta = shard_value - initial.
         initial_add_values: Map<SlotValue, felt252>,
-        /// Metadata for Torii event emission at settlement time.
-        /// Maps slot hash → (model_selector, entity_id, member_selector).
-        /// Stored at request_sharding time, read+cleared at settlement time.
+        /// Per-slot metadata (model_selector, entity_id, member_selector) for Torii events.
         slot_model_selector: Map<felt252, felt252>,
         slot_entity_id: Map<felt252, felt252>,
         slot_member_selector: Map<felt252, felt252>,
-        /// Entity keys for StoreSetRecord emission (settlement needs keys to create new entities in Torii).
-        /// Maps entity_id → serialized keys. Stored at request_sharding time.
+        /// Entity keys for StoreSetRecord emission (Torii needs keys for new entities).
         entity_keys_len: Map<felt252, u32>,
-        /// Maps combine_key(entity_id, index) → key value.
         entity_keys_data: Map<felt252, felt252>,
     }
 
@@ -78,7 +66,6 @@ pub mod sharding_component {
             sharding_contract_address: ContractAddress,
             contract_slots_changes: Span<CRDType>,
         ) {
-            // Guard: if a proxy is already active, it must be the same address.
             let current_proxy = self.sharding_contract_address.read();
             if !current_proxy.is_zero() {
                 assert(
@@ -87,7 +74,6 @@ pub mod sharding_component {
             }
             self.sharding_contract_address.write(sharding_contract_address);
 
-            // Validate and lock slots
             for crd_type in contract_slots_changes {
                 let crd_type = *crd_type;
 
@@ -105,7 +91,6 @@ pub mod sharding_component {
                         prev_crd_type.is_same_variant(crd_type), Errors::TYPE_CHANGE_WHILE_ACTIVE,
                     );
                 } else {
-                    // Slot is free (init_count == 0) — check type transition from Set
                     prev_crd_type.assert_is_base_set();
                 }
 
@@ -143,17 +128,14 @@ pub mod sharding_component {
 
             let contract_address = get_contract_address();
 
-            // Filter to only locked slots (init_count > 0).
-            // The settlement proof may contain slots from multiple contracts, but each
-            // contract_component only applies changes to its own registered slots.
-            // Unregistered slots are silently ignored — this is by design, not an error.
+            // Filter to locked slots only. Unregistered slots are silently ignored —
+            // the settlement proof may contain slots from other contracts.
             let mut locked_changes: Array<(felt252, felt252)> = ArrayTrait::new();
             let mut seen_keys: Felt252Dict<felt252> = Default::default();
             for slot_entry in storage_changes.span() {
                 let (storage_key, storage_value) = *slot_entry;
                 let (_, init_count) = self.slots.read(storage_key);
                 if init_count != 0 {
-                    // Guard against duplicate slots in a single settlement.
                     assert(Felt252DictTrait::get(ref seen_keys, storage_key) == 0, Errors::DUPLICATE_SLOT);
                     Felt252DictTrait::insert(ref seen_keys, storage_key, 1);
                     locked_changes.append((storage_key, storage_value));
@@ -162,17 +144,13 @@ pub mod sharding_component {
 
             assert(locked_changes.len() != 0, Errors::NO_STORAGE_CHANGES);
 
-            // Apply storage changes via CRDT logic (only locked slots)
             self.update_shard(locked_changes.clone(), contract_address);
 
-            // Unlock slots: decrement init_count, reset Lock types to Set
             for slot_entry in locked_changes.span() {
                 let (storage_key, _) = *slot_entry;
 
                 let (crd_type, init_count) = self.slots.read(storage_key);
 
-                // Lock slots reserve the storage key during shard execution
-                // but always discard the shard value — reset fully on unlock.
                 let is_lock = match crd_type {
                     CRDType::Lock(_) => true,
                     _ => false,
@@ -192,7 +170,6 @@ pub mod sharding_component {
                             self.initial_add_values.write(storage_key, 0);
                         }
                     } else {
-                        // Other shards still active on this slot — just decrement
                         self.slots.write(storage_key, (crd_type, new_init_count));
                     }
                 }
@@ -215,7 +192,6 @@ pub mod sharding_component {
 
                 let new_init_count = init_count - 1;
                 if new_init_count == 0 {
-                    // Fully unlocked — reset to base Set type
                     self.slots.write(slot_key, (CRDType::Set((contract_address, slot_key)), 0));
                     if let CRDType::Add(_) = crd_type {
                         self.initial_add_values.write(slot_key, 0);
@@ -241,8 +217,6 @@ pub mod sharding_component {
     pub impl MetadataImpl<
         TContractState, +HasComponent<TContractState>,
     > of MetadataTrait<TContractState> {
-        /// Store per-slot metadata for Torii event emission at settlement time.
-        /// Called by World.request_sharding() after computing each slot.
         fn store_slot_metadata(
             ref self: ComponentState<TContractState>,
             slot: felt252,
@@ -255,8 +229,6 @@ pub mod sharding_component {
             self.slot_member_selector.write(slot, member_selector);
         }
 
-        /// Read per-slot metadata. Returns (model_selector, entity_id, member_selector).
-        /// A model_selector of 0 indicates no metadata stored for this slot.
         fn read_slot_metadata(
             self: @ComponentState<TContractState>, slot: felt252,
         ) -> (felt252, felt252, felt252) {
@@ -267,21 +239,18 @@ pub mod sharding_component {
             )
         }
 
-        /// Clear per-slot metadata after settlement or cancel.
         fn clear_slot_metadata(ref self: ComponentState<TContractState>, slot: felt252) {
             self.slot_model_selector.write(slot, 0);
             self.slot_entity_id.write(slot, 0);
             self.slot_member_selector.write(slot, 0);
         }
 
-        /// Store entity keys for StoreSetRecord emission at settlement time.
-        /// Only stores once per entity_id (idempotent — skips if already stored).
+        /// Idempotent — skips if already stored for this entity_id.
         fn store_entity_keys(
             ref self: ComponentState<TContractState>,
             entity_id: felt252,
             keys: Span<felt252>,
         ) {
-            // Skip if already stored for this entity
             if self.entity_keys_len.read(entity_id) != 0 {
                 return;
             }
@@ -295,7 +264,6 @@ pub mod sharding_component {
             }
         }
 
-        /// Read entity keys. Returns empty span if not stored.
         fn read_entity_keys(
             self: @ComponentState<TContractState>,
             entity_id: felt252,
@@ -314,7 +282,6 @@ pub mod sharding_component {
             keys.span()
         }
 
-        /// Clear entity keys after settlement.
         fn clear_entity_keys(
             ref self: ComponentState<TContractState>,
             entity_id: felt252,
@@ -337,13 +304,6 @@ pub mod sharding_component {
     pub impl InternalImpl<
         TContractState, +HasComponent<TContractState>,
     > of InternalTrait<TContractState> {
-        /// Apply CRDT-based storage changes from a settled shard.
-        ///
-        /// Each slot is updated according to its registered CRDType:
-        /// - **Set/SetLock**: direct overwrite — `storage[key] = value`
-        /// - **Add**: delta merge — `delta = shard_value - initial_snapshot`,
-        ///   then `storage[key] = current + delta` (prevents double-counting)
-        /// - **Lock**: slot was reserved but value is discarded (unlock happens in caller)
         fn update_shard(
             ref self: ComponentState<TContractState>,
             storage_changes: Array<(felt252, felt252)>,
@@ -364,7 +324,6 @@ pub mod sharding_component {
                         let current_value = storage_read_syscall(0, storage_address)
                             .unwrap_syscall();
                         let initial_value = self.initial_add_values.read(key);
-                        // value is the absolute shard state; compute delta vs fork snapshot
                         let current_u256: u256 = current_value.into();
                         let shard_u256: u256 = value.into();
                         let initial_u256: u256 = initial_value.into();
@@ -374,8 +333,6 @@ pub mod sharding_component {
                         let new_value: felt252 = sum.try_into().expect(Errors::ARITHMETIC_OVERFLOW);
                         storage_write_syscall(0, storage_address, new_value).unwrap_syscall();
                     },
-                    // Lock reserves the slot during shard execution but discards
-                    // the shard's value; the slot is unlocked in update_shard_state.
                     CRDType::Lock(_) => {},
                 }
             }

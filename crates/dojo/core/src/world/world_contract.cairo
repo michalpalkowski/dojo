@@ -1211,11 +1211,9 @@ pub mod world {
                             model.selector, entity_id, shard_field.selector,
                         )
                     };
-                    // Store metadata for Torii event emission at settlement time.
                     self.sharding.store_slot_metadata(
                         slot, model.selector, entity_id, shard_field.selector,
                     );
-                    // Store entity keys (idempotent) for StoreSetRecord emission.
                     self.sharding.store_entity_keys(entity_id, model.keys);
 
                     let crd_type = match shard_field.crdt {
@@ -1228,7 +1226,6 @@ pub mod world {
                 }
             };
 
-            // Forward all computed slots to the sharding component.
             self.sharding.initialize_shard(proxy, all_slots.span());
         }
 
@@ -1264,7 +1261,7 @@ pub mod world {
         fn update_shard_state(
             ref self: ContractState, storage_changes: Array<(felt252, felt252)>,
         ) {
-            // 1. Collect metadata BEFORE CRDT merge (need slot list before component filters)
+            // Collect metadata before CRDT merge (component filters may drop slots).
             let mut slot_metas: Array<(felt252, felt252, felt252, felt252)> = ArrayTrait::new();
             for entry in storage_changes.span() {
                 let (slot, _) = *entry;
@@ -1274,41 +1271,23 @@ pub mod world {
                 }
             };
 
-            // 2. CRDT merge — component handles filtering, merge, unlock (UNCHANGED)
             self.sharding.update_shard_state(storage_changes);
 
-
-            // 3. Emit properly serialized Torii events.
-            //    StoreUpdateMember values must be Serde-serialized (not raw storage),
-            //    so we use Dojo's read_model_member / read_model_entity which handle
-            //    layout-aware deserialization (unpacking Fixed, recursing Struct, etc.).
-
-            // Deduplicate: track emitted (model, entity, member) triples via Felt252Dict.
-            // Key = hash(model, entity, dedup_member). O(1) lookup instead of O(n²).
+            // Emit Torii events with layout-aware deserialized values.
             let mut emitted: Felt252Dict<felt252> = Default::default();
-
-            // Model layout cache via Felt252Dict: O(1) lookup instead of O(n).
-            // We store layouts in an array and map model_selector → (index + 1) in the dict.
-            // Index 0 in dict means "not cached". Layout is read from layouts_store[index].
             let mut layout_dict: Felt252Dict<felt252> = Default::default();
             let mut layouts_store: Array<Layout> = ArrayTrait::new();
-
-            // Track entity_ids that need keys cleared after all emissions.
             let mut entities_to_clear: Array<felt252> = ArrayTrait::new();
 
             for meta in slot_metas.span() {
                 let (slot, model_sel, entity_id, member_sel) = *meta;
                 self.sharding.clear_slot_metadata(slot);
 
-                // Check if entity keys were stored during request_sharding.
-                // If so, emit StoreSetRecord (Torii needs keys to create NEW entities).
-                // Otherwise, emit StoreUpdateMember (updates existing entities).
+                // StoreSetRecord if keys stored (new entities), StoreUpdateMember otherwise.
                 let keys = self.sharding.read_entity_keys(entity_id);
                 let has_keys = keys.len() > 0;
                 let dedup_member = if has_keys { 0 } else { member_sel };
 
-                // Skip if already emitted for this (model, entity, member).
-                // Use hash as dict key for O(1) dedup.
                 let dedup_key = core::poseidon::poseidon_hash_span(
                     [model_sel, entity_id, dedup_member].span(),
                 );
@@ -1317,7 +1296,6 @@ pub mod world {
                 }
                 Felt252DictTrait::insert(ref emitted, dedup_key, 1);
 
-                // Get model layout from dict cache or model contract.
                 let cached_idx = Felt252DictTrait::get(ref layout_dict, model_sel);
                 let model_layout: Option<Layout> = if cached_idx != 0 {
                     let idx: u32 = (cached_idx - 1).try_into().unwrap();
@@ -1337,12 +1315,6 @@ pub mod world {
                 };
 
                 if has_keys {
-                    // Entity has stored keys: read post-merge values using Dojo's
-                    // layout-aware reader and emit one StoreSetRecord so Torii can
-                    // create/update the entity with proper indexed key columns.
-                    //
-                    // read_model_entity handles all layout types (Fixed packing,
-                    // nested Struct recursion, etc.) and produces correct Serde values.
                     let values = match model_layout {
                         Option::Some(layout) => {
                             storage::entity_model::read_model_entity(
@@ -1350,7 +1322,6 @@ pub mod world {
                             )
                         },
                         Option::None => {
-                            // Fallback: raw slot reads (shouldn't happen if model is registered)
                             let mut raw_values: Array<felt252> = ArrayTrait::new();
                             for inner in slot_metas.span() {
                                 let (inner_slot, inner_model, inner_entity, _) = *inner;
@@ -1377,7 +1348,6 @@ pub mod world {
                         );
                     entities_to_clear.append(entity_id);
                 } else {
-                    // No stored keys: emit per-field StoreUpdateMember.
                     let member_layout = match model_layout {
                         Option::Some(ml) => dojo::utils::find_model_field_layout(ml, member_sel),
                         Option::None => Option::None,
@@ -1389,7 +1359,6 @@ pub mod world {
                             )
                         },
                         Option::None => {
-                            // Fallback: raw storage read (works for single-felt252 fields)
                             let final_value = starknet::syscalls::storage_read_syscall(
                                 0, slot.try_into().unwrap(),
                             )
@@ -1409,7 +1378,6 @@ pub mod world {
                 }
             };
 
-            // Clear all entity keys after emissions are done.
             for eid in entities_to_clear.span() {
                 self.sharding.clear_entity_keys(*eid);
             };
@@ -1418,14 +1386,12 @@ pub mod world {
         fn cancel_shard_state(ref self: ContractState, slots: Span<felt252>) {
             self.sharding.cancel_shard_state(slots);
 
-            // Clear per-slot metadata and collect entity_ids for key cleanup.
             let mut cleared_entities: Felt252Dict<felt252> = Default::default();
             for slot in slots {
                 let slot = *slot;
                 let (_, entity_id, _) = self.sharding.read_slot_metadata(slot);
                 self.sharding.clear_slot_metadata(slot);
 
-                // Clear entity keys once per entity_id (avoid redundant work).
                 if entity_id != 0 && Felt252DictTrait::get(ref cleared_entities, entity_id) == 0 {
                     Felt252DictTrait::insert(ref cleared_entities, entity_id, 1);
                     self.sharding.clear_entity_keys(entity_id);

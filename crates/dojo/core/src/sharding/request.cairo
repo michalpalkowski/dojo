@@ -1,10 +1,6 @@
 use dojo::meta::Layout;
 use dojo::sharding::slot::PACKED_SLOT_BASE;
 
-/// Lightweight CRDT variant selector (no address/slot — just the type).
-///
-/// Used in `ShardField` to specify the CRDT strategy per field.
-/// World expands this into full `CRDType` values with computed slots.
 #[derive(Drop, Serde, Copy, Debug, PartialEq)]
 pub enum CRDVariant {
     #[default]
@@ -14,28 +10,12 @@ pub enum CRDVariant {
     SetLock,
 }
 
-/// Per-field CRDT configuration for sharding.
-///
-/// Each `ShardField` maps a model field (by its layout selector) to a CRDT type.
-/// This allows different fields within the same model to use different merge strategies.
-///
-/// # Example
-/// ```cairo
-/// use dojo::sharding::request::IntoShardField;
-///
-/// let fields = [
-///     selector!("stone_balance").as_add(),   // delta merge
-///     selector!("wood_balance").as_add(),     // delta merge
-///     selector!("owner").as_lock(),           // exclusive reservation
-/// ].span();
-/// ```
 #[derive(Drop, Serde, Copy, Debug, PartialEq)]
 pub struct ShardField {
     pub selector: felt252,
     pub crdt: CRDVariant,
 }
 
-/// Ergonomic constructors for `ShardField` from a field selector.
 pub trait IntoShardField {
     fn as_set(self: felt252) -> ShardField;
     fn as_add(self: felt252) -> ShardField;
@@ -61,29 +41,6 @@ impl Felt252IntoShardField of IntoShardField {
     }
 }
 
-/// Describes a model to include in a sharding request.
-///
-/// The game contract creates these and passes them to `world.request_sharding()`.
-/// Each field specifies its own CRDT strategy via `ShardField`.
-///
-/// # Two usage modes
-///
-/// **Whole-model** — apply one CRDT to all fields (use `IntoShardModel` helpers):
-/// ```cairo
-/// let layout = Model::<Resource>::layout();
-/// (resource_sel, layout).shard_add(keys)   // all fields → Add
-/// ```
-///
-/// **Per-field** — different CRDT per field (construct directly):
-/// ```cairo
-/// ShardModel {
-///     selector: resource_sel, keys,
-///     fields: [
-///         selector!("stone_balance").as_add(),
-///         selector!("owner").as_lock(),
-///     ].span(),
-/// }
-/// ```
 #[derive(Drop, Serde, Copy)]
 pub struct ShardModel {
     pub selector: felt252,
@@ -91,11 +48,6 @@ pub struct ShardModel {
     pub fields: Span<ShardField>,
 }
 
-/// Expands a model `Layout` into `Span<ShardField>` with a uniform CRDT for all fields.
-///
-/// Supports `Layout::Struct` (per-field selectors) and `Layout::Fixed` (packed models).
-/// For packed models, generates sentinel selectors (`PACKED_SLOT_BASE + offset`) that
-/// `request_sharding` maps to the correct packed storage slots.
 fn expand_layout(layout: Layout, crdt: CRDVariant) -> Span<ShardField> {
     match layout {
         Layout::Struct(fields) => {
@@ -121,24 +73,8 @@ fn expand_layout(layout: Layout, crdt: CRDVariant) -> Span<ShardField> {
     }
 }
 
-/// Ergonomic constructors for `ShardModel` via (selector, layout) tuples.
-///
-/// These apply a single CRDT to ALL fields of the model. For per-field control,
-/// construct `ShardModel` directly with a `fields` array.
-///
-/// # Example
-/// ```cairo
-/// use dojo::sharding::request::IntoShardModel;
-///
-/// let resource_selector = Model::<Resource>::selector(namespace_hash);
-/// let resource_layout = Model::<Resource>::layout();
-/// let keys = [player_id].span();
-///
-/// world.request_sharding(proxy, [
-///     (resource_selector, resource_layout).shard_add(keys),   // Add CRDT
-///     (army_selector, army_layout).shard(keys),               // Set CRDT (default)
-/// ].span());
-/// ```
+/// Apply a single CRDT to all fields of a model. For per-field control,
+/// construct `ShardModel` directly.
 pub trait IntoShardModel {
     fn shard(self: (felt252, Layout), keys: Span<felt252>) -> ShardModel;
     fn shard_add(self: (felt252, Layout), keys: Span<felt252>) -> ShardModel;
