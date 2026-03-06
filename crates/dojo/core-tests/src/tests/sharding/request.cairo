@@ -123,7 +123,7 @@ fn test_request_sharding_all_fields() {
     assert(result.b == 222, 'b should be updated');
 }
 
-/// Test: shard_pn (PN-Counter) — both P and N fields are G-Counters (Add).
+/// Test: PN-Counter pattern using shard_add — both P and N fields are G-Counters (Add).
 ///
 /// Scenario: Foo.a = P (additions), Foo.b = N (subtractions), balance = P - N.
 /// On shard: P increases by 50 (mint), N increases by 30 (burn).
@@ -142,9 +142,9 @@ fn test_request_sharding_pn_counter() {
 
     let proxy_address = declare_and_deploy("mock_sharding_proxy");
 
-    // Use PNCounter CRDT via shard_pn — both fields become Add (G-Counter).
+    // Use PNCounter CRDT via shard_add — both fields become Add (G-Counter).
     let layout = Model::<Foo>::layout();
-    let models = [(model_selector, layout).shard_pn([bob.into()].span())].span();
+    let models = [(model_selector, layout).shard_add([bob.into()].span())].span();
     world.dispatcher.request_sharding(proxy_address, models);
 
     // Mainchain changes while shard is active: P 100→120, N 50→60 (balance 50→60).
@@ -172,7 +172,7 @@ fn test_request_sharding_pn_counter() {
     assert(result.b == 90, 'PN: N delta incorrect');
 }
 
-/// Test: shard_pn with burn only (N increases, P unchanged) — simulates resource spending.
+/// Test: shard_add with burn only (N increases, P unchanged) — simulates resource spending.
 ///
 /// This is the key scenario that the old Add CRDT couldn't handle with a single balance field.
 /// With PN-Counter, N is its own G-Counter so delta is always >= 0.
@@ -189,7 +189,7 @@ fn test_request_sharding_pn_counter_burn_only() {
     let proxy_address = declare_and_deploy("mock_sharding_proxy");
 
     let layout = Model::<Foo>::layout();
-    let models = [(model_selector, layout).shard_pn([bob.into()].span())].span();
+    let models = [(model_selector, layout).shard_add([bob.into()].span())].span();
     world.dispatcher.request_sharding(proxy_address, models);
 
     // Shard: P unchanged (no minting), N increases by 300 (burning 300 resources).

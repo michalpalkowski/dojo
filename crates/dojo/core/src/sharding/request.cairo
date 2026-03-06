@@ -144,12 +144,6 @@ pub trait IntoShardModel {
     fn shard_add(self: (felt252, Layout), keys: Span<felt252>) -> ShardModel;
     fn shard_lock(self: (felt252, Layout), keys: Span<felt252>) -> ShardModel;
     fn shard_set_lock(self: (felt252, Layout), keys: Span<felt252>) -> ShardModel;
-    /// PN-Counter: paired G-Counters for fields that can be both added to and subtracted from.
-    ///
-    /// The model should have fields in (additions, subtractions) pairs.
-    /// Both are treated as G-Counters (grow-only Add CRDT).
-    /// Balance = additions - subtractions.
-    fn shard_pn(self: (felt252, Layout), keys: Span<felt252>) -> ShardModel;
 }
 
 impl SelectorLayoutIntoShardModel of IntoShardModel {
@@ -171,10 +165,5 @@ impl SelectorLayoutIntoShardModel of IntoShardModel {
     fn shard_set_lock(self: (felt252, Layout), keys: Span<felt252>) -> ShardModel {
         let (selector, layout) = self;
         ShardModel { selector, keys, fields: expand_layout(layout, CRDVariant::SetLock) }
-    }
-
-    fn shard_pn(self: (felt252, Layout), keys: Span<felt252>) -> ShardModel {
-        let (selector, layout) = self;
-        ShardModel { selector, keys, fields: expand_layout(layout, CRDVariant::Add) }
     }
 }

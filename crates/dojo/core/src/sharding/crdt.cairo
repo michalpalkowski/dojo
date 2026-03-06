@@ -1,26 +1,28 @@
 use starknet::ContractAddress;
 
-pub type slot_key = felt252;
-pub type slot_value = felt252;
+pub type SlotKey = felt252;
+pub type SlotValue = felt252;
 
 #[derive(Drop, Serde, Hash, Copy, Debug, PartialEq, starknet::Store)]
 pub enum CRDType {
-    Add: (ContractAddress, slot_value),
-    SetLock: (ContractAddress, slot_value),
+    Add: (ContractAddress, SlotValue),
+    SetLock: (ContractAddress, SlotValue),
     #[default]
-    Set: (ContractAddress, slot_value),
-    Lock: (ContractAddress, slot_value),
+    Set: (ContractAddress, SlotValue),
+    Lock: (ContractAddress, SlotValue),
 }
 
 pub trait CRDTypeTrait {
-    fn verify_crd_type(self: CRDType, crd_type: CRDType);
+    fn assert_is_base_set(self: CRDType);
     fn is_same_variant(self: CRDType, other: CRDType) -> bool;
     fn contract_address(self: CRDType) -> ContractAddress;
-    fn slot(self: CRDType) -> slot_value;
+    fn slot(self: CRDType) -> SlotValue;
 }
 
 pub impl CRDTypeImpl of CRDTypeTrait {
-    fn verify_crd_type(self: CRDType, crd_type: CRDType) {
+    /// Asserts this type is the base `Set` state (init_count == 0).
+    /// Set can transition to any type — this is the only valid starting point.
+    fn assert_is_base_set(self: CRDType) {
         let is_valid = match self {
             CRDType::Set(_) => true,
             _ => false,

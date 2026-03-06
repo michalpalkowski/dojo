@@ -59,6 +59,7 @@ pub mod world {
     use starknet::syscalls::{
         call_contract_syscall, deploy_syscall, get_class_hash_at_syscall, replace_class_syscall,
     };
+    use core::dict::{Felt252Dict, Felt252DictTrait};
     use starknet::{ClassHash, ContractAddress, SyscallResultTrait, get_caller_address, get_tx_info};
     use super::Permission;
 
@@ -1282,14 +1283,15 @@ pub mod world {
             //    so we use Dojo's read_model_member / read_model_entity which handle
             //    layout-aware deserialization (unpacking Fixed, recursing Struct, etc.).
 
-            // Deduplicate: track emitted (model, entity, member) triples.
-            // When entity keys are stored (registered via request_sharding), we emit
-            // one StoreSetRecord per (model, entity) — normalize member to 0.
-            // Otherwise emit one StoreUpdateMember per (model, entity, member).
-            let mut emitted: Array<(felt252, felt252, felt252)> = ArrayTrait::new();
+            // Deduplicate: track emitted (model, entity, member) triples via Felt252Dict.
+            // Key = hash(model, entity, dedup_member). O(1) lookup instead of O(n²).
+            let mut emitted: Felt252Dict<felt252> = Default::default();
 
-            // Model layout cache: avoid repeated cross-contract calls.
-            let mut layout_cache: Array<(felt252, Layout)> = ArrayTrait::new();
+            // Model layout cache via Felt252Dict: O(1) lookup instead of O(n).
+            // We store layouts in an array and map model_selector → (index + 1) in the dict.
+            // Index 0 in dict means "not cached". Layout is read from layouts_store[index].
+            let mut layout_dict: Felt252Dict<felt252> = Default::default();
+            let mut layouts_store: Array<Layout> = ArrayTrait::new();
 
             // Track entity_ids that need keys cleared after all emissions.
             let mut entities_to_clear: Array<felt252> = ArrayTrait::new();
@@ -1305,42 +1307,33 @@ pub mod world {
                 let has_keys = keys.len() > 0;
                 let dedup_member = if has_keys { 0 } else { member_sel };
 
-                // Skip if already emitted for this (model, entity, member)
-                let mut skip = false;
-                for e in emitted.span() {
-                    let (em, ee, emem) = *e;
-                    if em == model_sel && ee == entity_id && emem == dedup_member {
-                        skip = true;
-                        break;
-                    }
-                };
-                if skip {
+                // Skip if already emitted for this (model, entity, member).
+                // Use hash as dict key for O(1) dedup.
+                let dedup_key = core::poseidon::poseidon_hash_span(
+                    [model_sel, entity_id, dedup_member].span(),
+                );
+                if Felt252DictTrait::get(ref emitted, dedup_key) != 0 {
                     continue;
                 }
-                emitted.append((model_sel, entity_id, dedup_member));
+                Felt252DictTrait::insert(ref emitted, dedup_key, 1);
 
-                // Get model layout from cache or model contract.
-                let mut found_layout: Option<Layout> = Option::None;
-                for entry in layout_cache.span() {
-                    let (cached_sel, cached_layout) = *entry;
-                    if cached_sel == model_sel {
-                        found_layout = Option::Some(cached_layout);
-                        break;
+                // Get model layout from dict cache or model contract.
+                let cached_idx = Felt252DictTrait::get(ref layout_dict, model_sel);
+                let model_layout: Option<Layout> = if cached_idx != 0 {
+                    let idx: u32 = (cached_idx - 1).try_into().unwrap();
+                    Option::Some(*layouts_store[idx])
+                } else {
+                    match self.resources.read(model_sel) {
+                        Resource::Model((addr, _)) => {
+                            let l = IStoredResourceDispatcher { contract_address: addr }
+                                .layout();
+                            let store_idx: felt252 = (layouts_store.len() + 1).into();
+                            layouts_store.append(l);
+                            Felt252DictTrait::insert(ref layout_dict, model_sel, store_idx);
+                            Option::Some(l)
+                        },
+                        _ => Option::None,
                     }
-                };
-                let model_layout: Option<Layout> = match found_layout {
-                    Option::Some(l) => Option::Some(l),
-                    Option::None => {
-                        match self.resources.read(model_sel) {
-                            Resource::Model((addr, _)) => {
-                                let l = IStoredResourceDispatcher { contract_address: addr }
-                                    .layout();
-                                layout_cache.append((model_sel, l));
-                                Option::Some(l)
-                            },
-                            _ => Option::None,
-                        }
-                    },
                 };
 
                 if has_keys {
@@ -1424,8 +1417,19 @@ pub mod world {
 
         fn cancel_shard_state(ref self: ContractState, slots: Span<felt252>) {
             self.sharding.cancel_shard_state(slots);
+
+            // Clear per-slot metadata and collect entity_ids for key cleanup.
+            let mut cleared_entities: Felt252Dict<felt252> = Default::default();
             for slot in slots {
-                self.sharding.clear_slot_metadata(*slot);
+                let slot = *slot;
+                let (_, entity_id, _) = self.sharding.read_slot_metadata(slot);
+                self.sharding.clear_slot_metadata(slot);
+
+                // Clear entity keys once per entity_id (avoid redundant work).
+                if entity_id != 0 && Felt252DictTrait::get(ref cleared_entities, entity_id) == 0 {
+                    Felt252DictTrait::insert(ref cleared_entities, entity_id, 1);
+                    self.sharding.clear_entity_keys(entity_id);
+                }
             };
         }
     }
