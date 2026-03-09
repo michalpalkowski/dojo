@@ -90,6 +90,27 @@ fn test_request_sharding_add_delta() {
     assert(result.b == 200, 'b should be unchanged');
 }
 
+/// Test: SetLock blocks regular main-chain writes while shard is active.
+#[test]
+#[should_panic]
+fn test_request_sharding_set_lock_blocks_main_write() {
+    let (mut world, model_selector) = deploy_world_and_foo();
+
+    let bob: ContractAddress = 0xb0b.try_into().unwrap();
+    let foo = Foo { caller: bob, a: 100, b: 200 };
+    world.write_model_test(@foo);
+
+    let proxy_address = declare_and_deploy("mock_sharding_proxy");
+
+    let layout = Model::<Foo>::layout();
+    let models = [(model_selector, layout).shard_set_lock([bob.into()].span())].span();
+    world.dispatcher.request_sharding(proxy_address, models);
+
+    // Regular world write must fail while SetLock slots are active.
+    let foo_updated = Foo { caller: bob, a: 120, b: 250 };
+    world.write_model_test(@foo_updated);
+}
+
 /// Test: request_sharding creates slots for ALL fields in the model.
 #[test]
 fn test_request_sharding_all_fields() {

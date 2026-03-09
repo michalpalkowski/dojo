@@ -1619,12 +1619,14 @@ pub mod world {
             match index {
                 ModelIndex::Keys(keys) => {
                     let entity_id = entity_id_from_serialized_keys(keys);
+                    self.assert_model_write_unlocked(model_selector, entity_id, layout);
                     storage::entity_model::write_model_entity(
                         model_selector, entity_id, values, layout,
                     );
                     self.emit(StoreSetRecord { selector: model_selector, keys, values, entity_id });
                 },
                 ModelIndex::Id(entity_id) => {
+                    self.assert_model_write_unlocked(model_selector, entity_id, layout);
                     storage::entity_model::write_model_entity(
                         model_selector, entity_id, values, layout,
                     );
@@ -1633,6 +1635,7 @@ pub mod world {
                 ModelIndex::MemberId((
                     entity_id, member_selector,
                 )) => {
+                    self.assert_member_write_unlocked(model_selector, entity_id, member_selector);
                     storage::entity_model::write_model_member(
                         model_selector, entity_id, member_selector, values, layout,
                     );
@@ -1659,10 +1662,12 @@ pub mod world {
             match index {
                 ModelIndex::Keys(keys) => {
                     let entity_id = entity_id_from_serialized_keys(keys);
+                    self.assert_model_write_unlocked(model_selector, entity_id, layout);
                     storage::entity_model::delete_model_entity(model_selector, entity_id, layout);
                     self.emit(StoreDelRecord { selector: model_selector, entity_id });
                 },
                 ModelIndex::Id(entity_id) => {
+                    self.assert_model_write_unlocked(model_selector, entity_id, layout);
                     storage::entity_model::delete_model_entity(model_selector, entity_id, layout);
                     self.emit(StoreDelRecord { selector: model_selector, entity_id });
                 },
@@ -1704,6 +1709,54 @@ pub mod world {
             let hash = bytearray_hash(@name);
 
             (name, hash)
+        }
+
+        /// Guard regular world writes against active exclusive shard locks.
+        ///
+        /// Settlement writes still flow through `update_shard_state` (proxy-only path),
+        /// while gameplay writes to main chain must fail for `SetLock/Lock` slots.
+        fn assert_model_write_unlocked(
+            self: @ContractState, model_selector: felt252, entity_id: felt252, layout: Layout,
+        ) {
+            match layout {
+                Layout::Struct(fields) => {
+                    for field_layout in fields {
+                        let slot = compute_dojo_field_slot(
+                            model_selector, entity_id, *field_layout.selector,
+                        );
+                        self.assert_slot_writable(slot);
+                    }
+                },
+                Layout::Fixed(bits_layout) => {
+                    let mut bits_layout = bits_layout;
+                    let packed_size = dojo::storage::packing::calculate_packed_size(
+                        ref bits_layout,
+                    );
+                    let packed_base = compute_dojo_packed_slot(model_selector, entity_id);
+                    let mut i: usize = 0;
+                    while i < packed_size {
+                        self.assert_slot_writable(packed_base + i.into());
+                        i += 1;
+                    };
+                },
+                _ => {},
+            }
+        }
+
+        /// Member writes always map to the Dojo field slot keyed by `member_selector`.
+        fn assert_member_write_unlocked(
+            self: @ContractState,
+            model_selector: felt252,
+            entity_id: felt252,
+            member_selector: felt252,
+        ) {
+            let slot = compute_dojo_field_slot(model_selector, entity_id, member_selector);
+            self.assert_slot_writable(slot);
+        }
+
+        #[inline(always)]
+        fn assert_slot_writable(self: @ContractState, slot: felt252) {
+            assert(!self.sharding.is_slot_exclusive_locked(slot), sharding_cpt::Errors::SLOT_LOCKED);
         }
     }
 }

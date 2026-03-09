@@ -196,6 +196,16 @@ pub mod sharding_component {
             )
         }
 
+        /// Returns true when `slot` is currently active under an exclusive CRDT
+        /// (`SetLock` or `Lock`). These slots must reject regular world writes
+        /// while shard gameplay is active on main chain.
+        fn is_slot_exclusive_locked(
+            self: @ComponentState<TContractState>, slot: felt252,
+        ) -> bool {
+            let (crd_type, init_count) = self.slots.read(slot);
+            init_count != 0 && crd_type.is_exclusive()
+        }
+
         fn clear_slot_metadata(ref self: ComponentState<TContractState>, slot: felt252) {
             self.slot_model_selector.write(slot, 0);
             self.slot_entity_id.write(slot, 0);
