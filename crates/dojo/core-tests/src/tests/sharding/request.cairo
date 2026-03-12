@@ -246,6 +246,88 @@ fn test_cancel_shard_state_rejects_partial_exclusive_group() {
     sharding_proxy.cancel_shard_state(array![slot_a].span());
 }
 
+/// Test: settle must cover all exclusive slots in a single sharding request.
+#[test]
+#[should_panic]
+fn test_settle_shard_changes_rejects_partial_exclusive_request() {
+    let (mut world, model_selector) = deploy_world_and_foo();
+    let world_address = world.dispatcher.contract_address;
+
+    let bob: ContractAddress = 0xb0b.try_into().unwrap();
+    let alice: ContractAddress = 0xa11ce.try_into().unwrap();
+    world.write_model_test(@Foo { caller: bob, a: 100, b: 200 });
+    world.write_model_test(@Foo { caller: alice, a: 300, b: 400 });
+
+    let proxy_address = declare_and_deploy("mock_sharding_proxy");
+    let models = [
+        (
+            model_selector, Model::<Foo>::layout(),
+        )
+            .shard_with(
+                [bob.into()].span(), CRDVariant::SetLock, ShardFieldSelection::AutoDeterministic,
+            ),
+        (
+            model_selector, Model::<Foo>::layout(),
+        )
+            .shard_with(
+                [alice.into()].span(), CRDVariant::SetLock, ShardFieldSelection::AutoDeterministic,
+            ),
+    ]
+        .span();
+    world.dispatcher.request_sharding(proxy_address, models);
+
+    let (sel_a, sel_b) = foo_field_selectors();
+    let bob_entity_id = entity_id_from_keys(@bob);
+    let bob_slot_a = compute_dojo_field_slot(model_selector, bob_entity_id, sel_a);
+    let bob_slot_b = compute_dojo_field_slot(model_selector, bob_entity_id, sel_b);
+    let sharding_proxy = IShardingProxyDispatcher { contract_address: world_address };
+
+    snforge_std::start_cheat_caller_address(world_address, proxy_address);
+    sharding_proxy.settle_shard_changes(
+        array![(bob_slot_a, 111), (bob_slot_b, 222)], [].span(), [].span(),
+    );
+}
+
+/// Test: cancel must cover all exclusive slots in a single sharding request.
+#[test]
+#[should_panic]
+fn test_cancel_shard_state_rejects_partial_exclusive_request() {
+    let (mut world, model_selector) = deploy_world_and_foo();
+    let world_address = world.dispatcher.contract_address;
+
+    let bob: ContractAddress = 0xb0b.try_into().unwrap();
+    let alice: ContractAddress = 0xa11ce.try_into().unwrap();
+    world.write_model_test(@Foo { caller: bob, a: 100, b: 200 });
+    world.write_model_test(@Foo { caller: alice, a: 300, b: 400 });
+
+    let proxy_address = declare_and_deploy("mock_sharding_proxy");
+    let models = [
+        (
+            model_selector, Model::<Foo>::layout(),
+        )
+            .shard_with(
+                [bob.into()].span(), CRDVariant::SetLock, ShardFieldSelection::AutoDeterministic,
+            ),
+        (
+            model_selector, Model::<Foo>::layout(),
+        )
+            .shard_with(
+                [alice.into()].span(), CRDVariant::SetLock, ShardFieldSelection::AutoDeterministic,
+            ),
+    ]
+        .span();
+    world.dispatcher.request_sharding(proxy_address, models);
+
+    let (sel_a, sel_b) = foo_field_selectors();
+    let bob_entity_id = entity_id_from_keys(@bob);
+    let bob_slot_a = compute_dojo_field_slot(model_selector, bob_entity_id, sel_a);
+    let bob_slot_b = compute_dojo_field_slot(model_selector, bob_entity_id, sel_b);
+    let sharding_proxy = IShardingProxyDispatcher { contract_address: world_address };
+
+    snforge_std::start_cheat_caller_address(world_address, proxy_address);
+    sharding_proxy.cancel_shard_state(array![bob_slot_a, bob_slot_b].span());
+}
+
 /// Test: request_sharding creates slots for ALL fields in the model.
 #[test]
 fn test_request_sharding_all_fields() {

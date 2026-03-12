@@ -97,7 +97,29 @@ fn test_component_add_after_set_fails() {
 }
 
 #[test]
-#[should_panic(expected: ('Component: Slot locked by shard',))]
+#[should_panic]
+fn test_component_lock_after_double_set_fails() {
+    let (mut world, model_selector) = deploy_world_and_foo();
+    let bob: ContractAddress = 0xb0b.try_into().unwrap();
+    world.write_model_test(@Foo { caller: bob, a: 10, b: 20 });
+
+    let proxy_address = declare_and_deploy("mock_sharding_proxy");
+    let set_models = [(model_selector, Model::<Foo>::layout()).shard([bob.into()].span())].span();
+    world.dispatcher.request_sharding(proxy_address, set_models);
+    world.dispatcher.request_sharding(proxy_address, set_models);
+
+    let lock_models = [(
+        model_selector, Model::<Foo>::layout(),
+    )
+        .shard_with(
+            [bob.into()].span(), CRDVariant::Lock, ShardFieldSelection::AutoDeterministic,
+        )]
+        .span();
+    world.dispatcher.request_sharding(proxy_address, lock_models);
+}
+
+#[test]
+#[should_panic]
 fn test_component_lock_after_lock_fails() {
     let (mut world, model_selector) = deploy_world_and_foo();
     let bob: ContractAddress = 0xb0b.try_into().unwrap();

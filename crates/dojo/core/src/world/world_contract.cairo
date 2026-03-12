@@ -1203,6 +1203,7 @@ pub mod world {
             let world_addr = starknet::get_contract_address();
             let mut all_slots: Array<CRDType> = ArrayTrait::new();
             let mut seen_slots: Felt252Dict<felt252> = Default::default();
+            let request_exclusive_group_id = self.sharding.next_exclusive_group_id();
 
             for model in models {
                 let model = *model;
@@ -1217,7 +1218,6 @@ pub mod world {
                 // Compute entity_id from keys.
                 let entity_id = entity_id_from_serialized_keys(model.keys);
                 self.sharding.store_entity_keys(entity_id, model.keys);
-                let exclusive_group_id = self.compute_exclusive_group_id(model.selector, entity_id);
 
                 let planned_slots = plan_model_slots(
                     model.selector, entity_id, model_layout, model.fields, model.coverage,
@@ -1231,7 +1231,7 @@ pub mod world {
                     Felt252DictTrait::insert(ref seen_slots, planned.slot, 1);
 
                     let group_id = match planned.crdt {
-                        CRDVariant::SetLock | CRDVariant::Lock => exclusive_group_id,
+                        CRDVariant::SetLock | CRDVariant::Lock => request_exclusive_group_id,
                         _ => 0,
                     };
                     self.sharding.store_slot_metadata(
@@ -1570,14 +1570,6 @@ pub mod world {
                 }
             };
             slot_metas
-        }
-
-        fn compute_exclusive_group_id(
-            self: @ContractState, model_selector: felt252, entity_id: felt252,
-        ) -> felt252 {
-            core::poseidon::poseidon_hash_span(
-                ['dojo_exclusive_group', model_selector, entity_id].span(),
-            )
         }
 
         fn collect_settlement_unlock_slots(

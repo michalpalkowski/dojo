@@ -42,6 +42,8 @@ pub mod sharding_component {
         slot_group_id: Map<felt252, felt252>,
         /// Number of active exclusive slots for each group.
         group_active_slot_count: Map<felt252, u32>,
+        /// Monotonic nonce for request-level exclusive lock groups.
+        exclusive_group_nonce: felt252,
         /// Number of currently active metadata slots for each entity.
         entity_active_slot_count: Map<felt252, u32>,
         /// Entity keys for StoreSetRecord emission (Torii needs keys for new entities).
@@ -88,6 +90,8 @@ pub mod sharding_component {
 
                 if init_count != 0 {
                     assert(!prev_crd_type.is_exclusive(), Errors::SLOT_LOCKED);
+                    // Active slot CRDT type is immutable until fully unlocked.
+                    // This prevents flows like Set -> Set -> Lock on the same slot.
                     assert(
                         prev_crd_type.is_same_variant(crd_type), Errors::TYPE_CHANGE_WHILE_ACTIVE,
                     );
@@ -307,6 +311,14 @@ pub mod sharding_component {
                 assert(expected != 0, 'Shard grp: invalid');
                 assert(provided == expected, 'Shard grp: partial');
             };
+        }
+
+        /// Allocate a new group id for request-level exclusive lock atomicity.
+        fn next_exclusive_group_id(ref self: ComponentState<TContractState>) -> felt252 {
+            let current = self.exclusive_group_nonce.read();
+            let next = safe_increment(current, 'Group nonce overflow');
+            self.exclusive_group_nonce.write(next);
+            next
         }
 
         /// Idempotent — skips if already stored for this entity_id.
