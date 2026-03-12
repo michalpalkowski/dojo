@@ -56,6 +56,15 @@ fn mixed_dynamic_selectors() -> (felt252, felt252) {
     }
 }
 
+fn not_copiable_selectors() -> (felt252, felt252) {
+    let layout = Model::<NotCopiable>::layout();
+    if let dojo::meta::Layout::Struct(fields) = layout {
+        ((*fields[0]).selector, (*fields[1]).selector)
+    } else {
+        panic!("expected struct layout")
+    }
+}
+
 fn nested_fixed_selectors() -> (felt252, felt252, felt252) {
     let layout = Model::<NestedFixed>::layout();
     if let dojo::meta::Layout::Struct(fields) = layout {
@@ -919,6 +928,26 @@ fn test_request_sharding_dynamic_lock_blocks_forged_member_layout_write() {
         );
 }
 
+/// Regression: unknown member selector writes must be rejected
+#[test]
+#[should_panic]
+fn test_request_sharding_rejects_unknown_member_selector_write() {
+    let (mut world, model_selector) = deploy_world_with_mixed_dynamic();
+
+    let bob: ContractAddress = 0xb0b.try_into().unwrap();
+    world.write_model_test(@MixedDynamic { player: bob, fixed_value: 10, note: "hello" });
+
+    let entity_id = entity_id_from_keys(@bob);
+    world
+        .dispatcher
+        .set_entity(
+            model_selector,
+            ModelIndex::MemberId((entity_id, 0xDEAD_BEEF)),
+            [1].span(),
+            dojo::meta::Layout::Fixed([8].span()),
+        );
+}
+
 /// Test: settle_shard_changes rejects empty payload (no slots, no members).
 #[test]
 #[should_panic]
@@ -1077,6 +1106,80 @@ fn test_settle_shard_changes_rejects_duplicate_member_writes() {
     sharding_proxy.settle_shard_changes(array![], member_writes, member_values);
 }
 
+/// Regression: settle must reject trailing/unused member_write_values payload.
+#[test]
+#[should_panic]
+fn test_settle_shard_changes_rejects_unused_member_write_values() {
+    let (mut world, model_selector) = deploy_world_with_mixed_dynamic();
+    let world_address = world.dispatcher.contract_address;
+    let bob: ContractAddress = 0xb0b.try_into().unwrap();
+    world.write_model_test(@MixedDynamic { player: bob, fixed_value: 10, note: "hello" });
+
+    let proxy_address = declare_and_deploy("mock_sharding_proxy");
+    let layout = Model::<MixedDynamic>::layout();
+    let models = [(model_selector, layout).shard_dynamic([bob.into()].span())].span();
+    world.dispatcher.request_sharding(proxy_address, models);
+
+    let (fixed_selector, note_selector) = mixed_dynamic_selectors();
+    let entity_id = entity_id_from_keys(@bob);
+    let fixed_slot = compute_dojo_field_slot(model_selector, entity_id, fixed_selector);
+    let member_writes = [
+        ShardMemberWrite {
+            model_selector,
+            entity_id,
+            member_selector: note_selector,
+            values_offset: 0,
+            values_len: 3,
+        },
+    ]
+        .span();
+    // 4th value is intentionally unused.
+    let member_values: Span<felt252> = [0, 0, 0, 123].span();
+
+    let sharding_proxy = IShardingProxyDispatcher { contract_address: world_address };
+    snforge_std::start_cheat_caller_address(world_address, proxy_address);
+    sharding_proxy.settle_shard_changes(array![(fixed_slot, 77)], member_writes, member_values);
+}
+
+/// Regression: member_write_values payload must be contiguous/non-overlapping by ranges.
+#[test]
+#[should_panic]
+fn test_settle_shard_changes_rejects_overlapping_member_write_values_ranges() {
+    let (world, model_selector) = deploy_world_with_not_copiable();
+    let world_address = world.dispatcher.contract_address;
+    let bob: ContractAddress = 0xb0b.try_into().unwrap();
+
+    let proxy_address = declare_and_deploy("mock_sharding_proxy");
+    let layout = Model::<NotCopiable>::layout();
+    let models = [(model_selector, layout).shard_dynamic([bob.into()].span())].span();
+    world.dispatcher.request_sharding(proxy_address, models);
+
+    let (array_selector, byte_array_selector) = not_copiable_selectors();
+    let entity_id = entity_id_from_keys(@bob);
+    let member_writes = [
+        ShardMemberWrite {
+            model_selector,
+            entity_id,
+            member_selector: array_selector,
+            values_offset: 0,
+            values_len: 1,
+        },
+        ShardMemberWrite {
+            model_selector,
+            entity_id,
+            member_selector: byte_array_selector,
+            values_offset: 0,
+            values_len: 3,
+        },
+    ]
+        .span();
+    let member_values: Span<felt252> = [0, 0, 0].span();
+
+    let sharding_proxy = IShardingProxyDispatcher { contract_address: world_address };
+    snforge_std::start_cheat_caller_address(world_address, proxy_address);
+    sharding_proxy.settle_shard_changes(array![], member_writes, member_values);
+}
+
 /// Test: dynamic fields must be requested with SetLock CRDT.
 #[test]
 #[should_panic]
@@ -1227,5 +1330,24 @@ fn test_end_shard() {
     world.dispatcher.request_sharding(proxy_address, models);
 
     // Should not panic — forwards to proxy.end_shard().
+    snforge_std::start_cheat_caller_address(world.dispatcher.contract_address, proxy_address);
+    world.dispatcher.end_shard();
+    snforge_std::stop_cheat_caller_address(world.dispatcher.contract_address);
+}
+
+/// Regression: only sharding proxy can call end_shard.
+#[test]
+#[should_panic]
+fn test_end_shard_rejects_non_proxy_caller() {
+    let (mut world, model_selector) = deploy_world_and_foo();
+    let bob: ContractAddress = 0xb0b.try_into().unwrap();
+    world.write_model_test(@Foo { caller: bob, a: 100, b: 200 });
+
+    let proxy_address = declare_and_deploy("mock_sharding_proxy");
+    let layout = Model::<Foo>::layout();
+    let models = [(model_selector, layout).shard([bob.into()].span())].span();
+    world.dispatcher.request_sharding(proxy_address, models);
+
+    // Default test caller is not the sharding proxy.
     world.dispatcher.end_shard();
 }

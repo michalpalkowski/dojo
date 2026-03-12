@@ -1246,6 +1246,10 @@ pub mod world {
         }
 
         fn end_shard(ref self: ContractState) {
+            assert(
+                get_caller_address() == self.sharding.sharding_contract(),
+                sharding_cpt::Errors::UNAUTHORIZED_CALLER,
+            );
             self.sharding.end_shard();
         }
     }
@@ -1288,6 +1292,7 @@ pub mod world {
                 get_caller_address() == self.sharding.sharding_contract(),
                 sharding_cpt::Errors::UNAUTHORIZED_CALLER,
             );
+            self.assert_member_write_values_exact_coverage(member_writes, member_write_values);
 
             let requested_unlock_slots = self.collect_settlement_unlock_slots(
                 slot_changes.span(), member_writes,
@@ -1642,6 +1647,39 @@ pub mod world {
             values
         }
 
+        fn assert_member_write_values_exact_coverage(
+            self: @ContractState,
+            member_writes: Span<ShardMemberWrite>,
+            member_write_values: Span<felt252>,
+        ) {
+            if member_writes.len() == 0 {
+                assert(member_write_values.len() == 0, 'Shard settle: values unused');
+                return;
+            }
+
+            let mut covered: Felt252Dict<felt252> = Default::default();
+            let mut covered_len: u32 = 0;
+            for member_write in member_writes {
+                let member_write = *member_write;
+                let values_end = member_write.values_offset + member_write.values_len;
+                assert(values_end <= member_write_values.len(), 'Shard settle: values range');
+
+                let mut values_i: u32 = member_write.values_offset;
+                while values_i < values_end {
+                    let values_key: felt252 = values_i.into();
+                    assert(
+                        Felt252DictTrait::get(ref covered, values_key) == 0,
+                        'Shard settle: values overlap',
+                    );
+                    Felt252DictTrait::insert(ref covered, values_key, 1);
+                    covered_len += 1;
+                    values_i += 1;
+                };
+            };
+
+            assert(covered_len == member_write_values.len(), 'Shard settle: values unused');
+        }
+
         fn read_model_layout_or_panic(self: @ContractState, model_selector: felt252) -> Layout {
             let model_addr = match self.resources.read(model_selector) {
                 Resource::Model((addr, _)) => addr,
@@ -1976,6 +2014,19 @@ pub mod world {
             member_selector: felt252,
             member_layout: Layout,
         ) {
+            let model_layout = self.read_model_layout_or_panic(model_selector);
+            let canonical_member_layout = match dojo::utils::find_model_field_layout(
+                model_layout, member_selector,
+            ) {
+                Option::Some(layout) => layout,
+                Option::None => panic_with_byte_array(
+                    @format!(
+                        "set_entity: field layout not found for member {}",
+                        member_selector,
+                    ),
+                ),
+            };
+
             let member_key = combine_key(entity_id, member_selector);
             let mut slots: Array<felt252> = ArrayTrait::new();
             let deterministic = collect_shardable_slots(
@@ -1996,15 +2047,11 @@ pub mod world {
             // Defend against forged deterministic layouts for dynamic top-level members.
             // Even if caller-provided `member_layout` is deterministic, canonical model
             // layout may mark this member as dynamic and therefore protected by lock slot.
-            let model_layout = self.read_model_layout_or_panic(model_selector);
-            if let Option::Some(canonical_member_layout) =
-                dojo::utils::find_model_field_layout(model_layout, member_selector) {
-                if is_dynamic_layout(canonical_member_layout) {
-                    let dynamic_slot = compute_dynamic_member_lock_slot(
-                        model_selector, entity_id, member_selector,
-                    );
-                    self.assert_slot_writable(dynamic_slot);
-                }
+            if is_dynamic_layout(canonical_member_layout) {
+                let dynamic_slot = compute_dynamic_member_lock_slot(
+                    model_selector, entity_id, member_selector,
+                );
+                self.assert_slot_writable(dynamic_slot);
             }
         }
 
