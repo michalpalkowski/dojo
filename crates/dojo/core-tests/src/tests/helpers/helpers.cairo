@@ -62,6 +62,16 @@ pub struct Score {
     pub level: u32,
 }
 
+/// Packed model intentionally spanning two storage slots (2 * u128 = 256 bits).
+#[derive(IntrospectPacked, Copy)]
+#[dojo::model]
+pub struct PackedPair {
+    #[key]
+    pub player: ContractAddress,
+    pub left: u128,
+    pub right: u128,
+}
+
 #[derive(Copy)]
 #[dojo::model]
 pub struct Balance256 {
@@ -422,6 +432,14 @@ pub fn deploy_world_with_score() -> (WorldStorage, felt252) {
         resources: [TestResource::Model("Score")].span(),
     };
     (spawn_test_world([namespace_def].span()), Model::<Score>::selector(DOJO_NSH))
+}
+
+pub fn deploy_world_with_packed_pair() -> (WorldStorage, felt252) {
+    let namespace_def = NamespaceDef {
+        namespace: "dojo",
+        resources: [TestResource::Model("PackedPair")].span(),
+    };
+    (spawn_test_world([namespace_def].span()), Model::<PackedPair>::selector(DOJO_NSH))
 }
 
 pub fn deploy_world_with_balance256() -> (WorldStorage, felt252) {

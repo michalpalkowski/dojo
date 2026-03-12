@@ -66,6 +66,32 @@ pub mod sharding_component {
         pub const SLOT_METADATA_MISMATCH: felt252 = 'Component: Bad metadata';
     }
 
+    #[inline(always)]
+    fn assert_slot_reinit_allowed(prev_crd_type: CRDType, init_count: InitCount, next_crd_type: CRDType) {
+        if init_count == 0 {
+            prev_crd_type.assert_is_base_set();
+            return;
+        }
+
+        assert(!prev_crd_type.is_exclusive(), Errors::SLOT_LOCKED);
+        // Active slot CRDT type is immutable until fully unlocked.
+        // This prevents flows like Set -> Set -> Lock on the same slot.
+        assert(prev_crd_type.is_same_variant(next_crd_type), Errors::TYPE_CHANGE_WHILE_ACTIVE);
+    }
+
+    #[inline(always)]
+    fn should_snapshot_initial_add_value(crd_type: CRDType, init_count: InitCount) -> bool {
+        if init_count != 0 {
+            return false;
+        }
+
+        if let CRDType::Add(_) = crd_type {
+            return true;
+        }
+
+        false
+    }
+
     #[embeddable_as(ContractComponentImpl)]
     impl ContractImpl<
         TContractState, +HasComponent<TContractState>,
@@ -87,17 +113,7 @@ pub mod sharding_component {
                 let crd_type = *crd_type;
 
                 let (prev_crd_type, init_count) = self.slots.read(crd_type.slot());
-
-                if init_count != 0 {
-                    assert(!prev_crd_type.is_exclusive(), Errors::SLOT_LOCKED);
-                    // Active slot CRDT type is immutable until fully unlocked.
-                    // This prevents flows like Set -> Set -> Lock on the same slot.
-                    assert(
-                        prev_crd_type.is_same_variant(crd_type), Errors::TYPE_CHANGE_WHILE_ACTIVE,
-                    );
-                } else {
-                    prev_crd_type.assert_is_base_set();
-                }
+                assert_slot_reinit_allowed(prev_crd_type, init_count, crd_type);
 
                 let new_init_count = safe_increment(init_count, 'Init count overflow');
                 self.slots.write(crd_type.slot(), (crd_type, new_init_count));
@@ -106,12 +122,10 @@ pub mod sharding_component {
                 // When multiple shards stack on the same Add slot, the initial snapshot
                 // must remain from the first shard — otherwise subsequent initializations
                 // would overwrite it and corrupt delta computation at settlement time.
-                if let CRDType::Add(_) = crd_type {
-                    if init_count == 0 {
-                        let storage_address: StorageAddress = crd_type.slot().try_into().unwrap();
-                        let current = storage_read_syscall(0, storage_address).unwrap_syscall();
-                        self.initial_add_values.write(crd_type.slot(), current);
-                    }
+                if should_snapshot_initial_add_value(crd_type, init_count) {
+                    let storage_address: StorageAddress = crd_type.slot().try_into().unwrap();
+                    let current = storage_read_syscall(0, storage_address).unwrap_syscall();
+                    self.initial_add_values.write(crd_type.slot(), current);
                 }
             }
 
@@ -282,12 +296,16 @@ pub mod sharding_component {
         fn assert_exclusive_group_full_coverage(
             self: @ComponentState<TContractState>, slots: Span<felt252>,
         ) {
+            let mut seen_slots: Felt252Dict<felt252> = Default::default();
             let mut seen_groups: Felt252Dict<felt252> = Default::default();
             let mut group_counts: Felt252Dict<felt252> = Default::default();
             let mut groups: Array<felt252> = ArrayTrait::new();
 
             for slot in slots {
                 let slot = *slot;
+                assert(Felt252DictTrait::get(ref seen_slots, slot) == 0, Errors::DUPLICATE_SLOT);
+                Felt252DictTrait::insert(ref seen_slots, slot, 1);
+
                 let group_id = self.slot_group_id.read(slot);
                 if group_id == 0 {
                     continue;

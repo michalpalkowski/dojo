@@ -1,4 +1,4 @@
-use dojo::model::{Model, ModelStorage, ModelStorageTest};
+use dojo::model::{Model, ModelIndex, ModelStorage, ModelStorageTest};
 use dojo::sharding::compute_dojo_field_slot;
 use dojo::sharding::slot::{PACKED_SLOT_BASE, compute_dojo_packed_slot};
 use dojo::sharding::request::{
@@ -12,10 +12,11 @@ use dojo_snf_test::declare_and_deploy;
 use starknet::ContractAddress;
 
 use crate::tests::helpers::{
-    Balance256, Foo, MixedDynamic, NestedFixed, NestedStats, NotCopiable, TupleArrayOption,
-    deploy_world_and_foo,
-    deploy_world_with_balance256, deploy_world_with_mixed_dynamic, deploy_world_with_nested_fixed,
-    deploy_world_with_not_copiable, deploy_world_with_score, deploy_world_with_tuple_array_option,
+    Balance256, Foo, MixedDynamic, NestedFixed, NestedStats, NotCopiable, PackedPair,
+    TupleArrayOption, deploy_world_and_foo, deploy_world_with_balance256,
+    deploy_world_with_mixed_dynamic, deploy_world_with_nested_fixed,
+    deploy_world_with_not_copiable, deploy_world_with_packed_pair, deploy_world_with_score,
+    deploy_world_with_tuple_array_option,
 };
 
 /// Helper: get the local layout field selectors for Foo (same compilation unit as write/read_model).
@@ -188,6 +189,38 @@ fn test_request_sharding_set_lock_blocks_main_write() {
     world.write_model_test(@foo_updated);
 }
 
+/// Regression: model-level writes must not bypass SetLock with forged layouts.
+#[test]
+#[should_panic]
+fn test_request_sharding_set_lock_blocks_forged_model_layout_write() {
+    let (mut world, model_selector) = deploy_world_and_foo();
+
+    let bob: ContractAddress = 0xb0b.try_into().unwrap();
+    world.write_model_test(@Foo { caller: bob, a: 100, b: 200 });
+
+    let proxy_address = declare_and_deploy("mock_sharding_proxy");
+    let models = [(
+        model_selector, Model::<Foo>::layout(),
+    )
+        .shard_with(
+            [bob.into()].span(), CRDVariant::SetLock, ShardFieldSelection::AutoDeterministic,
+        )]
+        .span();
+    world.dispatcher.request_sharding(proxy_address, models);
+
+    let entity_id = entity_id_from_keys(@bob);
+    let forged_layout = dojo::meta::Layout::Struct(
+        [dojo::meta::FieldLayout {
+            selector: 0xDEAD_BEEF,
+            layout: dojo::meta::Layout::Fixed([8].span()),
+        }]
+            .span(),
+    );
+    world
+        .dispatcher
+        .set_entity(model_selector, ModelIndex::Id(entity_id), [1].span(), forged_layout);
+}
+
 /// Test: settle must provide all exclusive slots from the same model/entity group.
 #[test]
 #[should_panic]
@@ -244,6 +277,37 @@ fn test_cancel_shard_state_rejects_partial_exclusive_group() {
 
     snforge_std::start_cheat_caller_address(world_address, proxy_address);
     sharding_proxy.cancel_shard_state(array![slot_a].span());
+}
+
+/// Regression: duplicate slots must not bypass full-coverage check for exclusive groups.
+#[test]
+#[should_panic]
+fn test_cancel_shard_state_rejects_duplicate_slot_coverage_bypass() {
+    let (mut world, model_selector) = deploy_world_and_foo();
+    let world_address = world.dispatcher.contract_address;
+
+    let bob: ContractAddress = 0xb0b.try_into().unwrap();
+    world.write_model_test(@Foo { caller: bob, a: 100, b: 200 });
+
+    let proxy_address = declare_and_deploy("mock_sharding_proxy");
+    let models = [(
+        model_selector, Model::<Foo>::layout(),
+    )
+        .shard_with(
+            [bob.into()].span(), CRDVariant::SetLock, ShardFieldSelection::AutoDeterministic,
+        )]
+        .span();
+    world.dispatcher.request_sharding(proxy_address, models);
+
+    let (sel_a, _) = foo_field_selectors();
+    let entity_id = entity_id_from_keys(@bob);
+    let slot_a = compute_dojo_field_slot(model_selector, entity_id, sel_a);
+    let sharding_proxy = IShardingProxyDispatcher { contract_address: world_address };
+
+    // Buggy behavior accepts [A, A] as if it covered {A, B}.
+    // Correct behavior must reject duplicate coverage input.
+    snforge_std::start_cheat_caller_address(world_address, proxy_address);
+    sharding_proxy.cancel_shard_state(array![slot_a, slot_a].span());
 }
 
 /// Test: settle must cover all exclusive slots in a single sharding request.
@@ -673,6 +737,47 @@ fn test_request_sharding_rejects_packed_selector_out_of_range() {
     world.dispatcher.request_sharding(proxy_address, models);
 }
 
+/// Regression: partial settlement of packed models must not panic on the second chunk.
+#[test]
+fn test_request_sharding_packed_two_slot_partial_settlements_do_not_panic() {
+    let (mut world, model_selector) = deploy_world_with_packed_pair();
+    let world_address = world.dispatcher.contract_address;
+
+    let bob: ContractAddress = 0xb0b.try_into().unwrap();
+    world.write_model_test(@PackedPair { player: bob, left: 10, right: 20 });
+
+    let proxy_address = declare_and_deploy("mock_sharding_proxy");
+    let layout = Model::<PackedPair>::layout();
+
+    let packed_size = if let dojo::meta::Layout::Fixed(sizes) = layout {
+        let mut sizes = sizes;
+        dojo::storage::packing::calculate_packed_size(ref sizes)
+    } else {
+        panic!("expected fixed layout")
+    };
+    assert(packed_size == 2, 'packed pair should use 2 slots');
+
+    let models = [(model_selector, layout).shard([bob.into()].span())].span();
+    world.dispatcher.request_sharding(proxy_address, models);
+
+    let entity_id = entity_id_from_keys(@bob);
+    let slot0 = compute_dojo_packed_slot(model_selector, entity_id);
+    let slot1 = slot0 + 1;
+
+    let sharding_proxy = IShardingProxyDispatcher { contract_address: world_address };
+
+    // Settle first packed slot.
+    snforge_std::start_cheat_caller_address(world_address, proxy_address);
+    sharding_proxy.settle_shard_changes(array![(slot0, 111)], [].span(), [].span());
+    snforge_std::stop_cheat_caller_address(world_address);
+
+    // Settle second packed slot in a separate call.
+    // Before the fix this panics due to premature key cleanup and fixed-layout member lookup.
+    snforge_std::start_cheat_caller_address(world_address, proxy_address);
+    sharding_proxy.settle_shard_changes(array![(slot1, 222)], [].span(), [].span());
+    snforge_std::stop_cheat_caller_address(world_address);
+}
+
 /// Test: manual per-field sharding must reject unknown struct field selectors.
 #[test]
 #[should_panic]
@@ -782,6 +887,36 @@ fn test_request_sharding_set_lock_with_dynamic_member() {
     let result: MixedDynamic = world.read_model(bob);
     assert(result.fixed_value == 77, 'fixed member should be settled');
     assert(result.note == "", 'dynamic note mismatch');
+}
+
+/// Regression: dynamic member lock must also block forged deterministic member writes.
+#[test]
+#[should_panic]
+fn test_request_sharding_dynamic_lock_blocks_forged_member_layout_write() {
+    let (mut world, model_selector) = deploy_world_with_mixed_dynamic();
+
+    let bob: ContractAddress = 0xb0b.try_into().unwrap();
+    let value = MixedDynamic { player: bob, fixed_value: 10, note: "hello" };
+    world.write_model_test(@value);
+
+    let proxy_address = declare_and_deploy("mock_sharding_proxy");
+    let layout = Model::<MixedDynamic>::layout();
+    let models = [(model_selector, layout).shard_dynamic([bob.into()].span())].span();
+    world.dispatcher.request_sharding(proxy_address, models);
+
+    let (_, note_selector) = mixed_dynamic_selectors();
+    let entity_id = entity_id_from_keys(@bob);
+
+    // Attack attempt: same dynamic member selector with forged fixed layout.
+    // Expected behavior: still blocked by dynamic member lock.
+    world
+        .dispatcher
+        .set_entity(
+            model_selector,
+            ModelIndex::MemberId((entity_id, note_selector)),
+            [1].span(),
+            dojo::meta::Layout::Fixed([8].span()),
+        );
 }
 
 /// Test: settle_shard_changes rejects empty payload (no slots, no members).

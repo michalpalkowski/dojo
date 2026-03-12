@@ -1317,19 +1317,7 @@ pub mod world {
 
             let mut cleared_entities: Felt252Dict<felt252> = Default::default();
             for slot in slots {
-                let slot = *slot;
-                let (model_selector, entity_id, _) = self.sharding.read_slot_metadata(slot);
-                if model_selector == 0 || self.sharding.is_slot_active(slot) {
-                    continue;
-                }
-                self.sharding.clear_slot_metadata(slot);
-
-                if entity_id != 0 &&
-                    !self.sharding.has_entity_active_slots(entity_id) &&
-                    Felt252DictTrait::get(ref cleared_entities, entity_id) == 0 {
-                    Felt252DictTrait::insert(ref cleared_entities, entity_id, 1);
-                    self.sharding.clear_entity_keys(entity_id);
-                }
+                self.clear_inactive_canceled_slot(*slot, ref cleared_entities);
             };
         }
     }
@@ -1572,6 +1560,39 @@ pub mod world {
             slot_metas
         }
 
+        fn clear_entity_keys_if_inactive(
+            ref self: ContractState,
+            entity_id: felt252,
+            ref cleared_entities: Felt252Dict<felt252>,
+        ) {
+            if entity_id == 0 {
+                return;
+            }
+            if self.sharding.has_entity_active_slots(entity_id) {
+                return;
+            }
+            if Felt252DictTrait::get(ref cleared_entities, entity_id) != 0 {
+                return;
+            }
+
+            Felt252DictTrait::insert(ref cleared_entities, entity_id, 1);
+            self.sharding.clear_entity_keys(entity_id);
+        }
+
+        fn clear_inactive_canceled_slot(
+            ref self: ContractState,
+            slot: felt252,
+            ref cleared_entities: Felt252Dict<felt252>,
+        ) {
+            let (model_selector, entity_id, _) = self.sharding.read_slot_metadata(slot);
+            if model_selector == 0 || self.sharding.is_slot_active(slot) {
+                return;
+            }
+
+            self.sharding.clear_slot_metadata(slot);
+            self.clear_entity_keys_if_inactive(entity_id, ref cleared_entities);
+        }
+
         fn collect_settlement_unlock_slots(
             self: @ContractState,
             slot_changes: Span<(felt252, felt252)>,
@@ -1791,7 +1812,10 @@ pub mod world {
             };
 
             for entity_id in entities_to_clear.span() {
-                self.sharding.clear_entity_keys(*entity_id);
+                let entity_id = *entity_id;
+                if !self.sharding.has_entity_active_slots(entity_id) {
+                    self.sharding.clear_entity_keys(entity_id);
+                }
             };
         }
 
@@ -1924,8 +1948,13 @@ pub mod world {
         /// Settlement writes still flow through `settle_shard_changes` (proxy-only path),
         /// while gameplay writes to main chain must fail for `SetLock/Lock` slots.
         fn assert_model_write_unlocked(
-            self: @ContractState, model_selector: felt252, entity_id: felt252, layout: Layout,
+            self: @ContractState, model_selector: felt252, entity_id: felt252, _layout: Layout,
         ) {
+            // Use canonical on-chain model layout for lock checks.
+            // Caller-provided layouts may be intentionally partial/legacy and must not
+            // weaken sharding lock enforcement.
+            let layout = self.read_model_layout_or_panic(model_selector);
+
             let mut deterministic_slots: Array<felt252> = ArrayTrait::new();
             let _ = collect_shardable_slots(ref deterministic_slots, model_selector, entity_id, layout);
             for slot in deterministic_slots.span() {
@@ -1961,6 +1990,21 @@ pub mod world {
                     model_selector, entity_id, member_selector,
                 );
                 self.assert_slot_writable(dynamic_slot);
+                return;
+            }
+
+            // Defend against forged deterministic layouts for dynamic top-level members.
+            // Even if caller-provided `member_layout` is deterministic, canonical model
+            // layout may mark this member as dynamic and therefore protected by lock slot.
+            let model_layout = self.read_model_layout_or_panic(model_selector);
+            if let Option::Some(canonical_member_layout) =
+                dojo::utils::find_model_field_layout(model_layout, member_selector) {
+                if is_dynamic_layout(canonical_member_layout) {
+                    let dynamic_slot = compute_dynamic_member_lock_slot(
+                        model_selector, entity_id, member_selector,
+                    );
+                    self.assert_slot_writable(dynamic_slot);
+                }
             }
         }
 
