@@ -203,11 +203,20 @@ Concrete high-risk models in Eternum with dynamic branches under current flow:
 
 ## Verification Checklist
 
-- [ ] Stage A strict tests pass in Dojo core.
+- [x] Stage A strict tests pass in Dojo core.
 - [ ] Eternum `request_shard_all` scenarios pass without implicit dynamic skips.
 - [ ] Proxy emits event payload that operator decodes in both compatibility modes.
 - [ ] Operator recovery and retry preserve lease atomicity.
 - [ ] Cancel never leaves partially unlocked lease in strict mode.
+
+## Current Status (Dojo)
+
+- [x] A.1 Remove silent dynamic skip as default behavior.
+- [x] A.2 Enforce explicit coverage policy in planner/request path.
+- [x] A.3 Keep self-describing request APIs (`shard`, `shard_deterministic`, `shard_dynamic`) without versioned suffixes.
+- [x] A.4 Add strict rejection tests and exclusive group atomicity tests in `core-tests`.
+- [x] C.1/C.2 Refactor world orchestration by centralizing exclusive-group coverage checks in sharding component.
+- [ ] D/E/F Cross-repo lease protocol rollout (`sharding_operator` Cairo proxy + Rust operator + Eternum integration).
 
 ## Risk Assessment
 
