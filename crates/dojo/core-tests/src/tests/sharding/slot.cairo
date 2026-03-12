@@ -1,5 +1,6 @@
 use core::poseidon::poseidon_hash_span;
 use dojo::sharding::compute_dojo_field_slot;
+use dojo::sharding::slot::compute_dynamic_member_lock_slot;
 use dojo::storage::database;
 use dojo::utils::combine_key;
 use starknet::storage_access::storage_base_address_from_felt252;
@@ -62,4 +63,26 @@ fn test_different_fields_different_slots() {
     let slot_a = compute_dojo_field_slot(model_selector, entity_id, selector!("field_a"));
     let slot_b = compute_dojo_field_slot(model_selector, entity_id, selector!("field_b"));
     assert(slot_a != slot_b, 'same slot for diff fields');
+}
+
+#[test]
+fn test_dynamic_member_lock_formula_manual() {
+    let model_selector: felt252 = 0x2222;
+    let entity_id: felt252 = 0xABCD;
+    let member_selector: felt252 = 0x9999;
+
+    let expected = poseidon_hash_span(
+        ['dojo_dynamic_member_lock', model_selector, entity_id, member_selector].span(),
+    );
+    let result = compute_dynamic_member_lock_slot(model_selector, entity_id, member_selector);
+    assert(result == expected, 'dynamic lock formula mismatch');
+}
+
+#[test]
+fn test_dynamic_member_locks_differ_by_member() {
+    let model_selector: felt252 = 'model';
+    let entity_id: felt252 = 'entity';
+    let lock_a = compute_dynamic_member_lock_slot(model_selector, entity_id, selector!("a"));
+    let lock_b = compute_dynamic_member_lock_slot(model_selector, entity_id, selector!("b"));
+    assert(lock_a != lock_b, 'dynamic lock collision');
 }

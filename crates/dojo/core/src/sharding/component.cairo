@@ -8,7 +8,7 @@ pub trait IContractComponent<TContractState> {
         sharding_contract_address: ContractAddress,
         contract_slots_changes: Span<CRDType>,
     );
-    fn update_shard_state(ref self: TContractState, storage_changes: Array<(SlotKey, SlotValue)>);
+    fn settle_slot_changes(ref self: TContractState, storage_changes: Array<(SlotKey, SlotValue)>);
     fn cancel_shard_state(ref self: TContractState, slots: Span<felt252>);
     fn end_shard(ref self: TContractState);
 }
@@ -115,7 +115,7 @@ pub mod sharding_component {
             sharding_dispatcher.initialize_sharding(contract_slots_changes);
         }
 
-        fn update_shard_state(
+        fn settle_slot_changes(
             ref self: ComponentState<TContractState>, storage_changes: Array<(felt252, felt252)>,
         ) {
             let caller = get_caller_address();
@@ -209,6 +209,10 @@ pub mod sharding_component {
                 self.slot_entity_id.read(slot),
                 self.slot_member_selector.read(slot),
             )
+        }
+
+        fn sharding_contract(self: @ComponentState<TContractState>) -> ContractAddress {
+            self.sharding_contract_address.read()
         }
 
         /// Returns true when `slot` is currently active under an exclusive CRDT

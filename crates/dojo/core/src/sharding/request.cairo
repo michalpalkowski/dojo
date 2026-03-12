@@ -49,8 +49,9 @@ pub struct ShardModel {
 }
 
 #[derive(Copy, Drop)]
-enum ShardSelectionPolicy {
-    AutoSubset,
+pub enum ShardFieldSelection {
+    AutoDeterministic,
+    AutoIncludeDynamic,
     StrictAll,
 }
 
@@ -101,16 +102,20 @@ fn is_deterministic_layout(layout: Layout) -> bool {
 /// (`StoreUpdateMember` emission), while world-side request handling expands
 /// each selected member recursively into concrete deterministic slots.
 fn translate_struct_fields(
-    fields: Span<dojo::meta::FieldLayout>, crdt: CRDVariant, policy: ShardSelectionPolicy,
+    fields: Span<dojo::meta::FieldLayout>, crdt: CRDVariant, selection: ShardFieldSelection,
 ) -> Span<ShardField> {
     let mut result: Array<ShardField> = ArrayTrait::new();
     for field in fields {
-        if is_deterministic_layout(*field.layout) {
+        let include_dynamic = match selection {
+            ShardFieldSelection::AutoIncludeDynamic => true,
+            _ => false,
+        };
+        if is_deterministic_layout(*field.layout) || include_dynamic {
             result.append(ShardField { selector: (*field).selector, crdt });
         } else {
             // Auto policy intentionally skips dynamic members.
             // Strict policy fails fast on the first unsupported member.
-            if let ShardSelectionPolicy::StrictAll = policy {
+            if let ShardFieldSelection::StrictAll = selection {
                 panic!("ShardModel: unsupported field layout");
             }
         }
@@ -120,10 +125,10 @@ fn translate_struct_fields(
 }
 
 fn translate_layout(
-    layout: Layout, crdt: CRDVariant, policy: ShardSelectionPolicy,
+    layout: Layout, crdt: CRDVariant, selection: ShardFieldSelection,
 ) -> Span<ShardField> {
     match layout {
-        Layout::Struct(fields) => translate_struct_fields(fields, crdt, policy),
+        Layout::Struct(fields) => translate_struct_fields(fields, crdt, selection),
         Layout::Fixed(sizes) => {
             let mut sizes = sizes;
             let num_slots = dojo::storage::packing::calculate_packed_size(ref sizes);
@@ -143,70 +148,38 @@ fn translate_layout(
 /// Apply a single CRDT to all fields of a model. For per-field control,
 /// construct `ShardModel` directly.
 pub trait IntoShardModel {
+    fn shard_with(
+        self: (felt252, Layout),
+        keys: Span<felt252>,
+        crdt: CRDVariant,
+        selection: ShardFieldSelection,
+    ) -> ShardModel;
+
     fn shard(self: (felt252, Layout), keys: Span<felt252>) -> ShardModel;
-    fn shard_add(self: (felt252, Layout), keys: Span<felt252>) -> ShardModel;
-    fn shard_lock(self: (felt252, Layout), keys: Span<felt252>) -> ShardModel;
-    fn shard_set_lock(self: (felt252, Layout), keys: Span<felt252>) -> ShardModel;
     fn shard_strict(self: (felt252, Layout), keys: Span<felt252>) -> ShardModel;
-    fn shard_add_strict(self: (felt252, Layout), keys: Span<felt252>) -> ShardModel;
-    fn shard_lock_strict(self: (felt252, Layout), keys: Span<felt252>) -> ShardModel;
-    fn shard_set_lock_strict(self: (felt252, Layout), keys: Span<felt252>) -> ShardModel;
+    fn shard_dynamic(self: (felt252, Layout), keys: Span<felt252>) -> ShardModel;
 }
 
 impl SelectorLayoutIntoShardModel of IntoShardModel {
+    fn shard_with(
+        self: (felt252, Layout),
+        keys: Span<felt252>,
+        crdt: CRDVariant,
+        selection: ShardFieldSelection,
+    ) -> ShardModel {
+        let (selector, layout) = self;
+        ShardModel { selector, keys, fields: translate_layout(layout, crdt, selection) }
+    }
+
     fn shard(self: (felt252, Layout), keys: Span<felt252>) -> ShardModel {
-        let (selector, layout) = self;
-        ShardModel {
-            selector, keys, fields: translate_layout(layout, CRDVariant::Set, ShardSelectionPolicy::AutoSubset),
-        }
-    }
-
-    fn shard_add(self: (felt252, Layout), keys: Span<felt252>) -> ShardModel {
-        let (selector, layout) = self;
-        ShardModel {
-            selector, keys, fields: translate_layout(layout, CRDVariant::Add, ShardSelectionPolicy::AutoSubset),
-        }
-    }
-
-    fn shard_lock(self: (felt252, Layout), keys: Span<felt252>) -> ShardModel {
-        let (selector, layout) = self;
-        ShardModel {
-            selector, keys, fields: translate_layout(layout, CRDVariant::Lock, ShardSelectionPolicy::AutoSubset),
-        }
-    }
-
-    fn shard_set_lock(self: (felt252, Layout), keys: Span<felt252>) -> ShardModel {
-        let (selector, layout) = self;
-        ShardModel {
-            selector, keys: keys, fields: translate_layout(layout, CRDVariant::SetLock, ShardSelectionPolicy::AutoSubset),
-        }
+        self.shard_with(keys, CRDVariant::Set, ShardFieldSelection::AutoDeterministic)
     }
 
     fn shard_strict(self: (felt252, Layout), keys: Span<felt252>) -> ShardModel {
-        let (selector, layout) = self;
-        ShardModel {
-            selector, keys, fields: translate_layout(layout, CRDVariant::Set, ShardSelectionPolicy::StrictAll),
-        }
+        self.shard_with(keys, CRDVariant::Set, ShardFieldSelection::StrictAll)
     }
 
-    fn shard_add_strict(self: (felt252, Layout), keys: Span<felt252>) -> ShardModel {
-        let (selector, layout) = self;
-        ShardModel {
-            selector, keys, fields: translate_layout(layout, CRDVariant::Add, ShardSelectionPolicy::StrictAll),
-        }
-    }
-
-    fn shard_lock_strict(self: (felt252, Layout), keys: Span<felt252>) -> ShardModel {
-        let (selector, layout) = self;
-        ShardModel {
-            selector, keys, fields: translate_layout(layout, CRDVariant::Lock, ShardSelectionPolicy::StrictAll),
-        }
-    }
-
-    fn shard_set_lock_strict(self: (felt252, Layout), keys: Span<felt252>) -> ShardModel {
-        let (selector, layout) = self;
-        ShardModel {
-            selector, keys, fields: translate_layout(layout, CRDVariant::SetLock, ShardSelectionPolicy::StrictAll),
-        }
+    fn shard_dynamic(self: (felt252, Layout), keys: Span<felt252>) -> ShardModel {
+        self.shard_with(keys, CRDVariant::SetLock, ShardFieldSelection::AutoIncludeDynamic)
     }
 }

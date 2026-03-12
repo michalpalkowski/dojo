@@ -101,11 +101,12 @@ pub mod utils {
 
 pub mod sharding {
     pub mod slot;
-    pub use slot::compute_dojo_field_slot;
+    pub use slot::{compute_dojo_field_slot, compute_dynamic_member_lock_slot};
 
     pub mod crdt;
     pub mod interface;
     pub mod component;
+    pub mod planner;
     pub mod request;
 }
 
@@ -126,7 +127,7 @@ pub mod world {
     mod world_contract;
     pub use world_contract::world;
     pub use world_contract::{
-        IShardingProxy, IShardingProxyDispatcher, IShardingProxyDispatcherTrait,
+        IShardingProxy, IShardingProxyDispatcher, IShardingProxyDispatcherTrait, ShardMemberWrite,
     };
 
     pub mod storage;

@@ -1,4 +1,5 @@
 use core::fmt::{Display, Error, Formatter};
+use core::serde::Serde;
 
 #[derive(Copy, Drop, PartialEq)]
 pub enum Permission {
@@ -21,9 +22,23 @@ impl PermissionDisplay of Display<Permission> {
 /// Called by the proxy after settlement to apply or cancel storage changes.
 /// Access control is enforced inside the sharding component:
 /// caller must equal the `sharding_contract_address` set during `request_sharding`.
+#[derive(Drop, Serde, Copy)]
+pub struct ShardMemberWrite {
+    pub model_selector: felt252,
+    pub entity_id: felt252,
+    pub member_selector: felt252,
+    pub values_offset: u32,
+    pub values_len: u32,
+}
+
 #[starknet::interface]
 pub trait IShardingProxy<T> {
-    fn update_shard_state(ref self: T, storage_changes: Array<(felt252, felt252)>);
+    fn settle_shard_changes(
+        ref self: T,
+        slot_changes: Array<(felt252, felt252)>,
+        member_writes: Span<ShardMemberWrite>,
+        member_write_values: Span<felt252>,
+    );
     fn cancel_shard_state(ref self: T, slots: Span<felt252>);
 }
 
@@ -62,14 +77,16 @@ pub mod world {
     };
     use core::dict::{Felt252Dict, Felt252DictTrait};
     use starknet::{ClassHash, ContractAddress, SyscallResultTrait, get_caller_address, get_tx_info};
-    use super::Permission;
+    use super::{Permission, ShardMemberWrite};
 
     use dojo::sharding::component::sharding_component as sharding_cpt;
     use dojo::sharding::crdt::CRDType;
-    use dojo::sharding::request::{ShardModel, CRDVariant};
-    use dojo::sharding::slot::{
-        PACKED_SLOT_BASE, compute_dojo_packed_slot, is_packed_selector,
+    use dojo::sharding::planner::{
+        collect_dynamic_member_locks, collect_shardable_slots, is_dynamic_layout, plan_model_slots,
+        shard_crdt_type,
     };
+    use dojo::sharding::request::ShardModel;
+    use dojo::sharding::slot::compute_dynamic_member_lock_slot;
 
     component!(path: sharding_cpt, storage: sharding, event: ShardingEvent);
 
@@ -77,88 +94,12 @@ pub mod world {
     pub const DOJO_INIT_SELECTOR: felt252 = selector!("dojo_init");
     pub const WORLD_VERSION: felt252 = '1.8.0';
 
-    /// Collect deterministic storage slots for a layout rooted at `key`.
-    ///
-    /// Returns `true` only when the full layout is deterministic. Dynamic
-    /// branches (`Array` and `ByteArray`) return `false` and are skipped.
-    fn collect_shardable_slots(
-        ref slots: Array<felt252>, model_selector: felt252, key: felt252, layout: Layout,
-    ) -> bool {
-        match layout {
-            Layout::Fixed(bits_layout) => {
-                let mut bits_layout = bits_layout;
-                let packed_size = dojo::storage::packing::calculate_packed_size(
-                    ref bits_layout,
-                );
-                let packed_base = compute_dojo_packed_slot(model_selector, key);
-                let mut i: usize = 0;
-                while i < packed_size {
-                    slots.append(packed_base + i.into());
-                    i += 1;
-                };
-                true
-            },
-            Layout::Struct(fields) => {
-                let mut deterministic = true;
-                for field_layout in fields {
-                    let field_key = combine_key(key, *field_layout.selector);
-                    if !collect_shardable_slots(
-                        ref slots, model_selector, field_key, *field_layout.layout,
-                    ) {
-                        deterministic = false;
-                    }
-                };
-                deterministic
-            },
-            Layout::Tuple(item_layouts) => {
-                let mut deterministic = true;
-                for (i, item_layout) in item_layouts.into_iter().enumerate() {
-                    let item_key = combine_key(key, i.into());
-                    if !collect_shardable_slots(
-                        ref slots, model_selector, item_key, *item_layout,
-                    ) {
-                        deterministic = false;
-                    }
-                };
-                deterministic
-            },
-            Layout::FixedArray(fixed_array_layout) => {
-                let (item_layouts, array_len): (Span<Layout>, u32) = fixed_array_layout;
-                if item_layouts.len() == 0 {
-                    return false;
-                }
-                let item_layout = *item_layouts[0];
-                let mut deterministic = true;
-                let mut i: u32 = 0;
-                while i < array_len {
-                    let item_key = combine_key(key, i.into());
-                    if !collect_shardable_slots(
-                        ref slots, model_selector, item_key, item_layout,
-                    ) {
-                        deterministic = false;
-                    }
-                    i += 1;
-                };
-                deterministic
-            },
-            Layout::Enum(variant_layouts) => {
-                // Variant discriminator is always stored at the root key.
-                slots.append(compute_dojo_packed_slot(model_selector, key));
-
-                let mut deterministic = true;
-                for variant_layout in variant_layouts {
-                    let variant_key = combine_key(key, *variant_layout.selector);
-                    if !collect_shardable_slots(
-                        ref slots, model_selector, variant_key, *variant_layout.layout,
-                    ) {
-                        deterministic = false;
-                    }
-                };
-                deterministic
-            },
-            Layout::Array(_) => false,
-            Layout::ByteArray => false,
-        }
+    #[derive(Copy, Drop)]
+    struct SlotMeta {
+        slot: felt252,
+        model_selector: felt252,
+        entity_id: felt252,
+        member_selector: felt252,
     }
 
     #[event]
@@ -1267,135 +1208,32 @@ pub mod world {
                 let model = *model;
                 assert(model.fields.len() != 0, 'request_sharding: empty fields');
 
-                // Verify model is registered and read canonical onchain layout.
-                let model_contract_address = match self.resources.read(model.selector) {
-                    Resource::Model((model_address, _)) => model_address,
-                    _ => {
-                        panic_with_byte_array(
-                            @errors::resource_conflict(
-                                @format!("{}", model.selector), @"model",
-                            ),
-                        )
-                    },
-                };
-                let model_layout = IStoredResourceDispatcher {
-                    contract_address: model_contract_address,
-                }
-                    .layout();
-
                 // Caller must have writer permission for this model.
                 self.assert_caller_permissions(model.selector, Permission::Writer);
+
+                // Verify model is registered and read canonical onchain layout.
+                let model_layout = self.read_model_layout_or_panic(model.selector);
 
                 // Compute entity_id from keys.
                 let entity_id = entity_id_from_serialized_keys(model.keys);
                 self.sharding.store_entity_keys(entity_id, model.keys);
 
-                // Each ShardField carries its own field selector and CRDT variant.
-                // Selectors in the PACKED_SLOT_BASE range indicate packed model offsets;
-                // all other selectors are per-field (Layout::Struct).
-                for shard_field in model.fields {
-                    let shard_field = *shard_field;
-                    match model_layout {
-                        Layout::Struct(field_layouts) => {
-                            // Validate that selector belongs to this model.
-                            let field_layout = match dojo::utils::find_field_layout(
-                                shard_field.selector, field_layouts,
-                            ) {
-                                Option::Some(layout) => layout,
-                                Option::None => panic_with_byte_array(
-                                    @format!(
-                                        "request_sharding: unknown field selector {} for model {}",
-                                        shard_field.selector, model.selector,
-                                    ),
-                                ),
-                            };
+                let planned_slots = plan_model_slots(
+                    model.selector, entity_id, model_layout, model.fields,
+                );
+                for planned in planned_slots.span() {
+                    let planned = *planned;
+                    assert(
+                        Felt252DictTrait::get(ref seen_slots, planned.slot) == 0,
+                        sharding_cpt::Errors::DUPLICATE_SLOT,
+                    );
+                    Felt252DictTrait::insert(ref seen_slots, planned.slot, 1);
 
-                            // Struct members may be nested; expand recursively to
-                            // deterministic slots. Dynamic layouts (Array/ByteArray)
-                            // are rejected by protocol.
-                            let field_key = combine_key(entity_id, shard_field.selector);
-                            let mut field_slots: Array<felt252> = ArrayTrait::new();
-                            if !collect_shardable_slots(
-                                ref field_slots, model.selector, field_key, field_layout,
-                            ) {
-                                panic_with_byte_array(
-                                    @format!(
-                                        "request_sharding: unsupported dynamic field selector {}",
-                                        shard_field.selector,
-                                    ),
-                                );
-                            }
-                            assert(
-                                field_slots.len() != 0,
-                                'Shard: no slots',
-                            );
-
-                            for slot in field_slots.span() {
-                                let slot = *slot;
-                                assert(
-                                    Felt252DictTrait::get(ref seen_slots, slot) == 0,
-                                    sharding_cpt::Errors::DUPLICATE_SLOT,
-                                );
-                                Felt252DictTrait::insert(ref seen_slots, slot, 1);
-
-                                self.sharding.store_slot_metadata(
-                                    slot, model.selector, entity_id, shard_field.selector,
-                                );
-
-                                let crd_type = match shard_field.crdt {
-                                    CRDVariant::Set => CRDType::Set((world_addr, slot)),
-                                    CRDVariant::Add => CRDType::Add((world_addr, slot)),
-                                    CRDVariant::Lock => CRDType::Lock((world_addr, slot)),
-                                    CRDVariant::SetLock => CRDType::SetLock((world_addr, slot)),
-                                };
-                                all_slots.append(crd_type);
-                            };
-                        },
-                        Layout::Fixed(model_fixed_layout) => {
-                            assert(
-                                is_packed_selector(shard_field.selector),
-                                'Shard: packed selector',
-                            );
-
-                            let mut model_fixed_layout = model_fixed_layout;
-                            let packed_size = dojo::storage::packing::calculate_packed_size(
-                                ref model_fixed_layout,
-                            );
-
-                            let offset = shard_field.selector - PACKED_SLOT_BASE;
-                            let offset_index: usize = offset.try_into().unwrap();
-                            assert(
-                                offset_index < packed_size,
-                                'Shard: packed range',
-                            );
-
-                            let slot = compute_dojo_packed_slot(model.selector, entity_id) + offset;
-                            assert(
-                                Felt252DictTrait::get(ref seen_slots, slot) == 0,
-                                sharding_cpt::Errors::DUPLICATE_SLOT,
-                            );
-                            Felt252DictTrait::insert(ref seen_slots, slot, 1);
-
-                            self.sharding.store_slot_metadata(
-                                slot, model.selector, entity_id, shard_field.selector,
-                            );
-
-                            let crd_type = match shard_field.crdt {
-                                CRDVariant::Set => CRDType::Set((world_addr, slot)),
-                                CRDVariant::Add => CRDType::Add((world_addr, slot)),
-                                CRDVariant::Lock => CRDType::Lock((world_addr, slot)),
-                                CRDVariant::SetLock => CRDType::SetLock((world_addr, slot)),
-                            };
-                            all_slots.append(crd_type);
-                        },
-                        _ => panic_with_byte_array(
-                            @format!(
-                                "request_sharding: unsupported model layout for selector {}",
-                                model.selector,
-                            ),
-                        ),
-                    }
-                }
+                    self.sharding.store_slot_metadata(
+                        planned.slot, model.selector, entity_id, planned.member_selector,
+                    );
+                    all_slots.append(shard_crdt_type(planned.crdt, world_addr, planned.slot));
+                };
             };
 
             assert(all_slots.len() != 0, 'Shard: no slots');
@@ -1431,99 +1269,36 @@ pub mod world {
     /// `sharding_contract_address` set when `request_sharding` was first called.
     #[abi(embed_v0)]
     impl ShardingProxyImpl of super::IShardingProxy<ContractState> {
-        fn update_shard_state(
-            ref self: ContractState, storage_changes: Array<(felt252, felt252)>,
+        fn settle_shard_changes(
+            ref self: ContractState,
+            slot_changes: Array<(felt252, felt252)>,
+            member_writes: Span<ShardMemberWrite>,
+            member_write_values: Span<felt252>,
         ) {
-            // Collect metadata before CRDT merge (component filters may drop slots).
-            let mut slot_metas: Array<(felt252, felt252, felt252, felt252)> = ArrayTrait::new();
-            for entry in storage_changes.span() {
-                let (slot, _) = *entry;
-                let (model, entity, member) = self.sharding.read_slot_metadata(slot);
-                if model != 0 {
-                    slot_metas.append((slot, model, entity, member));
-                }
-            };
+            assert(
+                slot_changes.len() != 0 || member_writes.len() != 0,
+                'Shard settle: empty',
+            );
+            assert(
+                get_caller_address() == self.sharding.sharding_contract(),
+                sharding_cpt::Errors::UNAUTHORIZED_CALLER,
+            );
 
-            self.sharding.update_shard_state(storage_changes);
+            let mut slot_metas = self.collect_settlement_slot_metas(slot_changes.span());
 
-            // Emit Torii events with layout-aware deserialized values.
-            let mut emitted: Felt252Dict<felt252> = Default::default();
-            let mut layout_dict: Felt252Dict<felt252> = Default::default();
-            let mut layouts_store: Array<Layout> = ArrayTrait::new();
-            let mut entities_to_clear: Array<felt252> = ArrayTrait::new();
+            if slot_changes.len() != 0 {
+                self.sharding.settle_slot_changes(slot_changes);
+            }
 
-            for meta in slot_metas.span() {
-                let (slot, model_sel, entity_id, member_sel) = *meta;
-                let slot_still_active = self.sharding.is_slot_active(slot);
-                if !slot_still_active {
-                    self.sharding.clear_slot_metadata(slot);
-                }
+            let dynamic_slots_to_unlock = self.apply_dynamic_member_writes(
+                member_writes, member_write_values, ref slot_metas,
+            );
 
-                // StoreSetRecord if keys stored (new entities), StoreUpdateMember otherwise.
-                let keys = self.sharding.read_entity_keys(entity_id);
-                let has_keys = keys.len() > 0;
-                let dedup_member = if has_keys { 0 } else { member_sel };
+            if dynamic_slots_to_unlock.len() != 0 {
+                self.sharding.cancel_shard_state(dynamic_slots_to_unlock.span());
+            }
 
-                let dedup_key = core::poseidon::poseidon_hash_span(
-                    [model_sel, entity_id, dedup_member].span(),
-                );
-                if Felt252DictTrait::get(ref emitted, dedup_key) != 0 {
-                    continue;
-                }
-                Felt252DictTrait::insert(ref emitted, dedup_key, 1);
-
-                let cached_idx = Felt252DictTrait::get(ref layout_dict, model_sel);
-                let layout = if cached_idx != 0 {
-                    let idx: u32 = (cached_idx - 1).try_into().unwrap();
-                    *layouts_store[idx]
-                } else {
-                    let addr = match self.resources.read(model_sel) {
-                        Resource::Model((addr, _)) => addr,
-                        _ => panic_with_byte_array(
-                            @errors::resource_conflict(@format!("{model_sel}"), @"model"),
-                        ),
-                    };
-                    let model_layout = IStoredResourceDispatcher { contract_address: addr }.layout();
-                    let store_idx: felt252 = (layouts_store.len() + 1).into();
-                    layouts_store.append(model_layout);
-                    Felt252DictTrait::insert(ref layout_dict, model_sel, store_idx);
-                    model_layout
-                };
-
-                if has_keys {
-                    let values = storage::entity_model::read_model_entity(
-                        model_sel, entity_id, layout,
-                    );
-                    self
-                        .emit(
-                            StoreSetRecord {
-                                selector: model_sel, entity_id, keys, values,
-                            },
-                        );
-                    entities_to_clear.append(entity_id);
-                } else {
-                    let values = match dojo::utils::find_model_field_layout(layout, member_sel) {
-                        Option::Some(member_layout) => {
-                            storage::entity_model::read_model_member(
-                                model_sel, entity_id, member_sel, member_layout,
-                            )
-                        },
-                        Option::None => panic_with_byte_array(
-                            @format!("Shard settlement: field layout not found for member {member_sel}"),
-                        ),
-                    };
-                    self
-                        .emit(
-                            StoreUpdateMember {
-                                selector: model_sel, entity_id, member_selector: member_sel, values,
-                            },
-                        );
-                }
-            };
-
-            for eid in entities_to_clear.span() {
-                self.sharding.clear_entity_keys(*eid);
-            };
+            self.emit_settlement_events_and_cleanup(slot_metas.span());
         }
 
         fn cancel_shard_state(ref self: ContractState, slots: Span<felt252>) {
@@ -1770,6 +1545,211 @@ pub mod world {
             )
         }
 
+        fn collect_settlement_slot_metas(
+            self: @ContractState, slot_changes: Span<(felt252, felt252)>,
+        ) -> Array<SlotMeta> {
+            let mut slot_metas: Array<SlotMeta> = ArrayTrait::new();
+            for entry in slot_changes {
+                let (slot, _) = *entry;
+                let (model_selector, entity_id, member_selector) = self.sharding.read_slot_metadata(slot);
+                if model_selector != 0 {
+                    slot_metas.append(
+                        SlotMeta { slot, model_selector, entity_id, member_selector },
+                    );
+                }
+            };
+            slot_metas
+        }
+
+        fn collect_member_write_values(
+            self: @ContractState, member_write: ShardMemberWrite, member_write_values: Span<felt252>,
+        ) -> Array<felt252> {
+            let values_end = member_write.values_offset + member_write.values_len;
+            assert(values_end <= member_write_values.len(), 'Shard settle: values range');
+
+            let mut values: Array<felt252> = ArrayTrait::new();
+            let mut values_i: u32 = member_write.values_offset;
+            while values_i < values_end {
+                values.append(*member_write_values[values_i]);
+                values_i += 1;
+            };
+            values
+        }
+
+        fn read_model_layout_or_panic(self: @ContractState, model_selector: felt252) -> Layout {
+            let model_addr = match self.resources.read(model_selector) {
+                Resource::Model((addr, _)) => addr,
+                _ => panic_with_byte_array(
+                    @errors::resource_conflict(@format!("{}", model_selector), @"model"),
+                ),
+            };
+            IStoredResourceDispatcher { contract_address: model_addr }.layout()
+        }
+
+        fn apply_dynamic_member_writes(
+            ref self: ContractState,
+            member_writes: Span<ShardMemberWrite>,
+            member_write_values: Span<felt252>,
+            ref slot_metas: Array<SlotMeta>,
+        ) -> Array<felt252> {
+            let mut dynamic_slots_to_unlock: Array<felt252> = ArrayTrait::new();
+            let mut seen_dynamic_locks: Felt252Dict<felt252> = Default::default();
+
+            for member_write in member_writes {
+                let member_write = *member_write;
+                assert(member_write.values_len != 0, 'Shard settle: empty member');
+
+                let lock_slot = compute_dynamic_member_lock_slot(
+                    member_write.model_selector, member_write.entity_id, member_write.member_selector,
+                );
+                assert(
+                    Felt252DictTrait::get(ref seen_dynamic_locks, lock_slot) == 0,
+                    sharding_cpt::Errors::DUPLICATE_SLOT,
+                );
+                Felt252DictTrait::insert(ref seen_dynamic_locks, lock_slot, 1);
+
+                assert(
+                    self.sharding.is_slot_exclusive_locked(lock_slot),
+                    'Shard settle: lock missing',
+                );
+                let (meta_model, meta_entity, meta_member) = self.sharding.read_slot_metadata(lock_slot);
+                assert(meta_model == member_write.model_selector, sharding_cpt::Errors::SLOT_METADATA_MISMATCH);
+                assert(meta_entity == member_write.entity_id, sharding_cpt::Errors::SLOT_METADATA_MISMATCH);
+                assert(meta_member == member_write.member_selector, sharding_cpt::Errors::SLOT_METADATA_MISMATCH);
+
+                let values = self.collect_member_write_values(member_write, member_write_values);
+                let model_layout = self.read_model_layout_or_panic(member_write.model_selector);
+                let member_layout = match dojo::utils::find_model_field_layout(
+                    model_layout, member_write.member_selector,
+                ) {
+                    Option::Some(layout) => layout,
+                    Option::None => panic_with_byte_array(
+                        @format!(
+                            "settle_shard_changes: field layout not found for member {}",
+                            member_write.member_selector,
+                        ),
+                    ),
+                };
+                assert(is_dynamic_layout(member_layout), 'Shard settle: dynamic only');
+
+                storage::entity_model::write_model_member(
+                    member_write.model_selector,
+                    member_write.entity_id,
+                    member_write.member_selector,
+                    values.span(),
+                    member_layout,
+                );
+
+                dynamic_slots_to_unlock.append(lock_slot);
+                slot_metas.append(
+                    SlotMeta {
+                        slot: lock_slot,
+                        model_selector: member_write.model_selector,
+                        entity_id: member_write.entity_id,
+                        member_selector: member_write.member_selector,
+                    },
+                );
+            };
+
+            dynamic_slots_to_unlock
+        }
+
+        fn get_cached_model_layout(
+            self: @ContractState,
+            model_selector: felt252,
+            ref layout_dict: Felt252Dict<felt252>,
+            ref layouts_store: Array<Layout>,
+        ) -> Layout {
+            let cached_idx = Felt252DictTrait::get(ref layout_dict, model_selector);
+            if cached_idx != 0 {
+                let idx: u32 = (cached_idx - 1).try_into().unwrap();
+                return *layouts_store[idx];
+            }
+
+            let model_layout = self.read_model_layout_or_panic(model_selector);
+            let store_idx: felt252 = (layouts_store.len() + 1).into();
+            layouts_store.append(model_layout);
+            Felt252DictTrait::insert(ref layout_dict, model_selector, store_idx);
+            model_layout
+        }
+
+        fn emit_settlement_events_and_cleanup(
+            ref self: ContractState, slot_metas: Span<SlotMeta>,
+        ) {
+            let mut emitted: Felt252Dict<felt252> = Default::default();
+            let mut layout_dict: Felt252Dict<felt252> = Default::default();
+            let mut layouts_store: Array<Layout> = ArrayTrait::new();
+            let mut entities_to_clear: Array<felt252> = ArrayTrait::new();
+
+            for meta in slot_metas {
+                let meta = *meta;
+                if !self.sharding.is_slot_active(meta.slot) {
+                    self.sharding.clear_slot_metadata(meta.slot);
+                }
+
+                // StoreSetRecord if keys stored (new entities), StoreUpdateMember otherwise.
+                let keys = self.sharding.read_entity_keys(meta.entity_id);
+                let has_keys = keys.len() > 0;
+                let dedup_member = if has_keys { 0 } else { meta.member_selector };
+                let dedup_key = core::poseidon::poseidon_hash_span(
+                    [meta.model_selector, meta.entity_id, dedup_member].span(),
+                );
+                if Felt252DictTrait::get(ref emitted, dedup_key) != 0 {
+                    continue;
+                }
+                Felt252DictTrait::insert(ref emitted, dedup_key, 1);
+
+                let layout = self.get_cached_model_layout(
+                    meta.model_selector, ref layout_dict, ref layouts_store,
+                );
+
+                if has_keys {
+                    let values = storage::entity_model::read_model_entity(
+                        meta.model_selector, meta.entity_id, layout,
+                    );
+                    self
+                        .emit(
+                            StoreSetRecord {
+                                selector: meta.model_selector,
+                                entity_id: meta.entity_id,
+                                keys,
+                                values,
+                            },
+                        );
+                    entities_to_clear.append(meta.entity_id);
+                } else {
+                    let values = match dojo::utils::find_model_field_layout(
+                        layout, meta.member_selector,
+                    ) {
+                        Option::Some(member_layout) => {
+                            storage::entity_model::read_model_member(
+                                meta.model_selector, meta.entity_id, meta.member_selector, member_layout,
+                            )
+                        },
+                        Option::None => panic_with_byte_array(
+                            @format!(
+                                "Shard settlement: field layout not found for member {}",
+                                meta.member_selector,
+                            ),
+                        ),
+                    };
+                    self
+                        .emit(
+                            StoreUpdateMember {
+                                selector: meta.model_selector,
+                                entity_id: meta.entity_id,
+                                member_selector: meta.member_selector,
+                                values,
+                            },
+                        );
+                }
+            };
+
+            for entity_id in entities_to_clear.span() {
+                self.sharding.clear_entity_keys(*entity_id);
+            };
+        }
+
         /// Indicates if the provided namespace is already registered
         ///
         /// # Arguments
@@ -1896,14 +1876,20 @@ pub mod world {
 
         /// Guard regular world writes against active exclusive shard locks.
         ///
-        /// Settlement writes still flow through `update_shard_state` (proxy-only path),
+        /// Settlement writes still flow through `settle_shard_changes` (proxy-only path),
         /// while gameplay writes to main chain must fail for `SetLock/Lock` slots.
         fn assert_model_write_unlocked(
             self: @ContractState, model_selector: felt252, entity_id: felt252, layout: Layout,
         ) {
-            let mut slots: Array<felt252> = ArrayTrait::new();
-            let _ = collect_shardable_slots(ref slots, model_selector, entity_id, layout);
-            for slot in slots.span() {
+            let mut deterministic_slots: Array<felt252> = ArrayTrait::new();
+            let _ = collect_shardable_slots(ref deterministic_slots, model_selector, entity_id, layout);
+            for slot in deterministic_slots.span() {
+                self.assert_slot_writable(*slot);
+            };
+
+            let mut dynamic_locks: Array<felt252> = ArrayTrait::new();
+            collect_dynamic_member_locks(ref dynamic_locks, model_selector, entity_id, layout);
+            for slot in dynamic_locks.span() {
                 self.assert_slot_writable(*slot);
             };
         }
@@ -1918,12 +1904,19 @@ pub mod world {
         ) {
             let member_key = combine_key(entity_id, member_selector);
             let mut slots: Array<felt252> = ArrayTrait::new();
-            let _ = collect_shardable_slots(
+            let deterministic = collect_shardable_slots(
                 ref slots, model_selector, member_key, member_layout,
             );
             for slot in slots.span() {
                 self.assert_slot_writable(*slot);
             };
+
+            if !deterministic {
+                let dynamic_slot = compute_dynamic_member_lock_slot(
+                    model_selector, entity_id, member_selector,
+                );
+                self.assert_slot_writable(dynamic_slot);
+            }
         }
 
         #[inline(always)]

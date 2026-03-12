@@ -363,7 +363,7 @@ pub trait IWorld<T> {
     /// Forwards to the sharding proxy which emits `ShardFinished`.
     /// NOTE: This is intentionally permissionless — game contracts (Writers) need
     /// to call it, and `end_shard` only emits an event (no state mutations).
-    /// Actual settlement (`update_shard_state`) is gated by proxy auth.
+    /// Actual settlement (`settle_shard_changes`) is gated by proxy auth.
     fn end_shard(ref self: T);
 }
 

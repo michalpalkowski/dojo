@@ -1,10 +1,13 @@
 use dojo::model::{Model, ModelStorage, ModelStorageTest};
-use dojo::sharding::component::{IContractComponentDispatcher, IContractComponentDispatcherTrait};
 use dojo::sharding::compute_dojo_field_slot;
-use dojo::sharding::slot::compute_dojo_packed_slot;
-use dojo::sharding::request::{IntoShardModel, IntoShardField, ShardModel};
+use dojo::sharding::slot::{PACKED_SLOT_BASE, compute_dojo_packed_slot};
+use dojo::sharding::request::{
+    CRDVariant, IntoShardField, IntoShardModel, ShardFieldSelection, ShardModel,
+};
 use dojo::utils::{combine_key, entity_id_from_keys};
-use dojo::world::IWorldDispatcherTrait;
+use dojo::world::{
+    IShardingProxyDispatcher, IShardingProxyDispatcherTrait, IWorldDispatcherTrait, ShardMemberWrite,
+};
 use dojo_snf_test::declare_and_deploy;
 use starknet::ContractAddress;
 
@@ -12,7 +15,7 @@ use crate::tests::helpers::{
     Balance256, Foo, MixedDynamic, NestedFixed, NestedStats, NotCopiable, TupleArrayOption,
     deploy_world_and_foo,
     deploy_world_with_balance256, deploy_world_with_mixed_dynamic, deploy_world_with_nested_fixed,
-    deploy_world_with_not_copiable, deploy_world_with_tuple_array_option,
+    deploy_world_with_not_copiable, deploy_world_with_score, deploy_world_with_tuple_array_option,
 };
 
 /// Helper: get the local layout field selectors for Foo (same compilation unit as write/read_model).
@@ -38,6 +41,15 @@ fn mixed_dynamic_fixed_selector() -> felt252 {
     let layout = Model::<MixedDynamic>::layout();
     if let dojo::meta::Layout::Struct(fields) = layout {
         (*fields[0]).selector
+    } else {
+        panic!("expected struct layout")
+    }
+}
+
+fn mixed_dynamic_selectors() -> (felt252, felt252) {
+    let layout = Model::<MixedDynamic>::layout();
+    if let dojo::meta::Layout::Struct(fields) = layout {
+        ((*fields[0]).selector, (*fields[1]).selector)
     } else {
         panic!("expected struct layout")
     }
@@ -94,10 +106,10 @@ fn test_request_sharding_set() {
     let entity_id = entity_id_from_keys(@bob);
     let slot_a = compute_dojo_field_slot(model_selector, entity_id, sel_a);
 
-    let sharding = IContractComponentDispatcher { contract_address: world_address };
+    let sharding_proxy = IShardingProxyDispatcher { contract_address: world_address };
 
     snforge_std::start_cheat_caller_address(world_address, proxy_address);
-    sharding.update_shard_state(array![(slot_a, 999)]);
+    sharding_proxy.settle_shard_changes(array![(slot_a, 999)], [].span(), [].span());
     snforge_std::stop_cheat_caller_address(world_address);
 
     let result: Foo = world.read_model(bob);
@@ -117,9 +129,15 @@ fn test_request_sharding_add_delta() {
 
     let proxy_address = declare_and_deploy("mock_sharding_proxy");
 
-    // Use Add CRDT via shard_add.
+    // Use Add CRDT via generic shard_with(...).
     let layout = Model::<Foo>::layout();
-    let models = [(model_selector, layout).shard_add([bob.into()].span())].span();
+    let models = [(
+        model_selector, layout,
+    )
+        .shard_with(
+            [bob.into()].span(), CRDVariant::Add, ShardFieldSelection::AutoDeterministic,
+        )]
+        .span();
     world.dispatcher.request_sharding(proxy_address, models);
 
     // Mainchain changes a to 120 while shard is active.
@@ -131,10 +149,10 @@ fn test_request_sharding_add_delta() {
     let entity_id = entity_id_from_keys(@bob);
     let slot_a = compute_dojo_field_slot(model_selector, entity_id, sel_a);
 
-    let sharding = IContractComponentDispatcher { contract_address: world_address };
+    let sharding_proxy = IShardingProxyDispatcher { contract_address: world_address };
 
     snforge_std::start_cheat_caller_address(world_address, proxy_address);
-    sharding.update_shard_state(array![(slot_a, 150)]);
+    sharding_proxy.settle_shard_changes(array![(slot_a, 150)], [].span(), [].span());
     snforge_std::stop_cheat_caller_address(world_address);
 
     // Expected: current(120) + (shard(150) - initial(100)) = 170
@@ -156,7 +174,13 @@ fn test_request_sharding_set_lock_blocks_main_write() {
     let proxy_address = declare_and_deploy("mock_sharding_proxy");
 
     let layout = Model::<Foo>::layout();
-    let models = [(model_selector, layout).shard_set_lock([bob.into()].span())].span();
+    let models = [(
+        model_selector, layout,
+    )
+        .shard_with(
+            [bob.into()].span(), CRDVariant::SetLock, ShardFieldSelection::AutoDeterministic,
+        )]
+        .span();
     world.dispatcher.request_sharding(proxy_address, models);
 
     // Regular world write must fail while SetLock slots are active.
@@ -186,10 +210,10 @@ fn test_request_sharding_all_fields() {
     let slot_a = compute_dojo_field_slot(model_selector, entity_id, sel_a);
     let slot_b = compute_dojo_field_slot(model_selector, entity_id, sel_b);
 
-    let sharding = IContractComponentDispatcher { contract_address: world_address };
+    let sharding_proxy = IShardingProxyDispatcher { contract_address: world_address };
 
     snforge_std::start_cheat_caller_address(world_address, proxy_address);
-    sharding.update_shard_state(array![(slot_a, 111), (slot_b, 222)]);
+    sharding_proxy.settle_shard_changes(array![(slot_a, 111), (slot_b, 222)], [].span(), [].span());
     snforge_std::stop_cheat_caller_address(world_address);
 
     let result: Foo = world.read_model(bob);
@@ -197,7 +221,7 @@ fn test_request_sharding_all_fields() {
     assert(result.b == 222, 'b should be updated');
 }
 
-/// Test: PN-Counter pattern using shard_add — both P and N fields are G-Counters (Add).
+/// Test: PN-Counter pattern using generic Add selection — both P and N fields are G-Counters (Add).
 ///
 /// Scenario: Foo.a = P (additions), Foo.b = N (subtractions), balance = P - N.
 /// On shard: P increases by 50 (mint), N increases by 30 (burn).
@@ -216,9 +240,15 @@ fn test_request_sharding_pn_counter() {
 
     let proxy_address = declare_and_deploy("mock_sharding_proxy");
 
-    // Use PNCounter CRDT via shard_add — both fields become Add (G-Counter).
+    // Use PNCounter CRDT via shard_with(..., Add, ...) — both fields become Add (G-Counter).
     let layout = Model::<Foo>::layout();
-    let models = [(model_selector, layout).shard_add([bob.into()].span())].span();
+    let models = [(
+        model_selector, layout,
+    )
+        .shard_with(
+            [bob.into()].span(), CRDVariant::Add, ShardFieldSelection::AutoDeterministic,
+        )]
+        .span();
     world.dispatcher.request_sharding(proxy_address, models);
 
     // Mainchain changes while shard is active: P 100→120, N 50→60 (balance 50→60).
@@ -232,10 +262,10 @@ fn test_request_sharding_pn_counter() {
     let slot_a = compute_dojo_field_slot(model_selector, entity_id, sel_a);
     let slot_b = compute_dojo_field_slot(model_selector, entity_id, sel_b);
 
-    let sharding = IContractComponentDispatcher { contract_address: world_address };
+    let sharding_proxy = IShardingProxyDispatcher { contract_address: world_address };
 
     snforge_std::start_cheat_caller_address(world_address, proxy_address);
-    sharding.update_shard_state(array![(slot_a, 150), (slot_b, 80)]);
+    sharding_proxy.settle_shard_changes(array![(slot_a, 150), (slot_b, 80)], [].span(), [].span());
     snforge_std::stop_cheat_caller_address(world_address);
 
     // P: current(120) + (shard(150) - initial(100)) = 170
@@ -246,7 +276,7 @@ fn test_request_sharding_pn_counter() {
     assert(result.b == 90, 'PN: N delta incorrect');
 }
 
-/// Test: shard_add with burn only (N increases, P unchanged) — simulates resource spending.
+/// Test: Add mode with burn only (N increases, P unchanged) — simulates resource spending.
 ///
 /// This is the key scenario that the old Add CRDT couldn't handle with a single balance field.
 /// With PN-Counter, N is its own G-Counter so delta is always >= 0.
@@ -263,7 +293,13 @@ fn test_request_sharding_pn_counter_burn_only() {
     let proxy_address = declare_and_deploy("mock_sharding_proxy");
 
     let layout = Model::<Foo>::layout();
-    let models = [(model_selector, layout).shard_add([bob.into()].span())].span();
+    let models = [(
+        model_selector, layout,
+    )
+        .shard_with(
+            [bob.into()].span(), CRDVariant::Add, ShardFieldSelection::AutoDeterministic,
+        )]
+        .span();
     world.dispatcher.request_sharding(proxy_address, models);
 
     // Shard: P unchanged (no minting), N increases by 300 (burning 300 resources).
@@ -273,10 +309,10 @@ fn test_request_sharding_pn_counter_burn_only() {
     let slot_a = compute_dojo_field_slot(model_selector, entity_id, sel_a);
     let slot_b = compute_dojo_field_slot(model_selector, entity_id, sel_b);
 
-    let sharding = IContractComponentDispatcher { contract_address: world_address };
+    let sharding_proxy = IShardingProxyDispatcher { contract_address: world_address };
 
     snforge_std::start_cheat_caller_address(world_address, proxy_address);
-    sharding.update_shard_state(array![(slot_a, 1000), (slot_b, 500)]);
+    sharding_proxy.settle_shard_changes(array![(slot_a, 1000), (slot_b, 500)], [].span(), [].span());
     snforge_std::stop_cheat_caller_address(world_address);
 
     // P: current(1000) + (shard(1000) - initial(1000)) = 1000 (no change)
@@ -324,10 +360,10 @@ fn test_per_field_crdt_mixed() {
     let slot_a = compute_dojo_field_slot(model_selector, entity_id, sel_a);
     let slot_b = compute_dojo_field_slot(model_selector, entity_id, sel_b);
 
-    let sharding = IContractComponentDispatcher { contract_address: world_address };
+    let sharding_proxy = IShardingProxyDispatcher { contract_address: world_address };
 
     snforge_std::start_cheat_caller_address(world_address, proxy_address);
-    sharding.update_shard_state(array![(slot_a, 150), (slot_b, 999)]);
+    sharding_proxy.settle_shard_changes(array![(slot_a, 150), (slot_b, 999)], [].span(), [].span());
     snforge_std::stop_cheat_caller_address(world_address);
 
     // a: current(120) + (shard(150) - initial(100)) = 170 (Add delta)
@@ -358,14 +394,78 @@ fn test_request_sharding_struct_fixed_multi_slot_field() {
     let base_slot = compute_dojo_field_slot(model_selector, entity_id, selector);
     let high_slot = base_slot + 1;
 
-    let sharding = IContractComponentDispatcher { contract_address: world_address };
+    let sharding_proxy = IShardingProxyDispatcher { contract_address: world_address };
     snforge_std::start_cheat_caller_address(world_address, proxy_address);
-    sharding.update_shard_state(array![(base_slot, 55), (high_slot, 66)]);
+    sharding_proxy.settle_shard_changes(array![(base_slot, 55), (high_slot, 66)], [].span(), [].span());
     snforge_std::stop_cheat_caller_address(world_address);
 
     let result: Balance256 = world.read_model(bob);
     assert(result.amount.low == 55_u128, 'u256 low slot not updated');
     assert(result.amount.high == 66_u128, 'u256 high slot not updated');
+}
+
+/// Test: request_sharding rejects empty model list.
+#[test]
+#[should_panic]
+fn test_request_sharding_rejects_empty_models() {
+    let (mut world, _) = deploy_world_and_foo();
+    let proxy_address = declare_and_deploy("mock_sharding_proxy");
+    let models: Span<ShardModel> = [].span();
+    world.dispatcher.request_sharding(proxy_address, models);
+}
+
+/// Test: request_sharding rejects model entries with no fields.
+#[test]
+#[should_panic]
+fn test_request_sharding_rejects_empty_fields() {
+    let (mut world, model_selector) = deploy_world_and_foo();
+    let bob: ContractAddress = 0xb0b.try_into().unwrap();
+    let proxy_address = declare_and_deploy("mock_sharding_proxy");
+
+    let models = [
+        ShardModel { selector: model_selector, keys: [bob.into()].span(), fields: [].span() },
+    ]
+        .span();
+    world.dispatcher.request_sharding(proxy_address, models);
+}
+
+/// Test: fixed-layout models must use packed pseudo selectors.
+#[test]
+#[should_panic]
+fn test_request_sharding_fixed_model_requires_packed_selector() {
+    let (mut world, model_selector) = deploy_world_with_score();
+    let bob: ContractAddress = 0xb0b.try_into().unwrap();
+    let proxy_address = declare_and_deploy("mock_sharding_proxy");
+
+    let models = [
+        ShardModel {
+            selector: model_selector,
+            keys: [bob.into()].span(),
+            fields: [selector!("points").as_set()].span(),
+        },
+    ]
+        .span();
+    world.dispatcher.request_sharding(proxy_address, models);
+}
+
+/// Test: packed selector offsets outside packed size are rejected.
+#[test]
+#[should_panic]
+fn test_request_sharding_rejects_packed_selector_out_of_range() {
+    let (mut world, model_selector) = deploy_world_with_score();
+    let bob: ContractAddress = 0xb0b.try_into().unwrap();
+    let proxy_address = declare_and_deploy("mock_sharding_proxy");
+
+    // Score has packed_size = 1, so offset 1 is out of range.
+    let models = [
+        ShardModel {
+            selector: model_selector,
+            keys: [bob.into()].span(),
+            fields: [(PACKED_SLOT_BASE + 1).as_set()].span(),
+        },
+    ]
+        .span();
+    world.dispatcher.request_sharding(proxy_address, models);
 }
 
 /// Test: manual per-field sharding must reject unknown struct field selectors.
@@ -424,13 +524,236 @@ fn test_request_sharding_auto_skips_dynamic_fields() {
     let entity_id = entity_id_from_keys(@bob);
     let slot = compute_dojo_field_slot(model_selector, entity_id, fixed_selector);
 
-    let sharding = IContractComponentDispatcher { contract_address: world_address };
+    let sharding_proxy = IShardingProxyDispatcher { contract_address: world_address };
     snforge_std::start_cheat_caller_address(world_address, proxy_address);
-    sharding.update_shard_state(array![(slot, 77)]);
+    sharding_proxy.settle_shard_changes(array![(slot, 77)], [].span(), [].span());
     snforge_std::stop_cheat_caller_address(world_address);
 
     let result: MixedDynamic = world.read_model(bob);
     assert(result.fixed_value == 77, 'fixed field should be updated');
+}
+
+/// Test: dynamic members can be requested with explicit SetLock dynamic policy
+/// and settled via `settle_shard_changes` member writes.
+#[test]
+fn test_request_sharding_set_lock_with_dynamic_member() {
+    let (mut world, model_selector) = deploy_world_with_mixed_dynamic();
+    let world_address = world.dispatcher.contract_address;
+
+    let bob: ContractAddress = 0xb0b.try_into().unwrap();
+    let value = MixedDynamic { player: bob, fixed_value: 10, note: "hello" };
+    world.write_model_test(@value);
+
+    let proxy_address = declare_and_deploy("mock_sharding_proxy");
+    let layout = Model::<MixedDynamic>::layout();
+    let models = [(model_selector, layout).shard_dynamic([bob.into()].span())].span();
+    world.dispatcher.request_sharding(proxy_address, models);
+
+    let (fixed_selector, note_selector) = mixed_dynamic_selectors();
+    let entity_id = entity_id_from_keys(@bob);
+    let fixed_slot = compute_dojo_field_slot(model_selector, entity_id, fixed_selector);
+
+    let member_writes = [
+        ShardMemberWrite {
+            model_selector,
+            entity_id,
+            member_selector: note_selector,
+            values_offset: 0,
+            values_len: 3,
+        },
+    ]
+        .span();
+    // Empty ByteArray serialized as [data_len, pending_word, pending_word_len].
+    let member_values: Span<felt252> = [0, 0, 0].span();
+
+    let sharding_proxy = IShardingProxyDispatcher { contract_address: world_address };
+    snforge_std::start_cheat_caller_address(world_address, proxy_address);
+    sharding_proxy.settle_shard_changes(
+        array![(fixed_slot, 77)], member_writes, member_values,
+    );
+    snforge_std::stop_cheat_caller_address(world_address);
+
+    let result: MixedDynamic = world.read_model(bob);
+    assert(result.fixed_value == 77, 'fixed member should be settled');
+    assert(result.note == "", 'dynamic note mismatch');
+}
+
+/// Test: settle_shard_changes rejects empty payload (no slots, no members).
+#[test]
+#[should_panic]
+fn test_settle_shard_changes_rejects_empty_payload() {
+    let (mut world, model_selector) = deploy_world_with_mixed_dynamic();
+    let world_address = world.dispatcher.contract_address;
+    let bob: ContractAddress = 0xb0b.try_into().unwrap();
+    world.write_model_test(@MixedDynamic { player: bob, fixed_value: 10, note: "hello" });
+
+    let proxy_address = declare_and_deploy("mock_sharding_proxy");
+    let layout = Model::<MixedDynamic>::layout();
+    let models = [(model_selector, layout).shard_dynamic([bob.into()].span())].span();
+    world.dispatcher.request_sharding(proxy_address, models);
+
+    let sharding_proxy = IShardingProxyDispatcher { contract_address: world_address };
+    snforge_std::start_cheat_caller_address(world_address, proxy_address);
+    sharding_proxy.settle_shard_changes(array![], [].span(), [].span());
+}
+
+/// Test: settle_shard_changes rejects member writes with zero-length value slices.
+#[test]
+#[should_panic]
+fn test_settle_shard_changes_rejects_empty_member_write_values() {
+    let (mut world, model_selector) = deploy_world_with_mixed_dynamic();
+    let world_address = world.dispatcher.contract_address;
+    let bob: ContractAddress = 0xb0b.try_into().unwrap();
+    world.write_model_test(@MixedDynamic { player: bob, fixed_value: 10, note: "hello" });
+
+    let proxy_address = declare_and_deploy("mock_sharding_proxy");
+    let layout = Model::<MixedDynamic>::layout();
+    let models = [(model_selector, layout).shard_dynamic([bob.into()].span())].span();
+    world.dispatcher.request_sharding(proxy_address, models);
+
+    let (_, note_selector) = mixed_dynamic_selectors();
+    let entity_id = entity_id_from_keys(@bob);
+    let member_writes = [
+        ShardMemberWrite {
+            model_selector,
+            entity_id,
+            member_selector: note_selector,
+            values_offset: 0,
+            values_len: 0,
+        },
+    ]
+        .span();
+
+    let sharding_proxy = IShardingProxyDispatcher { contract_address: world_address };
+    snforge_std::start_cheat_caller_address(world_address, proxy_address);
+    sharding_proxy.settle_shard_changes(array![], member_writes, [].span());
+}
+
+/// Test: settle_shard_changes checks member value slice bounds.
+#[test]
+#[should_panic]
+fn test_settle_shard_changes_rejects_member_write_values_out_of_range() {
+    let (mut world, model_selector) = deploy_world_with_mixed_dynamic();
+    let world_address = world.dispatcher.contract_address;
+    let bob: ContractAddress = 0xb0b.try_into().unwrap();
+    world.write_model_test(@MixedDynamic { player: bob, fixed_value: 10, note: "hello" });
+
+    let proxy_address = declare_and_deploy("mock_sharding_proxy");
+    let layout = Model::<MixedDynamic>::layout();
+    let models = [(model_selector, layout).shard_dynamic([bob.into()].span())].span();
+    world.dispatcher.request_sharding(proxy_address, models);
+
+    let (_, note_selector) = mixed_dynamic_selectors();
+    let entity_id = entity_id_from_keys(@bob);
+    let member_writes = [
+        ShardMemberWrite {
+            model_selector,
+            entity_id,
+            member_selector: note_selector,
+            values_offset: 1,
+            values_len: 3,
+        },
+    ]
+        .span();
+    let member_values: Span<felt252> = [0, 0].span();
+
+    let sharding_proxy = IShardingProxyDispatcher { contract_address: world_address };
+    snforge_std::start_cheat_caller_address(world_address, proxy_address);
+    sharding_proxy.settle_shard_changes(array![], member_writes, member_values);
+}
+
+/// Test: member writes require an active dynamic lock slot.
+#[test]
+#[should_panic]
+fn test_settle_shard_changes_rejects_member_write_without_dynamic_lock() {
+    let (mut world, model_selector) = deploy_world_with_mixed_dynamic();
+    let world_address = world.dispatcher.contract_address;
+    let bob: ContractAddress = 0xb0b.try_into().unwrap();
+    world.write_model_test(@MixedDynamic { player: bob, fixed_value: 10, note: "hello" });
+
+    let proxy_address = declare_and_deploy("mock_sharding_proxy");
+    let layout = Model::<MixedDynamic>::layout();
+    // Auto deterministic policy excludes dynamic field lock.
+    let models = [(model_selector, layout).shard([bob.into()].span())].span();
+    world.dispatcher.request_sharding(proxy_address, models);
+
+    let (_, note_selector) = mixed_dynamic_selectors();
+    let entity_id = entity_id_from_keys(@bob);
+    let member_writes = [
+        ShardMemberWrite {
+            model_selector,
+            entity_id,
+            member_selector: note_selector,
+            values_offset: 0,
+            values_len: 3,
+        },
+    ]
+        .span();
+    let member_values: Span<felt252> = [0, 0, 0].span();
+
+    let sharding_proxy = IShardingProxyDispatcher { contract_address: world_address };
+    snforge_std::start_cheat_caller_address(world_address, proxy_address);
+    sharding_proxy.settle_shard_changes(array![], member_writes, member_values);
+}
+
+/// Test: duplicate member writes for the same dynamic lock are rejected.
+#[test]
+#[should_panic]
+fn test_settle_shard_changes_rejects_duplicate_member_writes() {
+    let (mut world, model_selector) = deploy_world_with_mixed_dynamic();
+    let world_address = world.dispatcher.contract_address;
+    let bob: ContractAddress = 0xb0b.try_into().unwrap();
+    world.write_model_test(@MixedDynamic { player: bob, fixed_value: 10, note: "hello" });
+
+    let proxy_address = declare_and_deploy("mock_sharding_proxy");
+    let layout = Model::<MixedDynamic>::layout();
+    let models = [(model_selector, layout).shard_dynamic([bob.into()].span())].span();
+    world.dispatcher.request_sharding(proxy_address, models);
+
+    let (_, note_selector) = mixed_dynamic_selectors();
+    let entity_id = entity_id_from_keys(@bob);
+    let member_writes = [
+        ShardMemberWrite {
+            model_selector,
+            entity_id,
+            member_selector: note_selector,
+            values_offset: 0,
+            values_len: 3,
+        },
+        ShardMemberWrite {
+            model_selector,
+            entity_id,
+            member_selector: note_selector,
+            values_offset: 3,
+            values_len: 3,
+        },
+    ]
+        .span();
+    let member_values: Span<felt252> = [0, 0, 0, 0, 0, 0].span();
+
+    let sharding_proxy = IShardingProxyDispatcher { contract_address: world_address };
+    snforge_std::start_cheat_caller_address(world_address, proxy_address);
+    sharding_proxy.settle_shard_changes(array![], member_writes, member_values);
+}
+
+/// Test: dynamic fields must be requested with SetLock CRDT.
+#[test]
+#[should_panic]
+fn test_request_sharding_dynamic_requires_set_lock() {
+    let (world, model_selector) = deploy_world_with_mixed_dynamic();
+    let bob: ContractAddress = 0xb0b.try_into().unwrap();
+    let (_, note_selector) = mixed_dynamic_selectors();
+
+    let proxy_address = declare_and_deploy("mock_sharding_proxy");
+    let models = [
+        ShardModel {
+            selector: model_selector,
+            keys: [bob.into()].span(),
+            fields: [note_selector.as_set()].span(),
+        },
+    ]
+        .span();
+    world.dispatcher.request_sharding(proxy_address, models);
 }
 
 /// Test: nested fixed layouts are expanded into concrete slots.
@@ -458,9 +781,9 @@ fn test_request_sharding_nested_fixed_layout() {
     let hp_slot = compute_dojo_packed_slot(model_selector, hp_key);
     let gold_slot = compute_dojo_field_slot(model_selector, entity_id, gold_selector);
 
-    let sharding = IContractComponentDispatcher { contract_address: world_address };
+    let sharding_proxy = IShardingProxyDispatcher { contract_address: world_address };
     snforge_std::start_cheat_caller_address(world_address, proxy_address);
-    sharding.update_shard_state(array![(hp_slot, 99), (gold_slot, 777)]);
+    sharding_proxy.settle_shard_changes(array![(hp_slot, 99), (gold_slot, 777)], [].span(), [].span());
     snforge_std::stop_cheat_caller_address(world_address);
 
     let result: NestedFixed = world.read_model(bob);
@@ -510,14 +833,16 @@ fn test_request_sharding_tuple_fixedarray_enum_layout() {
     )
         .unwrap();
 
-    let sharding = IContractComponentDispatcher { contract_address: world_address };
+    let sharding_proxy = IShardingProxyDispatcher { contract_address: world_address };
     snforge_std::start_cheat_caller_address(world_address, proxy_address);
-    sharding.update_shard_state(
+    sharding_proxy.settle_shard_changes(
         array![
             (pair_item0_slot, 55),
             (samples_item1_slot, 66),
             (status_discriminator_slot, current_discriminator),
         ],
+        [].span(),
+        [].span(),
     );
     snforge_std::stop_cheat_caller_address(world_address);
 

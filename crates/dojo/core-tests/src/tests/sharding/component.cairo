@@ -1,6 +1,6 @@
 use dojo::model::{Model, ModelStorage, ModelStorageTest};
 use dojo::sharding::compute_dojo_field_slot;
-use dojo::sharding::request::IntoShardModel;
+use dojo::sharding::request::{CRDVariant, IntoShardModel, ShardFieldSelection};
 use dojo::utils::entity_id_from_keys;
 use dojo::world::{
     IShardingProxyDispatcher, IShardingProxyDispatcherTrait, IWorldDispatcherTrait,
@@ -31,12 +31,22 @@ fn test_component_setlock_after_add_fails() {
 
     let proxy_address = declare_and_deploy("mock_sharding_proxy");
 
-    let add_models = [(model_selector, Model::<Foo>::layout()).shard_add([bob.into()].span())]
+    let add_models = [(
+        model_selector, Model::<Foo>::layout(),
+    )
+        .shard_with(
+            [bob.into()].span(), CRDVariant::Add, ShardFieldSelection::AutoDeterministic,
+        )]
         .span();
     world.dispatcher.request_sharding(proxy_address, add_models);
 
     let setlock_models = [
-        (model_selector, Model::<Foo>::layout()).shard_set_lock([bob.into()].span()),
+        (
+            model_selector, Model::<Foo>::layout(),
+        )
+            .shard_with(
+                [bob.into()].span(), CRDVariant::SetLock, ShardFieldSelection::AutoDeterministic,
+            ),
     ]
         .span();
     world.dispatcher.request_sharding(proxy_address, setlock_models);
@@ -51,7 +61,12 @@ fn test_component_set_after_add_fails() {
 
     let proxy_address = declare_and_deploy("mock_sharding_proxy");
 
-    let add_models = [(model_selector, Model::<Foo>::layout()).shard_add([bob.into()].span())]
+    let add_models = [(
+        model_selector, Model::<Foo>::layout(),
+    )
+        .shard_with(
+            [bob.into()].span(), CRDVariant::Add, ShardFieldSelection::AutoDeterministic,
+        )]
         .span();
     world.dispatcher.request_sharding(proxy_address, add_models);
 
@@ -71,7 +86,12 @@ fn test_component_add_after_set_fails() {
     let set_models = [(model_selector, Model::<Foo>::layout()).shard([bob.into()].span())].span();
     world.dispatcher.request_sharding(proxy_address, set_models);
 
-    let add_models = [(model_selector, Model::<Foo>::layout()).shard_add([bob.into()].span())]
+    let add_models = [(
+        model_selector, Model::<Foo>::layout(),
+    )
+        .shard_with(
+            [bob.into()].span(), CRDVariant::Add, ShardFieldSelection::AutoDeterministic,
+        )]
         .span();
     world.dispatcher.request_sharding(proxy_address, add_models);
 }
@@ -85,7 +105,12 @@ fn test_component_lock_after_lock_fails() {
 
     let proxy_address = declare_and_deploy("mock_sharding_proxy");
 
-    let lock_models = [(model_selector, Model::<Foo>::layout()).shard_lock([bob.into()].span())]
+    let lock_models = [(
+        model_selector, Model::<Foo>::layout(),
+    )
+        .shard_with(
+            [bob.into()].span(), CRDVariant::Lock, ShardFieldSelection::AutoDeterministic,
+        )]
         .span();
     world.dispatcher.request_sharding(proxy_address, lock_models);
     world.dispatcher.request_sharding(proxy_address, lock_models);
@@ -108,7 +133,7 @@ fn test_component_update_requires_proxy_caller() {
     let slot_a = compute_dojo_field_slot(model_selector, entity_id, sel_a);
 
     let sharding_proxy = IShardingProxyDispatcher { contract_address: world_address };
-    sharding_proxy.update_shard_state(array![(slot_a, 999)]);
+    sharding_proxy.settle_shard_changes(array![(slot_a, 999)], [].span(), [].span());
 }
 
 #[test]
@@ -149,7 +174,7 @@ fn test_component_rejects_duplicate_slots_in_settlement() {
 
     let sharding_proxy = IShardingProxyDispatcher { contract_address: world_address };
     snforge_std::start_cheat_caller_address(world_address, proxy_address);
-    sharding_proxy.update_shard_state(array![(slot_a, 111), (slot_a, 222)]);
+    sharding_proxy.settle_shard_changes(array![(slot_a, 111), (slot_a, 222)], [].span(), [].span());
 }
 
 #[test]
@@ -160,7 +185,13 @@ fn test_component_lock_settlement_does_not_write() {
     world.write_model_test(@Foo { caller: bob, a: 100, b: 200 });
 
     let proxy_address = declare_and_deploy("mock_sharding_proxy");
-    let models = [(model_selector, Model::<Foo>::layout()).shard_lock([bob.into()].span())].span();
+    let models = [(
+        model_selector, Model::<Foo>::layout(),
+    )
+        .shard_with(
+            [bob.into()].span(), CRDVariant::Lock, ShardFieldSelection::AutoDeterministic,
+        )]
+        .span();
     world.dispatcher.request_sharding(proxy_address, models);
 
     let (sel_a, _) = foo_field_selectors();
@@ -169,7 +200,7 @@ fn test_component_lock_settlement_does_not_write() {
 
     let sharding_proxy = IShardingProxyDispatcher { contract_address: world_address };
     snforge_std::start_cheat_caller_address(world_address, proxy_address);
-    sharding_proxy.update_shard_state(array![(slot_a, 999)]);
+    sharding_proxy.settle_shard_changes(array![(slot_a, 999)], [].span(), [].span());
     snforge_std::stop_cheat_caller_address(world_address);
 
     let result: Foo = world.read_model(bob);
@@ -186,7 +217,12 @@ fn test_component_add_underflow_rejected() {
     world.write_model_test(@Foo { caller: bob, a: 100, b: 200 });
 
     let proxy_address = declare_and_deploy("mock_sharding_proxy");
-    let models = [(model_selector, Model::<Foo>::layout()).shard_add([bob.into()].span())]
+    let models = [(
+        model_selector, Model::<Foo>::layout(),
+    )
+        .shard_with(
+            [bob.into()].span(), CRDVariant::Add, ShardFieldSelection::AutoDeterministic,
+        )]
         .span();
     world.dispatcher.request_sharding(proxy_address, models);
 
@@ -196,7 +232,7 @@ fn test_component_add_underflow_rejected() {
 
     let sharding_proxy = IShardingProxyDispatcher { contract_address: world_address };
     snforge_std::start_cheat_caller_address(world_address, proxy_address);
-    sharding_proxy.update_shard_state(array![(slot_a, 90)]);
+    sharding_proxy.settle_shard_changes(array![(slot_a, 90)], [].span(), [].span());
 }
 
 #[test]
@@ -208,7 +244,12 @@ fn test_component_add_overflow_rejected() {
     world.write_model_test(@Foo { caller: bob, a: 0, b: 200 });
 
     let proxy_address = declare_and_deploy("mock_sharding_proxy");
-    let models = [(model_selector, Model::<Foo>::layout()).shard_add([bob.into()].span())]
+    let models = [(
+        model_selector, Model::<Foo>::layout(),
+    )
+        .shard_with(
+            [bob.into()].span(), CRDVariant::Add, ShardFieldSelection::AutoDeterministic,
+        )]
         .span();
     world.dispatcher.request_sharding(proxy_address, models);
 
@@ -222,7 +263,7 @@ fn test_component_add_overflow_rejected() {
     let sharding_proxy = IShardingProxyDispatcher { contract_address: world_address };
     snforge_std::start_cheat_caller_address(world_address, proxy_address);
     // Delta = 1 - 0 = 1, current + delta = FIELD_PRIME -> cannot fit into felt252.
-    sharding_proxy.update_shard_state(array![(slot_a, 1)]);
+    sharding_proxy.settle_shard_changes(array![(slot_a, 1)], [].span(), [].span());
 }
 
 #[starknet::contract]

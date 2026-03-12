@@ -96,6 +96,7 @@ mod tests {
 
     mod sharding {
         mod slot;
+        mod planner;
         mod component;
         mod request;
         mod settlement_events;

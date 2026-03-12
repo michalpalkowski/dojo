@@ -1,6 +1,8 @@
 use dojo::model::{Model, ModelStorage, ModelStorageTest};
 use dojo::sharding::compute_dojo_field_slot;
-use dojo::sharding::request::{IntoShardField, IntoShardModel, ShardModel};
+use dojo::sharding::request::{
+    CRDVariant, IntoShardField, IntoShardModel, ShardFieldSelection, ShardModel,
+};
 use dojo::utils::entity_id_from_keys;
 use dojo::world::{
     IShardingProxyDispatcher, IShardingProxyDispatcherTrait, IWorldDispatcherTrait,
@@ -25,7 +27,7 @@ fn foo_field_selectors() -> (felt252, felt252) {
 }
 
 
-/// Test: update_shard_state emits StoreSetRecord when entity keys are stored.
+/// Test: settle_shard_changes emits StoreSetRecord when entity keys are stored.
 #[test]
 fn test_settlement_emits_store_set_record() {
     let (mut world, model_selector) = deploy_world_and_foo();
@@ -51,7 +53,7 @@ fn test_settlement_emits_store_set_record() {
 
     let sharding_proxy = IShardingProxyDispatcher { contract_address: world_address };
     snforge_std::start_cheat_caller_address(world_address, proxy_address);
-    sharding_proxy.update_shard_state(array![(slot_a, 999), (slot_b, 777)]);
+    sharding_proxy.settle_shard_changes(array![(slot_a, 999), (slot_b, 777)], [].span(), [].span());
     snforge_std::stop_cheat_caller_address(world_address);
 
     // Check values by reading the model
@@ -92,7 +94,13 @@ fn test_settlement_add_crdt_emits_merged_value() {
     let proxy_address = declare_and_deploy("mock_sharding_proxy");
 
     let layout = Model::<Foo>::layout();
-    let models = [(model_selector, layout).shard_add([bob.into()].span())].span();
+    let models = [(
+        model_selector, layout,
+    )
+        .shard_with(
+            [bob.into()].span(), CRDVariant::Add, ShardFieldSelection::AutoDeterministic,
+        )]
+        .span();
     world.dispatcher.request_sharding(proxy_address, models);
 
     // Mainchain changes a from 100 → 120 while shard is active
@@ -108,7 +116,7 @@ fn test_settlement_add_crdt_emits_merged_value() {
     // Shard saw initial=100, produced shard_value=150 (delta=50)
     let sharding_proxy = IShardingProxyDispatcher { contract_address: world_address };
     snforge_std::start_cheat_caller_address(world_address, proxy_address);
-    sharding_proxy.update_shard_state(array![(slot_a, 150)]);
+    sharding_proxy.settle_shard_changes(array![(slot_a, 150)], [].span(), [].span());
     snforge_std::stop_cheat_caller_address(world_address);
 
     // Expected merged value: current(120) + (shard(150) - initial(100)) = 170
@@ -218,7 +226,7 @@ fn test_partial_cancel_keeps_keys_for_remaining_slots() {
 
     // Settle the remaining slot.
     snforge_std::start_cheat_caller_address(world_address, proxy_address);
-    sharding_proxy.update_shard_state(array![(slot_b, 999)]);
+    sharding_proxy.settle_shard_changes(array![(slot_b, 999)], [].span(), [].span());
     snforge_std::stop_cheat_caller_address(world_address);
 
     // Remaining settlement should still emit StoreSetRecord with keys.
@@ -295,7 +303,7 @@ fn test_settlement_per_field_mixed_crdt_events() {
     // Shard: a initial=100 → shard=150 (delta=50), b = 999 (Set overwrite)
     let sharding_proxy = IShardingProxyDispatcher { contract_address: world_address };
     snforge_std::start_cheat_caller_address(world_address, proxy_address);
-    sharding_proxy.update_shard_state(array![(slot_a, 150), (slot_b, 999)]);
+    sharding_proxy.settle_shard_changes(array![(slot_a, 150), (slot_b, 999)], [].span(), [].span());
     snforge_std::stop_cheat_caller_address(world_address);
 
     // a: current(120) + (shard(150) - initial(100)) = 170
@@ -358,7 +366,7 @@ fn test_settlement_building_like_multi_key() {
     // Shard changes: category 3 → 7, entity_id 42 → 99
     let sharding_proxy = IShardingProxyDispatcher { contract_address: world_address };
     snforge_std::start_cheat_caller_address(world_address, proxy_address);
-    sharding_proxy.update_shard_state(array![(slot_cat, 7), (slot_eid, 99)]);
+    sharding_proxy.settle_shard_changes(array![(slot_cat, 7), (slot_eid, 99)], [].span(), [].span());
     snforge_std::stop_cheat_caller_address(world_address);
 
     // StoreSetRecord must include composite keys [col=5, row=10]
@@ -417,7 +425,7 @@ fn test_settlement_new_entity_created_on_shard() {
     // Shard created a brand new building: category=2, entity_id=55
     let sharding_proxy = IShardingProxyDispatcher { contract_address: world_address };
     snforge_std::start_cheat_caller_address(world_address, proxy_address);
-    sharding_proxy.update_shard_state(array![(slot_cat, 2), (slot_eid, 55)]);
+    sharding_proxy.settle_shard_changes(array![(slot_cat, 2), (slot_eid, 55)], [].span(), [].span());
     snforge_std::stop_cheat_caller_address(world_address);
 
     // Must emit StoreSetRecord with keys so Torii can create entity from scratch
@@ -477,7 +485,7 @@ fn test_settlement_packed_model_unpacks_values() {
 
     let sharding_proxy = IShardingProxyDispatcher { contract_address: world_address };
     snforge_std::start_cheat_caller_address(world_address, proxy_address);
-    sharding_proxy.update_shard_state(array![(packed_slot, packed_value)]);
+    sharding_proxy.settle_shard_changes(array![(packed_slot, packed_value)], [].span(), [].span());
     snforge_std::stop_cheat_caller_address(world_address);
 
     // StoreSetRecord values must be UNPACKED Serde values [points=2000, level=10],

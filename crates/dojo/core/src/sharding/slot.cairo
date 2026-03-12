@@ -4,6 +4,7 @@ use core::poseidon::poseidon_hash_span;
 
 /// Sentinel range for packed model slot offsets. Real selectors (Poseidon hashes) never collide.
 pub const PACKED_SLOT_BASE: felt252 = 'dojo_packed_slot';
+pub const DYNAMIC_MEMBER_LOCK_DOMAIN: felt252 = 'dojo_dynamic_member_lock';
 
 #[inline(always)]
 pub fn compute_dojo_field_slot(
@@ -21,6 +22,17 @@ pub fn compute_dojo_packed_slot(
     entity_id: felt252,
 ) -> felt252 {
     poseidon_hash_span([DOJO_STORAGE, model_selector, entity_id].span())
+}
+
+#[inline(always)]
+pub fn compute_dynamic_member_lock_slot(
+    model_selector: felt252,
+    entity_id: felt252,
+    member_selector: felt252,
+) -> felt252 {
+    poseidon_hash_span(
+        [DYNAMIC_MEMBER_LOCK_DOMAIN, model_selector, entity_id, member_selector].span(),
+    )
 }
 
 #[inline(always)]
