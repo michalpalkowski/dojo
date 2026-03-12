@@ -1849,14 +1849,14 @@ pub mod world {
             match index {
                 ModelIndex::Keys(keys) => {
                     let entity_id = entity_id_from_serialized_keys(keys);
-                    self.assert_model_write_unlocked(model_selector, entity_id, layout);
+                    self.assert_model_write_unlocked(model_selector, entity_id);
                     storage::entity_model::write_model_entity(
                         model_selector, entity_id, values, layout,
                     );
                     self.emit(StoreSetRecord { selector: model_selector, keys, values, entity_id });
                 },
                 ModelIndex::Id(entity_id) => {
-                    self.assert_model_write_unlocked(model_selector, entity_id, layout);
+                    self.assert_model_write_unlocked(model_selector, entity_id);
                     storage::entity_model::write_model_entity(
                         model_selector, entity_id, values, layout,
                     );
@@ -1894,12 +1894,12 @@ pub mod world {
             match index {
                 ModelIndex::Keys(keys) => {
                     let entity_id = entity_id_from_serialized_keys(keys);
-                    self.assert_model_write_unlocked(model_selector, entity_id, layout);
+                    self.assert_model_write_unlocked(model_selector, entity_id);
                     storage::entity_model::delete_model_entity(model_selector, entity_id, layout);
                     self.emit(StoreDelRecord { selector: model_selector, entity_id });
                 },
                 ModelIndex::Id(entity_id) => {
-                    self.assert_model_write_unlocked(model_selector, entity_id, layout);
+                    self.assert_model_write_unlocked(model_selector, entity_id);
                     storage::entity_model::delete_model_entity(model_selector, entity_id, layout);
                     self.emit(StoreDelRecord { selector: model_selector, entity_id });
                 },
@@ -1948,7 +1948,7 @@ pub mod world {
         /// Settlement writes still flow through `settle_shard_changes` (proxy-only path),
         /// while gameplay writes to main chain must fail for `SetLock/Lock` slots.
         fn assert_model_write_unlocked(
-            self: @ContractState, model_selector: felt252, entity_id: felt252, _layout: Layout,
+            self: @ContractState, model_selector: felt252, entity_id: felt252,
         ) {
             // Use canonical on-chain model layout for lock checks.
             // Caller-provided layouts may be intentionally partial/legacy and must not
