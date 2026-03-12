@@ -1292,7 +1292,7 @@ pub mod world {
             let requested_unlock_slots = self.collect_settlement_unlock_slots(
                 slot_changes.span(), member_writes,
             );
-            self.assert_exclusive_group_full_coverage(requested_unlock_slots.span());
+            self.sharding.assert_exclusive_group_full_coverage(requested_unlock_slots.span());
 
             let mut slot_metas = self.collect_settlement_slot_metas(slot_changes.span());
 
@@ -1312,7 +1312,7 @@ pub mod world {
         }
 
         fn cancel_shard_state(ref self: ContractState, slots: Span<felt252>) {
-            self.assert_exclusive_group_full_coverage(slots);
+            self.sharding.assert_exclusive_group_full_coverage(slots);
             self.sharding.cancel_shard_state(slots);
 
             let mut cleared_entities: Felt252Dict<felt252> = Default::default();
@@ -1612,39 +1612,6 @@ pub mod world {
             };
 
             slots
-        }
-
-        fn assert_exclusive_group_full_coverage(
-            self: @ContractState, slots: Span<felt252>,
-        ) {
-            let mut seen_groups: Felt252Dict<felt252> = Default::default();
-            let mut group_counts: Felt252Dict<felt252> = Default::default();
-            let mut groups: Array<felt252> = ArrayTrait::new();
-
-            for slot in slots {
-                let slot = *slot;
-                let group_id = self.sharding.read_slot_group_id(slot);
-                if group_id == 0 {
-                    continue;
-                }
-                assert(self.sharding.is_slot_active(slot), 'Shard grp: inactive');
-
-                if Felt252DictTrait::get(ref seen_groups, group_id) == 0 {
-                    Felt252DictTrait::insert(ref seen_groups, group_id, 1);
-                    groups.append(group_id);
-                }
-
-                let current = Felt252DictTrait::get(ref group_counts, group_id);
-                Felt252DictTrait::insert(ref group_counts, group_id, current + 1);
-            };
-
-            for group_id in groups.span() {
-                let group_id = *group_id;
-                let expected: felt252 = self.sharding.group_active_slots(group_id).into();
-                let provided = Felt252DictTrait::get(ref group_counts, group_id);
-                assert(expected != 0, 'Shard grp: invalid');
-                assert(provided == expected, 'Shard grp: partial');
-            };
         }
 
         fn collect_member_write_values(

@@ -273,16 +273,40 @@ pub mod sharding_component {
             self.slot_group_id.write(slot, 0);
         }
 
-        fn read_slot_group_id(
-            self: @ComponentState<TContractState>, slot: felt252,
-        ) -> felt252 {
-            self.slot_group_id.read(slot)
-        }
+        /// Every exclusive lock group present in `slots` must be covered fully.
+        /// This prevents partial unlocks for SetLock/Lock requests.
+        fn assert_exclusive_group_full_coverage(
+            self: @ComponentState<TContractState>, slots: Span<felt252>,
+        ) {
+            let mut seen_groups: Felt252Dict<felt252> = Default::default();
+            let mut group_counts: Felt252Dict<felt252> = Default::default();
+            let mut groups: Array<felt252> = ArrayTrait::new();
 
-        fn group_active_slots(
-            self: @ComponentState<TContractState>, group_id: felt252,
-        ) -> u32 {
-            self.group_active_slot_count.read(group_id)
+            for slot in slots {
+                let slot = *slot;
+                let group_id = self.slot_group_id.read(slot);
+                if group_id == 0 {
+                    continue;
+                }
+                let (_, init_count) = self.slots.read(slot);
+                assert(init_count != 0, 'Shard grp: inactive');
+
+                if Felt252DictTrait::get(ref seen_groups, group_id) == 0 {
+                    Felt252DictTrait::insert(ref seen_groups, group_id, 1);
+                    groups.append(group_id);
+                }
+
+                let current = Felt252DictTrait::get(ref group_counts, group_id);
+                Felt252DictTrait::insert(ref group_counts, group_id, current + 1);
+            };
+
+            for group_id in groups.span() {
+                let group_id = *group_id;
+                let expected: felt252 = self.group_active_slot_count.read(group_id).into();
+                let provided = Felt252DictTrait::get(ref group_counts, group_id);
+                assert(expected != 0, 'Shard grp: invalid');
+                assert(provided == expected, 'Shard grp: partial');
+            };
         }
 
         /// Idempotent — skips if already stored for this entity_id.
