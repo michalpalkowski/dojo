@@ -113,7 +113,7 @@ fn translate_struct_fields(
         if is_deterministic_layout(*field.layout) || include_dynamic {
             result.append(ShardField { selector: (*field).selector, crdt });
         } else {
-            // Auto policy intentionally skips dynamic members.
+            // Deterministic-only policy intentionally skips dynamic members.
             // Strict policy fails fast on the first unsupported member.
             if let ShardFieldSelection::StrictAll = selection {
                 panic!("ShardModel: unsupported field layout");
@@ -147,6 +147,10 @@ fn translate_layout(
 
 /// Apply a single CRDT to all fields of a model. For per-field control,
 /// construct `ShardModel` directly.
+///
+/// `shard()` is strict-by-default and rejects dynamic members. Use
+/// `shard_deterministic()` only when partial deterministic coverage is an
+/// explicit, intentional choice.
 pub trait IntoShardModel {
     fn shard_with(
         self: (felt252, Layout),
@@ -155,6 +159,7 @@ pub trait IntoShardModel {
         selection: ShardFieldSelection,
     ) -> ShardModel;
 
+    fn shard_deterministic(self: (felt252, Layout), keys: Span<felt252>) -> ShardModel;
     fn shard(self: (felt252, Layout), keys: Span<felt252>) -> ShardModel;
     fn shard_strict(self: (felt252, Layout), keys: Span<felt252>) -> ShardModel;
     fn shard_dynamic(self: (felt252, Layout), keys: Span<felt252>) -> ShardModel;
@@ -171,8 +176,12 @@ impl SelectorLayoutIntoShardModel of IntoShardModel {
         ShardModel { selector, keys, fields: translate_layout(layout, crdt, selection) }
     }
 
-    fn shard(self: (felt252, Layout), keys: Span<felt252>) -> ShardModel {
+    fn shard_deterministic(self: (felt252, Layout), keys: Span<felt252>) -> ShardModel {
         self.shard_with(keys, CRDVariant::Set, ShardFieldSelection::AutoDeterministic)
+    }
+
+    fn shard(self: (felt252, Layout), keys: Span<felt252>) -> ShardModel {
+        self.shard_with(keys, CRDVariant::Set, ShardFieldSelection::StrictAll)
     }
 
     fn shard_strict(self: (felt252, Layout), keys: Span<felt252>) -> ShardModel {

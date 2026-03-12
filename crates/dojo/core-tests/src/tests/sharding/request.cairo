@@ -504,9 +504,9 @@ fn test_request_sharding_rejects_non_fixed_struct_field_layout() {
     world.dispatcher.request_sharding(proxy_address, models);
 }
 
-/// Test: auto translator skips unsupported dynamic fields and keeps fixed ones.
+/// Test: explicit deterministic-only policy skips dynamic fields and keeps fixed ones.
 #[test]
-fn test_request_sharding_auto_skips_dynamic_fields() {
+fn test_request_sharding_deterministic_only_skips_dynamic_fields() {
     let (mut world, model_selector) = deploy_world_with_mixed_dynamic();
     let world_address = world.dispatcher.contract_address;
 
@@ -517,7 +517,7 @@ fn test_request_sharding_auto_skips_dynamic_fields() {
     let proxy_address = declare_and_deploy("mock_sharding_proxy");
 
     let layout = Model::<MixedDynamic>::layout();
-    let models = [(model_selector, layout).shard([bob.into()].span())].span();
+    let models = [(model_selector, layout).shard_deterministic([bob.into()].span())].span();
     world.dispatcher.request_sharding(proxy_address, models);
 
     let fixed_selector = mixed_dynamic_fixed_selector();
@@ -673,8 +673,8 @@ fn test_settle_shard_changes_rejects_member_write_without_dynamic_lock() {
 
     let proxy_address = declare_and_deploy("mock_sharding_proxy");
     let layout = Model::<MixedDynamic>::layout();
-    // Auto deterministic policy excludes dynamic field lock.
-    let models = [(model_selector, layout).shard([bob.into()].span())].span();
+    // Deterministic-only policy excludes dynamic field lock.
+    let models = [(model_selector, layout).shard_deterministic([bob.into()].span())].span();
     world.dispatcher.request_sharding(proxy_address, models);
 
     let (_, note_selector) = mixed_dynamic_selectors();
@@ -856,16 +856,16 @@ fn test_request_sharding_tuple_fixedarray_enum_layout() {
     assert(status_discriminator_after == current_discriminator, 'enum discr mismatch');
 }
 
-/// Test: strict translator rejects mixed layouts that include dynamic fields.
+/// Test: default translator is strict and rejects mixed layouts with dynamic fields.
 #[test]
 #[should_panic]
-fn test_request_sharding_strict_rejects_mixed_dynamic() {
+fn test_request_sharding_default_rejects_mixed_dynamic() {
     let (world, model_selector) = deploy_world_with_mixed_dynamic();
     let bob: ContractAddress = 0xb0b.try_into().unwrap();
 
     let proxy_address = declare_and_deploy("mock_sharding_proxy");
     let layout = Model::<MixedDynamic>::layout();
-    let models = [(model_selector, layout).shard_strict([bob.into()].span())].span();
+    let models = [(model_selector, layout).shard([bob.into()].span())].span();
     world.dispatcher.request_sharding(proxy_address, models);
 }
 
