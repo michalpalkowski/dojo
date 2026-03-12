@@ -38,6 +38,10 @@ pub mod sharding_component {
         slot_model_selector: Map<felt252, felt252>,
         slot_entity_id: Map<felt252, felt252>,
         slot_member_selector: Map<felt252, felt252>,
+        /// Exclusive lock group id for slot (`0` for non-exclusive CRDTs).
+        slot_group_id: Map<felt252, felt252>,
+        /// Number of active exclusive slots for each group.
+        group_active_slot_count: Map<felt252, u32>,
         /// Number of currently active metadata slots for each entity.
         entity_active_slot_count: Map<felt252, u32>,
         /// Entity keys for StoreSetRecord emission (Torii needs keys for new entities).
@@ -183,11 +187,16 @@ pub mod sharding_component {
             model_selector: felt252,
             entity_id: felt252,
             member_selector: felt252,
+            group_id: felt252,
         ) {
             let prev_model = self.slot_model_selector.read(slot);
             if prev_model == 0 {
                 let current_count = self.entity_active_slot_count.read(entity_id);
                 self.entity_active_slot_count.write(entity_id, current_count + 1);
+                if group_id != 0 {
+                    let current_group_count = self.group_active_slot_count.read(group_id);
+                    self.group_active_slot_count.write(group_id, current_group_count + 1);
+                }
             } else {
                 assert(prev_model == model_selector, Errors::SLOT_METADATA_MISMATCH);
                 assert(self.slot_entity_id.read(slot) == entity_id, Errors::SLOT_METADATA_MISMATCH);
@@ -195,10 +204,12 @@ pub mod sharding_component {
                     self.slot_member_selector.read(slot) == member_selector,
                     Errors::SLOT_METADATA_MISMATCH,
                 );
+                assert(self.slot_group_id.read(slot) == group_id, Errors::SLOT_METADATA_MISMATCH);
             }
             self.slot_model_selector.write(slot, model_selector);
             self.slot_entity_id.write(slot, entity_id);
             self.slot_member_selector.write(slot, member_selector);
+            self.slot_group_id.write(slot, group_id);
         }
 
         fn read_slot_metadata(
@@ -252,6 +263,26 @@ pub mod sharding_component {
             self.slot_model_selector.write(slot, 0);
             self.slot_entity_id.write(slot, 0);
             self.slot_member_selector.write(slot, 0);
+
+            let group_id = self.slot_group_id.read(slot);
+            if group_id != 0 {
+                let group_count = self.group_active_slot_count.read(group_id);
+                assert(group_count != 0, Errors::SLOT_METADATA_MISMATCH);
+                self.group_active_slot_count.write(group_id, group_count - 1);
+            }
+            self.slot_group_id.write(slot, 0);
+        }
+
+        fn read_slot_group_id(
+            self: @ComponentState<TContractState>, slot: felt252,
+        ) -> felt252 {
+            self.slot_group_id.read(slot)
+        }
+
+        fn group_active_slots(
+            self: @ComponentState<TContractState>, group_id: felt252,
+        ) -> u32 {
+            self.group_active_slot_count.read(group_id)
         }
 
         /// Idempotent — skips if already stored for this entity_id.

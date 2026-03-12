@@ -1,7 +1,7 @@
 use dojo::model::{Model, ModelStorage, ModelStorageTest};
 use dojo::sharding::compute_dojo_field_slot;
 use dojo::sharding::request::{
-    CRDVariant, IntoShardField, IntoShardModel, ShardFieldSelection, ShardModel,
+    CRDVariant, IntoShardField, IntoShardModel, ShardCoverage, ShardFieldSelection, ShardModel,
 };
 use dojo::utils::entity_id_from_keys;
 use dojo::world::{
@@ -285,6 +285,7 @@ fn test_settlement_per_field_mixed_crdt_events() {
             selector: model_selector,
             keys: [bob.into()].span(),
             fields: [sel_a.as_add(), sel_b.as_set()].span(),
+            coverage: ShardCoverage::Full,
         },
     ]
         .span();

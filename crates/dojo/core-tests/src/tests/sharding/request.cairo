@@ -2,7 +2,7 @@ use dojo::model::{Model, ModelStorage, ModelStorageTest};
 use dojo::sharding::compute_dojo_field_slot;
 use dojo::sharding::slot::{PACKED_SLOT_BASE, compute_dojo_packed_slot};
 use dojo::sharding::request::{
-    CRDVariant, IntoShardField, IntoShardModel, ShardFieldSelection, ShardModel,
+    CRDVariant, IntoShardField, IntoShardModel, ShardCoverage, ShardFieldSelection, ShardModel,
 };
 use dojo::utils::{combine_key, entity_id_from_keys};
 use dojo::world::{
@@ -188,6 +188,64 @@ fn test_request_sharding_set_lock_blocks_main_write() {
     world.write_model_test(@foo_updated);
 }
 
+/// Test: settle must provide all exclusive slots from the same model/entity group.
+#[test]
+#[should_panic]
+fn test_settle_shard_changes_rejects_partial_exclusive_group() {
+    let (mut world, model_selector) = deploy_world_and_foo();
+    let world_address = world.dispatcher.contract_address;
+
+    let bob: ContractAddress = 0xb0b.try_into().unwrap();
+    world.write_model_test(@Foo { caller: bob, a: 100, b: 200 });
+
+    let proxy_address = declare_and_deploy("mock_sharding_proxy");
+    let models = [(
+        model_selector, Model::<Foo>::layout(),
+    )
+        .shard_with(
+            [bob.into()].span(), CRDVariant::SetLock, ShardFieldSelection::AutoDeterministic,
+        )]
+        .span();
+    world.dispatcher.request_sharding(proxy_address, models);
+
+    let (sel_a, _) = foo_field_selectors();
+    let entity_id = entity_id_from_keys(@bob);
+    let slot_a = compute_dojo_field_slot(model_selector, entity_id, sel_a);
+    let sharding_proxy = IShardingProxyDispatcher { contract_address: world_address };
+
+    snforge_std::start_cheat_caller_address(world_address, proxy_address);
+    sharding_proxy.settle_shard_changes(array![(slot_a, 999)], [].span(), [].span());
+}
+
+/// Test: cancel must provide all exclusive slots from the same model/entity group.
+#[test]
+#[should_panic]
+fn test_cancel_shard_state_rejects_partial_exclusive_group() {
+    let (mut world, model_selector) = deploy_world_and_foo();
+    let world_address = world.dispatcher.contract_address;
+
+    let bob: ContractAddress = 0xb0b.try_into().unwrap();
+    world.write_model_test(@Foo { caller: bob, a: 100, b: 200 });
+
+    let proxy_address = declare_and_deploy("mock_sharding_proxy");
+    let models = [(
+        model_selector, Model::<Foo>::layout(),
+    )
+        .shard_with(
+            [bob.into()].span(), CRDVariant::SetLock, ShardFieldSelection::AutoDeterministic,
+        )]
+        .span();
+    world.dispatcher.request_sharding(proxy_address, models);
+
+    let (sel_a, _) = foo_field_selectors();
+    let entity_id = entity_id_from_keys(@bob);
+    let slot_a = compute_dojo_field_slot(model_selector, entity_id, sel_a);
+    let sharding_proxy = IShardingProxyDispatcher { contract_address: world_address };
+
+    snforge_std::start_cheat_caller_address(world_address, proxy_address);
+    sharding_proxy.cancel_shard_state(array![slot_a].span());
+}
+
 /// Test: request_sharding creates slots for ALL fields in the model.
 #[test]
 fn test_request_sharding_all_fields() {
@@ -219,6 +277,63 @@ fn test_request_sharding_all_fields() {
     let result: Foo = world.read_model(bob);
     assert(result.a == 111, 'a should be updated');
     assert(result.b == 222, 'b should be updated');
+}
+
+/// Test: full coverage policy rejects partial field selection.
+#[test]
+#[should_panic]
+fn test_request_sharding_full_coverage_rejects_partial_selection() {
+    let (mut world, model_selector) = deploy_world_and_foo();
+    let bob: ContractAddress = 0xb0b.try_into().unwrap();
+    world.write_model_test(@Foo { caller: bob, a: 100, b: 200 });
+
+    let proxy_address = declare_and_deploy("mock_sharding_proxy");
+    let (sel_a, _) = foo_field_selectors();
+    let models = [
+        ShardModel {
+            selector: model_selector,
+            keys: [bob.into()].span(),
+            fields: [sel_a.as_set()].span(),
+            coverage: ShardCoverage::Full,
+        },
+    ]
+        .span();
+    world.dispatcher.request_sharding(proxy_address, models);
+}
+
+/// Test: deterministic subset policy allows explicit partial field selection.
+#[test]
+fn test_request_sharding_deterministic_subset_allows_partial_selection() {
+    let (mut world, model_selector) = deploy_world_and_foo();
+    let world_address = world.dispatcher.contract_address;
+
+    let bob: ContractAddress = 0xb0b.try_into().unwrap();
+    world.write_model_test(@Foo { caller: bob, a: 100, b: 200 });
+
+    let proxy_address = declare_and_deploy("mock_sharding_proxy");
+    let (sel_a, _) = foo_field_selectors();
+    let models = [
+        ShardModel {
+            selector: model_selector,
+            keys: [bob.into()].span(),
+            fields: [sel_a.as_set()].span(),
+            coverage: ShardCoverage::DeterministicSubset,
+        },
+    ]
+        .span();
+    world.dispatcher.request_sharding(proxy_address, models);
+
+    let entity_id = entity_id_from_keys(@bob);
+    let slot_a = compute_dojo_field_slot(model_selector, entity_id, sel_a);
+    let sharding_proxy = IShardingProxyDispatcher { contract_address: world_address };
+
+    snforge_std::start_cheat_caller_address(world_address, proxy_address);
+    sharding_proxy.settle_shard_changes(array![(slot_a, 777)], [].span(), [].span());
+    snforge_std::stop_cheat_caller_address(world_address);
+
+    let result: Foo = world.read_model(bob);
+    assert(result.a == 777, 'a should be updated');
+    assert(result.b == 200, 'b should be unchanged');
 }
 
 /// Test: PN-Counter pattern using generic Add selection — both P and N fields are G-Counters (Add).
@@ -345,6 +460,7 @@ fn test_per_field_crdt_mixed() {
             selector: model_selector,
             keys: [bob.into()].span(),
             fields: [sel_a.as_add(), sel_b.as_set()].span(),
+            coverage: ShardCoverage::Full,
         },
     ]
         .span();
@@ -423,7 +539,12 @@ fn test_request_sharding_rejects_empty_fields() {
     let proxy_address = declare_and_deploy("mock_sharding_proxy");
 
     let models = [
-        ShardModel { selector: model_selector, keys: [bob.into()].span(), fields: [].span() },
+        ShardModel {
+            selector: model_selector,
+            keys: [bob.into()].span(),
+            fields: [].span(),
+            coverage: ShardCoverage::Full,
+        },
     ]
         .span();
     world.dispatcher.request_sharding(proxy_address, models);
@@ -442,6 +563,7 @@ fn test_request_sharding_fixed_model_requires_packed_selector() {
             selector: model_selector,
             keys: [bob.into()].span(),
             fields: [selector!("points").as_set()].span(),
+            coverage: ShardCoverage::Full,
         },
     ]
         .span();
@@ -462,6 +584,7 @@ fn test_request_sharding_rejects_packed_selector_out_of_range() {
             selector: model_selector,
             keys: [bob.into()].span(),
             fields: [(PACKED_SLOT_BASE + 1).as_set()].span(),
+            coverage: ShardCoverage::Full,
         },
     ]
         .span();
@@ -484,6 +607,7 @@ fn test_request_sharding_rejects_unknown_field_selector() {
             selector: model_selector,
             keys: [bob.into()].span(),
             fields: [0xDEADBEEF.as_set()].span(),
+            coverage: ShardCoverage::Full,
         },
     ]
         .span();
@@ -750,6 +874,7 @@ fn test_request_sharding_dynamic_requires_set_lock() {
             selector: model_selector,
             keys: [bob.into()].span(),
             fields: [note_selector.as_set()].span(),
+            coverage: ShardCoverage::Full,
         },
     ]
         .span();

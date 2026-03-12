@@ -1,11 +1,12 @@
 use dojo::meta::Layout;
 use dojo::sharding::crdt::CRDType;
-use dojo::sharding::request::{CRDVariant, ShardField};
+use dojo::sharding::request::{CRDVariant, ShardCoverage, ShardField};
 use dojo::sharding::slot::{
     PACKED_SLOT_BASE, compute_dojo_packed_slot, compute_dynamic_member_lock_slot, is_packed_selector,
 };
 use dojo::utils::combine_key;
 use starknet::ContractAddress;
+use core::dict::{Felt252Dict, Felt252DictTrait};
 
 #[derive(Copy, Drop)]
 pub struct PlannedSlot {
@@ -231,7 +232,10 @@ pub fn plan_model_slots(
     entity_id: felt252,
     model_layout: Layout,
     fields: Span<ShardField>,
+    coverage: ShardCoverage,
 ) -> Array<PlannedSlot> {
+    validate_model_coverage(model_layout, fields, coverage);
+
     let mut planned_slots: Array<PlannedSlot> = ArrayTrait::new();
     for shard_field in fields {
         let field_slots = plan_shard_field(model_selector, entity_id, model_layout, *shard_field);
@@ -240,4 +244,83 @@ pub fn plan_model_slots(
         };
     };
     planned_slots
+}
+
+pub fn validate_model_coverage(model_layout: Layout, fields: Span<ShardField>, coverage: ShardCoverage) {
+    match model_layout {
+        Layout::Struct(field_layouts) => {
+            validate_struct_coverage(field_layouts, fields, coverage);
+        },
+        Layout::Fixed(sizes) => {
+            let mut sizes = sizes;
+            let packed_size = dojo::storage::packing::calculate_packed_size(ref sizes);
+            validate_fixed_coverage(fields, coverage, packed_size);
+        },
+        _ => panic!("request_sharding: unsupported model layout"),
+    }
+}
+
+fn validate_struct_coverage(
+    field_layouts: Span<dojo::meta::FieldLayout>, fields: Span<ShardField>, coverage: ShardCoverage,
+) {
+    let mut selected: Felt252Dict<felt252> = Default::default();
+
+    for field in fields {
+        let field = *field;
+        assert(
+            Felt252DictTrait::get(ref selected, field.selector) == 0,
+            'Shard coverage: duplicate field',
+        );
+        Felt252DictTrait::insert(ref selected, field.selector, 1);
+
+        let field_layout = match dojo::utils::find_field_layout(field.selector, field_layouts) {
+            Option::Some(layout) => layout,
+            Option::None => panic!("request_sharding: unknown field selector"),
+        };
+
+        if let ShardCoverage::DeterministicSubset = coverage {
+            assert(!is_dynamic_layout(field_layout), 'Shard cov: dyn needs full');
+        }
+    };
+
+    if let ShardCoverage::Full = coverage {
+        assert(fields.len() == field_layouts.len(), 'Shard cov: full struct');
+        for field_layout in field_layouts {
+            assert(
+                Felt252DictTrait::get(ref selected, *field_layout.selector) != 0,
+                'Shard cov: missing field',
+            );
+        };
+    }
+}
+
+fn validate_fixed_coverage(fields: Span<ShardField>, coverage: ShardCoverage, packed_size: usize) {
+    let mut selected: Felt252Dict<felt252> = Default::default();
+
+    for field in fields {
+        let field = *field;
+        assert(is_packed_selector(field.selector), 'Shard: packed selector');
+        let offset = field.selector - PACKED_SLOT_BASE;
+        let offset_index: usize = offset.try_into().unwrap();
+        assert(offset_index < packed_size, 'Shard: packed range');
+        assert(
+            Felt252DictTrait::get(ref selected, field.selector) == 0,
+            'Shard coverage: duplicate field',
+        );
+        Felt252DictTrait::insert(ref selected, field.selector, 1);
+    };
+
+    if let ShardCoverage::Full = coverage {
+        let fields_len: usize = fields.len().try_into().unwrap();
+        assert(fields_len == packed_size, 'Shard cov: full packed');
+        let mut i: usize = 0;
+        while i < packed_size {
+            let selector = PACKED_SLOT_BASE + i.into();
+            assert(
+                Felt252DictTrait::get(ref selected, selector) != 0,
+                'Shard cov: missing packed',
+            );
+            i += 1;
+        };
+    }
 }

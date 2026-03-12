@@ -46,6 +46,14 @@ pub struct ShardModel {
     pub selector: felt252,
     pub keys: Span<felt252>,
     pub fields: Span<ShardField>,
+    pub coverage: ShardCoverage,
+}
+
+#[derive(Drop, Serde, Copy, Debug, PartialEq)]
+pub enum ShardCoverage {
+    #[default]
+    Full,
+    DeterministicSubset,
 }
 
 #[derive(Copy, Drop)]
@@ -146,7 +154,7 @@ fn translate_layout(
 }
 
 /// Apply a single CRDT to all fields of a model. For per-field control,
-/// construct `ShardModel` directly.
+/// construct `ShardModel` directly and set `coverage` explicitly.
 ///
 /// `shard()` is strict-by-default and rejects dynamic members. Use
 /// `shard_deterministic()` only when partial deterministic coverage is an
@@ -161,7 +169,6 @@ pub trait IntoShardModel {
 
     fn shard_deterministic(self: (felt252, Layout), keys: Span<felt252>) -> ShardModel;
     fn shard(self: (felt252, Layout), keys: Span<felt252>) -> ShardModel;
-    fn shard_strict(self: (felt252, Layout), keys: Span<felt252>) -> ShardModel;
     fn shard_dynamic(self: (felt252, Layout), keys: Span<felt252>) -> ShardModel;
 }
 
@@ -173,7 +180,11 @@ impl SelectorLayoutIntoShardModel of IntoShardModel {
         selection: ShardFieldSelection,
     ) -> ShardModel {
         let (selector, layout) = self;
-        ShardModel { selector, keys, fields: translate_layout(layout, crdt, selection) }
+        let coverage = match selection {
+            ShardFieldSelection::AutoDeterministic => ShardCoverage::DeterministicSubset,
+            _ => ShardCoverage::Full,
+        };
+        ShardModel { selector, keys, fields: translate_layout(layout, crdt, selection), coverage }
     }
 
     fn shard_deterministic(self: (felt252, Layout), keys: Span<felt252>) -> ShardModel {
@@ -181,10 +192,6 @@ impl SelectorLayoutIntoShardModel of IntoShardModel {
     }
 
     fn shard(self: (felt252, Layout), keys: Span<felt252>) -> ShardModel {
-        self.shard_with(keys, CRDVariant::Set, ShardFieldSelection::StrictAll)
-    }
-
-    fn shard_strict(self: (felt252, Layout), keys: Span<felt252>) -> ShardModel {
         self.shard_with(keys, CRDVariant::Set, ShardFieldSelection::StrictAll)
     }
 

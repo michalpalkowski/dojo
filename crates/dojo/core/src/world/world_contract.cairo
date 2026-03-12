@@ -85,7 +85,7 @@ pub mod world {
         collect_dynamic_member_locks, collect_shardable_slots, is_dynamic_layout, plan_model_slots,
         shard_crdt_type,
     };
-    use dojo::sharding::request::ShardModel;
+    use dojo::sharding::request::{CRDVariant, ShardModel};
     use dojo::sharding::slot::compute_dynamic_member_lock_slot;
 
     component!(path: sharding_cpt, storage: sharding, event: ShardingEvent);
@@ -1217,9 +1217,10 @@ pub mod world {
                 // Compute entity_id from keys.
                 let entity_id = entity_id_from_serialized_keys(model.keys);
                 self.sharding.store_entity_keys(entity_id, model.keys);
+                let exclusive_group_id = self.compute_exclusive_group_id(model.selector, entity_id);
 
                 let planned_slots = plan_model_slots(
-                    model.selector, entity_id, model_layout, model.fields,
+                    model.selector, entity_id, model_layout, model.fields, model.coverage,
                 );
                 for planned in planned_slots.span() {
                     let planned = *planned;
@@ -1229,8 +1230,12 @@ pub mod world {
                     );
                     Felt252DictTrait::insert(ref seen_slots, planned.slot, 1);
 
+                    let group_id = match planned.crdt {
+                        CRDVariant::SetLock | CRDVariant::Lock => exclusive_group_id,
+                        _ => 0,
+                    };
                     self.sharding.store_slot_metadata(
-                        planned.slot, model.selector, entity_id, planned.member_selector,
+                        planned.slot, model.selector, entity_id, planned.member_selector, group_id,
                     );
                     all_slots.append(shard_crdt_type(planned.crdt, world_addr, planned.slot));
                 };
@@ -1284,6 +1289,11 @@ pub mod world {
                 sharding_cpt::Errors::UNAUTHORIZED_CALLER,
             );
 
+            let requested_unlock_slots = self.collect_settlement_unlock_slots(
+                slot_changes.span(), member_writes,
+            );
+            self.assert_exclusive_group_full_coverage(requested_unlock_slots.span());
+
             let mut slot_metas = self.collect_settlement_slot_metas(slot_changes.span());
 
             if slot_changes.len() != 0 {
@@ -1302,6 +1312,7 @@ pub mod world {
         }
 
         fn cancel_shard_state(ref self: ContractState, slots: Span<felt252>) {
+            self.assert_exclusive_group_full_coverage(slots);
             self.sharding.cancel_shard_state(slots);
 
             let mut cleared_entities: Felt252Dict<felt252> = Default::default();
@@ -1559,6 +1570,81 @@ pub mod world {
                 }
             };
             slot_metas
+        }
+
+        fn compute_exclusive_group_id(
+            self: @ContractState, model_selector: felt252, entity_id: felt252,
+        ) -> felt252 {
+            core::poseidon::poseidon_hash_span(
+                ['dojo_exclusive_group', model_selector, entity_id].span(),
+            )
+        }
+
+        fn collect_settlement_unlock_slots(
+            self: @ContractState,
+            slot_changes: Span<(felt252, felt252)>,
+            member_writes: Span<ShardMemberWrite>,
+        ) -> Array<felt252> {
+            let mut slots: Array<felt252> = ArrayTrait::new();
+            let mut seen_slots: Felt252Dict<felt252> = Default::default();
+
+            for entry in slot_changes {
+                let (slot, _) = *entry;
+                assert(
+                    Felt252DictTrait::get(ref seen_slots, slot) == 0,
+                    sharding_cpt::Errors::DUPLICATE_SLOT,
+                );
+                Felt252DictTrait::insert(ref seen_slots, slot, 1);
+                slots.append(slot);
+            };
+
+            for member_write in member_writes {
+                let member_write = *member_write;
+                let lock_slot = compute_dynamic_member_lock_slot(
+                    member_write.model_selector, member_write.entity_id, member_write.member_selector,
+                );
+                assert(
+                    Felt252DictTrait::get(ref seen_slots, lock_slot) == 0,
+                    sharding_cpt::Errors::DUPLICATE_SLOT,
+                );
+                Felt252DictTrait::insert(ref seen_slots, lock_slot, 1);
+                slots.append(lock_slot);
+            };
+
+            slots
+        }
+
+        fn assert_exclusive_group_full_coverage(
+            self: @ContractState, slots: Span<felt252>,
+        ) {
+            let mut seen_groups: Felt252Dict<felt252> = Default::default();
+            let mut group_counts: Felt252Dict<felt252> = Default::default();
+            let mut groups: Array<felt252> = ArrayTrait::new();
+
+            for slot in slots {
+                let slot = *slot;
+                let group_id = self.sharding.read_slot_group_id(slot);
+                if group_id == 0 {
+                    continue;
+                }
+                assert(self.sharding.is_slot_active(slot), 'Shard grp: inactive');
+
+                if Felt252DictTrait::get(ref seen_groups, group_id) == 0 {
+                    Felt252DictTrait::insert(ref seen_groups, group_id, 1);
+                    groups.append(group_id);
+                }
+
+                let current = Felt252DictTrait::get(ref group_counts, group_id);
+                Felt252DictTrait::insert(ref group_counts, group_id, current + 1);
+            };
+
+            for group_id in groups.span() {
+                let group_id = *group_id;
+                let expected: felt252 = self.sharding.group_active_slots(group_id).into();
+                let provided = Felt252DictTrait::get(ref group_counts, group_id);
+                assert(expected != 0, 'Shard grp: invalid');
+                assert(provided == expected, 'Shard grp: partial');
+            };
         }
 
         fn collect_member_write_values(

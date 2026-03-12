@@ -23,7 +23,7 @@ fn foo_field_selectors() -> (felt252, felt252) {
 }
 
 #[test]
-#[should_panic(expected: ('Component: Type change active',))]
+#[should_panic(expected: ('Component: Bad metadata',))]
 fn test_component_setlock_after_add_fails() {
     let (mut world, model_selector) = deploy_world_and_foo();
     let bob: ContractAddress = 0xb0b.try_into().unwrap();
@@ -194,13 +194,14 @@ fn test_component_lock_settlement_does_not_write() {
         .span();
     world.dispatcher.request_sharding(proxy_address, models);
 
-    let (sel_a, _) = foo_field_selectors();
+    let (sel_a, sel_b) = foo_field_selectors();
     let entity_id = entity_id_from_keys(@bob);
     let slot_a = compute_dojo_field_slot(model_selector, entity_id, sel_a);
+    let slot_b = compute_dojo_field_slot(model_selector, entity_id, sel_b);
 
     let sharding_proxy = IShardingProxyDispatcher { contract_address: world_address };
     snforge_std::start_cheat_caller_address(world_address, proxy_address);
-    sharding_proxy.settle_shard_changes(array![(slot_a, 999)], [].span(), [].span());
+    sharding_proxy.settle_shard_changes(array![(slot_a, 999), (slot_b, 777)], [].span(), [].span());
     snforge_std::stop_cheat_caller_address(world_address);
 
     let result: Foo = world.read_model(bob);

@@ -1,6 +1,6 @@
 use dojo::model::Model;
 use dojo::sharding::planner::{collect_shardable_slots, is_dynamic_layout, plan_model_slots};
-use dojo::sharding::request::{CRDVariant, IntoShardField};
+use dojo::sharding::request::{CRDVariant, IntoShardField, ShardCoverage};
 use dojo::sharding::slot::{
     PACKED_SLOT_BASE, compute_dojo_field_slot, compute_dojo_packed_slot, compute_dynamic_member_lock_slot,
 };
@@ -35,7 +35,11 @@ fn test_planner_struct_fixed_member_slot() {
     let layout = Model::<Foo>::layout();
 
     let planned_slots = plan_model_slots(
-        model_selector, entity_id, layout, [a_selector.as_set()].span(),
+        model_selector,
+        entity_id,
+        layout,
+        [a_selector.as_set()].span(),
+        ShardCoverage::DeterministicSubset,
     );
     assert(planned_slots.len() == 1, 'one slot');
 
@@ -52,14 +56,19 @@ fn test_planner_dynamic_member_setlock_uses_dynamic_lock_slot() {
     let player: ContractAddress = 0xb0b.try_into().unwrap();
     let entity_id = dojo::utils::entity_id_from_keys(@player);
     let (_, note_selector) = mixed_dynamic_selectors();
+    let (fixed_selector, _) = mixed_dynamic_selectors();
     let layout = Model::<MixedDynamic>::layout();
 
     let planned_slots = plan_model_slots(
-        model_selector, entity_id, layout, [note_selector.as_set_lock()].span(),
+        model_selector,
+        entity_id,
+        layout,
+        [fixed_selector.as_set(), note_selector.as_set_lock()].span(),
+        ShardCoverage::Full,
     );
-    assert(planned_slots.len() == 1, 'one dynamic lock');
+    assert(planned_slots.len() == 2, 'fixed + dynamic');
 
-    let planned = *planned_slots[0];
+    let planned = *planned_slots[1];
     let expected_lock_slot = compute_dynamic_member_lock_slot(model_selector, entity_id, note_selector);
     assert(planned.slot == expected_lock_slot, 'dynamic lock slot mismatch');
     assert(planned.member_selector == note_selector, 'member sel mismatch');
@@ -75,7 +84,9 @@ fn test_planner_dynamic_member_requires_setlock() {
     let (_, note_selector) = mixed_dynamic_selectors();
     let layout = Model::<MixedDynamic>::layout();
 
-    let _ = plan_model_slots(model_selector, entity_id, layout, [note_selector.as_set()].span());
+    let _ = plan_model_slots(
+        model_selector, entity_id, layout, [note_selector.as_set()].span(), ShardCoverage::Full,
+    );
 }
 
 #[test]
@@ -86,7 +97,7 @@ fn test_planner_fixed_model_packed_selector() {
     let layout = Model::<Score>::layout();
 
     let planned_slots = plan_model_slots(
-        model_selector, entity_id, layout, [PACKED_SLOT_BASE.as_add()].span(),
+        model_selector, entity_id, layout, [PACKED_SLOT_BASE.as_add()].span(), ShardCoverage::Full,
     );
     assert(planned_slots.len() == 1, 'one packed slot');
 
@@ -106,7 +117,11 @@ fn test_planner_fixed_model_packed_selector_out_of_range() {
     let layout = Model::<Score>::layout();
 
     let _ = plan_model_slots(
-        model_selector, entity_id, layout, [(PACKED_SLOT_BASE + 1).as_set()].span(),
+        model_selector,
+        entity_id,
+        layout,
+        [(PACKED_SLOT_BASE + 1).as_set()].span(),
+        ShardCoverage::Full,
     );
 }
 
