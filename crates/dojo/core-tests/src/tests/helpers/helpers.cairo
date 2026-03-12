@@ -62,12 +62,43 @@ pub struct Score {
     pub level: u32,
 }
 
+#[derive(Copy)]
+#[dojo::model]
+pub struct Balance256 {
+    #[key]
+    pub player: ContractAddress,
+    pub amount: u256,
+}
+
 #[dojo::model]
 pub struct NotCopiable {
     #[key]
     pub caller: ContractAddress,
     pub a: Array<felt252>,
     pub b: ByteArray,
+}
+
+#[derive(Introspect, Copy, Drop, Serde, Debug, PartialEq, Default, DojoStore)]
+pub struct NestedStats {
+    pub hp: u64,
+    pub mana: u64,
+}
+
+#[derive(Copy)]
+#[dojo::model]
+pub struct NestedFixed {
+    #[key]
+    pub player: ContractAddress,
+    pub stats: NestedStats,
+    pub gold: u32,
+}
+
+#[dojo::model]
+pub struct MixedDynamic {
+    #[key]
+    pub player: ContractAddress,
+    pub fixed_value: u64,
+    pub note: ByteArray,
 }
 
 
@@ -86,6 +117,17 @@ pub struct WithOptionAndEnums {
     pub id: u32,
     pub a: EnumOne,
     pub b: Option<u32>,
+}
+
+/// Deterministic mixed layout to cover Tuple / FixedArray / Enum sharding paths.
+#[derive(Copy)]
+#[dojo::model]
+pub struct TupleArrayOption {
+    #[key]
+    pub player: ContractAddress,
+    pub pair: (u32, u64),
+    pub samples: [u16; 3],
+    pub status: Option<u32>,
 }
 
 #[starknet::contract]
@@ -380,6 +422,46 @@ pub fn deploy_world_with_score() -> (WorldStorage, felt252) {
         resources: [TestResource::Model("Score")].span(),
     };
     (spawn_test_world([namespace_def].span()), Model::<Score>::selector(DOJO_NSH))
+}
+
+pub fn deploy_world_with_balance256() -> (WorldStorage, felt252) {
+    let namespace_def = NamespaceDef {
+        namespace: "dojo",
+        resources: [TestResource::Model("Balance256")].span(),
+    };
+    (spawn_test_world([namespace_def].span()), Model::<Balance256>::selector(DOJO_NSH))
+}
+
+pub fn deploy_world_with_not_copiable() -> (WorldStorage, felt252) {
+    let namespace_def = NamespaceDef {
+        namespace: "dojo",
+        resources: [TestResource::Model("NotCopiable")].span(),
+    };
+    (spawn_test_world([namespace_def].span()), Model::<NotCopiable>::selector(DOJO_NSH))
+}
+
+pub fn deploy_world_with_nested_fixed() -> (WorldStorage, felt252) {
+    let namespace_def = NamespaceDef {
+        namespace: "dojo",
+        resources: [TestResource::Model("NestedFixed")].span(),
+    };
+    (spawn_test_world([namespace_def].span()), Model::<NestedFixed>::selector(DOJO_NSH))
+}
+
+pub fn deploy_world_with_mixed_dynamic() -> (WorldStorage, felt252) {
+    let namespace_def = NamespaceDef {
+        namespace: "dojo",
+        resources: [TestResource::Model("MixedDynamic")].span(),
+    };
+    (spawn_test_world([namespace_def].span()), Model::<MixedDynamic>::selector(DOJO_NSH))
+}
+
+pub fn deploy_world_with_tuple_array_option() -> (WorldStorage, felt252) {
+    let namespace_def = NamespaceDef {
+        namespace: "dojo",
+        resources: [TestResource::Model("TupleArrayOption")].span(),
+    };
+    (spawn_test_world([namespace_def].span()), Model::<TupleArrayOption>::selector(DOJO_NSH))
 }
 
 /// Deploys an empty world with the `dojo` namespace and registers the `foo` model.

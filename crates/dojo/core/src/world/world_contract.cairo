@@ -47,7 +47,8 @@ pub mod world {
     use dojo::model::{Model, ModelIndex, ResourceMetadata, metadata};
     use dojo::storage;
     use dojo::utils::{
-        bytearray_hash, default_address, default_class_hash, entity_id_from_serialized_keys,
+        bytearray_hash, combine_key, default_address, default_class_hash,
+        entity_id_from_serialized_keys,
         selector_from_namespace_and_name,
     };
     use dojo::world::{IUpgradeableWorld, IWorld, Resource, ResourceIsNoneTrait, errors};
@@ -67,7 +68,7 @@ pub mod world {
     use dojo::sharding::crdt::CRDType;
     use dojo::sharding::request::{ShardModel, CRDVariant};
     use dojo::sharding::slot::{
-        PACKED_SLOT_BASE, compute_dojo_field_slot, compute_dojo_packed_slot, is_packed_selector,
+        PACKED_SLOT_BASE, compute_dojo_packed_slot, is_packed_selector,
     };
 
     component!(path: sharding_cpt, storage: sharding, event: ShardingEvent);
@@ -75,6 +76,90 @@ pub mod world {
     pub const WORLD: felt252 = 0;
     pub const DOJO_INIT_SELECTOR: felt252 = selector!("dojo_init");
     pub const WORLD_VERSION: felt252 = '1.8.0';
+
+    /// Collect deterministic storage slots for a layout rooted at `key`.
+    ///
+    /// Returns `true` only when the full layout is deterministic. Dynamic
+    /// branches (`Array` and `ByteArray`) return `false` and are skipped.
+    fn collect_shardable_slots(
+        ref slots: Array<felt252>, model_selector: felt252, key: felt252, layout: Layout,
+    ) -> bool {
+        match layout {
+            Layout::Fixed(bits_layout) => {
+                let mut bits_layout = bits_layout;
+                let packed_size = dojo::storage::packing::calculate_packed_size(
+                    ref bits_layout,
+                );
+                let packed_base = compute_dojo_packed_slot(model_selector, key);
+                let mut i: usize = 0;
+                while i < packed_size {
+                    slots.append(packed_base + i.into());
+                    i += 1;
+                };
+                true
+            },
+            Layout::Struct(fields) => {
+                let mut deterministic = true;
+                for field_layout in fields {
+                    let field_key = combine_key(key, *field_layout.selector);
+                    if !collect_shardable_slots(
+                        ref slots, model_selector, field_key, *field_layout.layout,
+                    ) {
+                        deterministic = false;
+                    }
+                };
+                deterministic
+            },
+            Layout::Tuple(item_layouts) => {
+                let mut deterministic = true;
+                for (i, item_layout) in item_layouts.into_iter().enumerate() {
+                    let item_key = combine_key(key, i.into());
+                    if !collect_shardable_slots(
+                        ref slots, model_selector, item_key, *item_layout,
+                    ) {
+                        deterministic = false;
+                    }
+                };
+                deterministic
+            },
+            Layout::FixedArray(fixed_array_layout) => {
+                let (item_layouts, array_len): (Span<Layout>, u32) = fixed_array_layout;
+                if item_layouts.len() == 0 {
+                    return false;
+                }
+                let item_layout = *item_layouts[0];
+                let mut deterministic = true;
+                let mut i: u32 = 0;
+                while i < array_len {
+                    let item_key = combine_key(key, i.into());
+                    if !collect_shardable_slots(
+                        ref slots, model_selector, item_key, item_layout,
+                    ) {
+                        deterministic = false;
+                    }
+                    i += 1;
+                };
+                deterministic
+            },
+            Layout::Enum(variant_layouts) => {
+                // Variant discriminator is always stored at the root key.
+                slots.append(compute_dojo_packed_slot(model_selector, key));
+
+                let mut deterministic = true;
+                for variant_layout in variant_layouts {
+                    let variant_key = combine_key(key, *variant_layout.selector);
+                    if !collect_shardable_slots(
+                        ref slots, model_selector, variant_key, *variant_layout.layout,
+                    ) {
+                        deterministic = false;
+                    }
+                };
+                deterministic
+            },
+            Layout::Array(_) => false,
+            Layout::ByteArray => false,
+        }
+    }
 
     #[event]
     #[derive(Drop, starknet::Event)]
@@ -1176,13 +1261,15 @@ pub mod world {
 
             let world_addr = starknet::get_contract_address();
             let mut all_slots: Array<CRDType> = ArrayTrait::new();
+            let mut seen_slots: Felt252Dict<felt252> = Default::default();
 
             for model in models {
                 let model = *model;
+                assert(model.fields.len() != 0, 'request_sharding: empty fields');
 
-                // Verify model is registered.
-                match self.resources.read(model.selector) {
-                    Resource::Model(_) => {},
+                // Verify model is registered and read canonical onchain layout.
+                let model_contract_address = match self.resources.read(model.selector) {
+                    Resource::Model((model_address, _)) => model_address,
                     _ => {
                         panic_with_byte_array(
                             @errors::resource_conflict(
@@ -1191,41 +1278,127 @@ pub mod world {
                         )
                     },
                 };
+                let model_layout = IStoredResourceDispatcher {
+                    contract_address: model_contract_address,
+                }
+                    .layout();
 
                 // Caller must have writer permission for this model.
                 self.assert_caller_permissions(model.selector, Permission::Writer);
 
                 // Compute entity_id from keys.
                 let entity_id = entity_id_from_serialized_keys(model.keys);
+                self.sharding.store_entity_keys(entity_id, model.keys);
 
                 // Each ShardField carries its own field selector and CRDT variant.
                 // Selectors in the PACKED_SLOT_BASE range indicate packed model offsets;
                 // all other selectors are per-field (Layout::Struct).
                 for shard_field in model.fields {
                     let shard_field = *shard_field;
-                    let slot = if is_packed_selector(shard_field.selector) {
-                        let offset = shard_field.selector - PACKED_SLOT_BASE;
-                        compute_dojo_packed_slot(model.selector, entity_id) + offset
-                    } else {
-                        compute_dojo_field_slot(
-                            model.selector, entity_id, shard_field.selector,
-                        )
-                    };
-                    self.sharding.store_slot_metadata(
-                        slot, model.selector, entity_id, shard_field.selector,
-                    );
-                    self.sharding.store_entity_keys(entity_id, model.keys);
+                    match model_layout {
+                        Layout::Struct(field_layouts) => {
+                            // Validate that selector belongs to this model.
+                            let field_layout = match dojo::utils::find_field_layout(
+                                shard_field.selector, field_layouts,
+                            ) {
+                                Option::Some(layout) => layout,
+                                Option::None => panic_with_byte_array(
+                                    @format!(
+                                        "request_sharding: unknown field selector {} for model {}",
+                                        shard_field.selector, model.selector,
+                                    ),
+                                ),
+                            };
 
-                    let crd_type = match shard_field.crdt {
-                        CRDVariant::Set => CRDType::Set((world_addr, slot)),
-                        CRDVariant::Add => CRDType::Add((world_addr, slot)),
-                        CRDVariant::Lock => CRDType::Lock((world_addr, slot)),
-                        CRDVariant::SetLock => CRDType::SetLock((world_addr, slot)),
-                    };
-                    all_slots.append(crd_type);
+                            // Struct members may be nested; expand recursively to
+                            // deterministic slots. Dynamic layouts (Array/ByteArray)
+                            // are rejected by protocol.
+                            let field_key = combine_key(entity_id, shard_field.selector);
+                            let mut field_slots: Array<felt252> = ArrayTrait::new();
+                            if !collect_shardable_slots(
+                                ref field_slots, model.selector, field_key, field_layout,
+                            ) {
+                                panic_with_byte_array(
+                                    @format!(
+                                        "request_sharding: unsupported dynamic field selector {}",
+                                        shard_field.selector,
+                                    ),
+                                );
+                            }
+                            assert(
+                                field_slots.len() != 0,
+                                'Shard: no slots',
+                            );
+
+                            for slot in field_slots.span() {
+                                let slot = *slot;
+                                assert(
+                                    Felt252DictTrait::get(ref seen_slots, slot) == 0,
+                                    sharding_cpt::Errors::DUPLICATE_SLOT,
+                                );
+                                Felt252DictTrait::insert(ref seen_slots, slot, 1);
+
+                                self.sharding.store_slot_metadata(
+                                    slot, model.selector, entity_id, shard_field.selector,
+                                );
+
+                                let crd_type = match shard_field.crdt {
+                                    CRDVariant::Set => CRDType::Set((world_addr, slot)),
+                                    CRDVariant::Add => CRDType::Add((world_addr, slot)),
+                                    CRDVariant::Lock => CRDType::Lock((world_addr, slot)),
+                                    CRDVariant::SetLock => CRDType::SetLock((world_addr, slot)),
+                                };
+                                all_slots.append(crd_type);
+                            };
+                        },
+                        Layout::Fixed(model_fixed_layout) => {
+                            assert(
+                                is_packed_selector(shard_field.selector),
+                                'Shard: packed selector',
+                            );
+
+                            let mut model_fixed_layout = model_fixed_layout;
+                            let packed_size = dojo::storage::packing::calculate_packed_size(
+                                ref model_fixed_layout,
+                            );
+
+                            let offset = shard_field.selector - PACKED_SLOT_BASE;
+                            let offset_index: usize = offset.try_into().unwrap();
+                            assert(
+                                offset_index < packed_size,
+                                'Shard: packed range',
+                            );
+
+                            let slot = compute_dojo_packed_slot(model.selector, entity_id) + offset;
+                            assert(
+                                Felt252DictTrait::get(ref seen_slots, slot) == 0,
+                                sharding_cpt::Errors::DUPLICATE_SLOT,
+                            );
+                            Felt252DictTrait::insert(ref seen_slots, slot, 1);
+
+                            self.sharding.store_slot_metadata(
+                                slot, model.selector, entity_id, shard_field.selector,
+                            );
+
+                            let crd_type = match shard_field.crdt {
+                                CRDVariant::Set => CRDType::Set((world_addr, slot)),
+                                CRDVariant::Add => CRDType::Add((world_addr, slot)),
+                                CRDVariant::Lock => CRDType::Lock((world_addr, slot)),
+                                CRDVariant::SetLock => CRDType::SetLock((world_addr, slot)),
+                            };
+                            all_slots.append(crd_type);
+                        },
+                        _ => panic_with_byte_array(
+                            @format!(
+                                "request_sharding: unsupported model layout for selector {}",
+                                model.selector,
+                            ),
+                        ),
+                    }
                 }
             };
 
+            assert(all_slots.len() != 0, 'Shard: no slots');
             self.sharding.initialize_shard(proxy, all_slots.span());
         }
 
@@ -1281,7 +1454,10 @@ pub mod world {
 
             for meta in slot_metas.span() {
                 let (slot, model_sel, entity_id, member_sel) = *meta;
-                self.sharding.clear_slot_metadata(slot);
+                let slot_still_active = self.sharding.is_slot_active(slot);
+                if !slot_still_active {
+                    self.sharding.clear_slot_metadata(slot);
+                }
 
                 // StoreSetRecord if keys stored (new entities), StoreUpdateMember otherwise.
                 let keys = self.sharding.read_entity_keys(entity_id);
@@ -1356,10 +1532,15 @@ pub mod world {
             let mut cleared_entities: Felt252Dict<felt252> = Default::default();
             for slot in slots {
                 let slot = *slot;
-                let (_, entity_id, _) = self.sharding.read_slot_metadata(slot);
+                let (model_selector, entity_id, _) = self.sharding.read_slot_metadata(slot);
+                if model_selector == 0 || self.sharding.is_slot_active(slot) {
+                    continue;
+                }
                 self.sharding.clear_slot_metadata(slot);
 
-                if entity_id != 0 && Felt252DictTrait::get(ref cleared_entities, entity_id) == 0 {
+                if entity_id != 0 &&
+                    !self.sharding.has_entity_active_slots(entity_id) &&
+                    Felt252DictTrait::get(ref cleared_entities, entity_id) == 0 {
                     Felt252DictTrait::insert(ref cleared_entities, entity_id, 1);
                     self.sharding.clear_entity_keys(entity_id);
                 }
@@ -1635,7 +1816,9 @@ pub mod world {
                 ModelIndex::MemberId((
                     entity_id, member_selector,
                 )) => {
-                    self.assert_member_write_unlocked(model_selector, entity_id, member_selector);
+                    self.assert_member_write_unlocked(
+                        model_selector, entity_id, member_selector, layout,
+                    );
                     storage::entity_model::write_model_member(
                         model_selector, entity_id, member_selector, values, layout,
                     );
@@ -1718,40 +1901,29 @@ pub mod world {
         fn assert_model_write_unlocked(
             self: @ContractState, model_selector: felt252, entity_id: felt252, layout: Layout,
         ) {
-            match layout {
-                Layout::Struct(fields) => {
-                    for field_layout in fields {
-                        let slot = compute_dojo_field_slot(
-                            model_selector, entity_id, *field_layout.selector,
-                        );
-                        self.assert_slot_writable(slot);
-                    }
-                },
-                Layout::Fixed(bits_layout) => {
-                    let mut bits_layout = bits_layout;
-                    let packed_size = dojo::storage::packing::calculate_packed_size(
-                        ref bits_layout,
-                    );
-                    let packed_base = compute_dojo_packed_slot(model_selector, entity_id);
-                    let mut i: usize = 0;
-                    while i < packed_size {
-                        self.assert_slot_writable(packed_base + i.into());
-                        i += 1;
-                    };
-                },
-                _ => {},
-            }
+            let mut slots: Array<felt252> = ArrayTrait::new();
+            let _ = collect_shardable_slots(ref slots, model_selector, entity_id, layout);
+            for slot in slots.span() {
+                self.assert_slot_writable(*slot);
+            };
         }
 
-        /// Member writes always map to the Dojo field slot keyed by `member_selector`.
+        /// Member writes map to all deterministic slots under the member key.
         fn assert_member_write_unlocked(
             self: @ContractState,
             model_selector: felt252,
             entity_id: felt252,
             member_selector: felt252,
+            member_layout: Layout,
         ) {
-            let slot = compute_dojo_field_slot(model_selector, entity_id, member_selector);
-            self.assert_slot_writable(slot);
+            let member_key = combine_key(entity_id, member_selector);
+            let mut slots: Array<felt252> = ArrayTrait::new();
+            let _ = collect_shardable_slots(
+                ref slots, model_selector, member_key, member_layout,
+            );
+            for slot in slots.span() {
+                self.assert_slot_writable(*slot);
+            };
         }
 
         #[inline(always)]

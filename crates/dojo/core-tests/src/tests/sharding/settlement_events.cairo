@@ -182,6 +182,82 @@ fn test_cancel_clears_metadata_no_events() {
     assert(result.a == 100, 'cancel should not change value');
 }
 
+/// Test: partial cancel keeps entity keys for remaining active slots.
+///
+/// Policy: partial cancel is allowed. If only part of an entity's active slots
+/// are canceled, later settlement of the remaining slots must still emit
+/// StoreSetRecord (with keys), not StoreUpdateMember.
+#[test]
+fn test_partial_cancel_keeps_keys_for_remaining_slots() {
+    let (mut world, model_selector) = deploy_world_and_foo();
+    let world_address = world.dispatcher.contract_address;
+
+    let bob: ContractAddress = 0xb0b.try_into().unwrap();
+    let foo = Foo { caller: bob, a: 100, b: 200 };
+    world.write_model_test(@foo);
+
+    let proxy_address = declare_and_deploy("mock_sharding_proxy");
+
+    let layout = Model::<Foo>::layout();
+    let models = [(model_selector, layout).shard([bob.into()].span())].span();
+    world.dispatcher.request_sharding(proxy_address, models);
+
+    let (sel_a, sel_b) = foo_field_selectors();
+    let entity_id = entity_id_from_keys(@bob);
+    let slot_a = compute_dojo_field_slot(model_selector, entity_id, sel_a);
+    let slot_b = compute_dojo_field_slot(model_selector, entity_id, sel_b);
+
+    let sharding_proxy = IShardingProxyDispatcher { contract_address: world_address };
+
+    // Cancel only one slot.
+    snforge_std::start_cheat_caller_address(world_address, proxy_address);
+    sharding_proxy.cancel_shard_state(array![slot_a].span());
+    snforge_std::stop_cheat_caller_address(world_address);
+
+    let mut spy = spy_events();
+
+    // Settle the remaining slot.
+    snforge_std::start_cheat_caller_address(world_address, proxy_address);
+    sharding_proxy.update_shard_state(array![(slot_b, 999)]);
+    snforge_std::stop_cheat_caller_address(world_address);
+
+    // Remaining settlement should still emit StoreSetRecord with keys.
+    spy
+        .assert_emitted(
+            @array![
+                (
+                    world_address,
+                    world_contract::Event::StoreSetRecord(
+                        world_contract::StoreSetRecord {
+                            selector: model_selector,
+                            entity_id,
+                            keys: [bob.into()].span(),
+                            values: [100, 999].span(),
+                        },
+                    ),
+                ),
+            ],
+        );
+
+    // Explicitly ensure it did not degrade to member-only update.
+    spy
+        .assert_not_emitted(
+            @array![
+                (
+                    world_address,
+                    world_contract::Event::StoreUpdateMember(
+                        world_contract::StoreUpdateMember {
+                            selector: model_selector,
+                            entity_id,
+                            member_selector: sel_b,
+                            values: [999].span(),
+                        },
+                    ),
+                ),
+            ],
+        );
+}
+
 /// Test: per-field mixed CRDT — Add field emits merged value, Set field emits overwritten value.
 #[test]
 fn test_settlement_per_field_mixed_crdt_events() {

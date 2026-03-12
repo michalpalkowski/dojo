@@ -1,19 +1,72 @@
 use dojo::model::{Model, ModelStorage, ModelStorageTest};
 use dojo::sharding::component::{IContractComponentDispatcher, IContractComponentDispatcherTrait};
 use dojo::sharding::compute_dojo_field_slot;
+use dojo::sharding::slot::compute_dojo_packed_slot;
 use dojo::sharding::request::{IntoShardModel, IntoShardField, ShardModel};
-use dojo::utils::entity_id_from_keys;
+use dojo::utils::{combine_key, entity_id_from_keys};
 use dojo::world::IWorldDispatcherTrait;
 use dojo_snf_test::declare_and_deploy;
 use starknet::ContractAddress;
 
-use crate::tests::helpers::{Foo, deploy_world_and_foo};
+use crate::tests::helpers::{
+    Balance256, Foo, MixedDynamic, NestedFixed, NestedStats, NotCopiable, TupleArrayOption,
+    deploy_world_and_foo,
+    deploy_world_with_balance256, deploy_world_with_mixed_dynamic, deploy_world_with_nested_fixed,
+    deploy_world_with_not_copiable, deploy_world_with_tuple_array_option,
+};
 
 /// Helper: get the local layout field selectors for Foo (same compilation unit as write/read_model).
 fn foo_field_selectors() -> (felt252, felt252) {
     let layout = Model::<Foo>::layout();
     if let dojo::meta::Layout::Struct(fields) = layout {
         ((*fields[0]).selector, (*fields[1]).selector)
+    } else {
+        panic!("expected struct layout")
+    }
+}
+
+fn balance256_field_selector() -> felt252 {
+    let layout = Model::<Balance256>::layout();
+    if let dojo::meta::Layout::Struct(fields) = layout {
+        (*fields[0]).selector
+    } else {
+        panic!("expected struct layout")
+    }
+}
+
+fn mixed_dynamic_fixed_selector() -> felt252 {
+    let layout = Model::<MixedDynamic>::layout();
+    if let dojo::meta::Layout::Struct(fields) = layout {
+        (*fields[0]).selector
+    } else {
+        panic!("expected struct layout")
+    }
+}
+
+fn nested_fixed_selectors() -> (felt252, felt252, felt252) {
+    let layout = Model::<NestedFixed>::layout();
+    if let dojo::meta::Layout::Struct(fields) = layout {
+        let stats_selector = (*fields[0]).selector;
+        let gold_selector = (*fields[1]).selector;
+        if let dojo::meta::Layout::Struct(stat_fields) = *fields[0].layout {
+            let hp_selector = (*stat_fields[0]).selector;
+            (stats_selector, hp_selector, gold_selector)
+        } else {
+            panic!("expected nested struct layout")
+        }
+    } else {
+        panic!("expected struct layout")
+    }
+}
+
+fn tuple_array_option_selectors() -> (felt252, felt252, felt252) {
+    let layout = Model::<TupleArrayOption>::layout();
+    if let dojo::meta::Layout::Struct(fields) = layout {
+        let pair_selector = selector!("pair");
+        let samples_selector = selector!("samples");
+        let status_selector = selector!("status");
+        assert(dojo::utils::find_field_layout(status_selector, fields).is_some(), 'missing status');
+        (pair_selector, samples_selector, status_selector)
     } else {
         panic!("expected struct layout")
     }
@@ -282,6 +335,213 @@ fn test_per_field_crdt_mixed() {
     let result: Foo = world.read_model(bob);
     assert(result.a == 170, 'Add delta incorrect');
     assert(result.b == 999, 'Set should overwrite');
+}
+
+/// Test: field with fixed layout spanning 2 slots (u256) must update both slots.
+#[test]
+fn test_request_sharding_struct_fixed_multi_slot_field() {
+    let (mut world, model_selector) = deploy_world_with_balance256();
+    let world_address = world.dispatcher.contract_address;
+
+    let bob: ContractAddress = 0xb0b.try_into().unwrap();
+    let initial = Balance256 { player: bob, amount: u256 { low: 1_u128, high: 2_u128 } };
+    world.write_model_test(@initial);
+
+    let proxy_address = declare_and_deploy("mock_sharding_proxy");
+
+    let layout = Model::<Balance256>::layout();
+    let models = [(model_selector, layout).shard([bob.into()].span())].span();
+    world.dispatcher.request_sharding(proxy_address, models);
+
+    let selector = balance256_field_selector();
+    let entity_id = entity_id_from_keys(@bob);
+    let base_slot = compute_dojo_field_slot(model_selector, entity_id, selector);
+    let high_slot = base_slot + 1;
+
+    let sharding = IContractComponentDispatcher { contract_address: world_address };
+    snforge_std::start_cheat_caller_address(world_address, proxy_address);
+    sharding.update_shard_state(array![(base_slot, 55), (high_slot, 66)]);
+    snforge_std::stop_cheat_caller_address(world_address);
+
+    let result: Balance256 = world.read_model(bob);
+    assert(result.amount.low == 55_u128, 'u256 low slot not updated');
+    assert(result.amount.high == 66_u128, 'u256 high slot not updated');
+}
+
+/// Test: manual per-field sharding must reject unknown struct field selectors.
+#[test]
+#[should_panic]
+fn test_request_sharding_rejects_unknown_field_selector() {
+    let (mut world, model_selector) = deploy_world_and_foo();
+    let bob: ContractAddress = 0xb0b.try_into().unwrap();
+
+    let foo = Foo { caller: bob, a: 10, b: 20 };
+    world.write_model_test(@foo);
+
+    let proxy_address = declare_and_deploy("mock_sharding_proxy");
+    let models = [
+        ShardModel {
+            selector: model_selector,
+            keys: [bob.into()].span(),
+            fields: [0xDEADBEEF.as_set()].span(),
+        },
+    ]
+        .span();
+
+    world.dispatcher.request_sharding(proxy_address, models);
+}
+
+/// Test: struct fields with non-fixed layouts are not supported for sharding.
+#[test]
+#[should_panic]
+fn test_request_sharding_rejects_non_fixed_struct_field_layout() {
+    let (world, model_selector) = deploy_world_with_not_copiable();
+    let bob: ContractAddress = 0xb0b.try_into().unwrap();
+
+    let proxy_address = declare_and_deploy("mock_sharding_proxy");
+    let layout = Model::<NotCopiable>::layout();
+    let models = [(model_selector, layout).shard([bob.into()].span())].span();
+    world.dispatcher.request_sharding(proxy_address, models);
+}
+
+/// Test: auto translator skips unsupported dynamic fields and keeps fixed ones.
+#[test]
+fn test_request_sharding_auto_skips_dynamic_fields() {
+    let (mut world, model_selector) = deploy_world_with_mixed_dynamic();
+    let world_address = world.dispatcher.contract_address;
+
+    let bob: ContractAddress = 0xb0b.try_into().unwrap();
+    let value = MixedDynamic { player: bob, fixed_value: 10, note: "hello" };
+    world.write_model_test(@value);
+
+    let proxy_address = declare_and_deploy("mock_sharding_proxy");
+
+    let layout = Model::<MixedDynamic>::layout();
+    let models = [(model_selector, layout).shard([bob.into()].span())].span();
+    world.dispatcher.request_sharding(proxy_address, models);
+
+    let fixed_selector = mixed_dynamic_fixed_selector();
+    let entity_id = entity_id_from_keys(@bob);
+    let slot = compute_dojo_field_slot(model_selector, entity_id, fixed_selector);
+
+    let sharding = IContractComponentDispatcher { contract_address: world_address };
+    snforge_std::start_cheat_caller_address(world_address, proxy_address);
+    sharding.update_shard_state(array![(slot, 77)]);
+    snforge_std::stop_cheat_caller_address(world_address);
+
+    let result: MixedDynamic = world.read_model(bob);
+    assert(result.fixed_value == 77, 'fixed field should be updated');
+}
+
+/// Test: nested fixed layouts are expanded into concrete slots.
+#[test]
+fn test_request_sharding_nested_fixed_layout() {
+    let (mut world, model_selector) = deploy_world_with_nested_fixed();
+    let world_address = world.dispatcher.contract_address;
+
+    let bob: ContractAddress = 0xb0b.try_into().unwrap();
+    let value = NestedFixed {
+        player: bob, stats: NestedStats { hp: 10, mana: 20 }, gold: 5,
+    };
+    world.write_model_test(@value);
+
+    let proxy_address = declare_and_deploy("mock_sharding_proxy");
+
+    let layout = Model::<NestedFixed>::layout();
+    let models = [(model_selector, layout).shard([bob.into()].span())].span();
+    world.dispatcher.request_sharding(proxy_address, models);
+
+    let (stats_selector, hp_selector, gold_selector) = nested_fixed_selectors();
+    let entity_id = entity_id_from_keys(@bob);
+    let stats_key = combine_key(entity_id, stats_selector);
+    let hp_key = combine_key(stats_key, hp_selector);
+    let hp_slot = compute_dojo_packed_slot(model_selector, hp_key);
+    let gold_slot = compute_dojo_field_slot(model_selector, entity_id, gold_selector);
+
+    let sharding = IContractComponentDispatcher { contract_address: world_address };
+    snforge_std::start_cheat_caller_address(world_address, proxy_address);
+    sharding.update_shard_state(array![(hp_slot, 99), (gold_slot, 777)]);
+    snforge_std::stop_cheat_caller_address(world_address);
+
+    let result: NestedFixed = world.read_model(bob);
+    assert(result.stats.hp == 99, 'nested hp should be updated');
+    assert(result.stats.mana == 20, 'nested mana should be unchanged');
+    assert(result.gold == 777, 'gold should be updated');
+}
+
+/// Test: tuple/fixed-array/enum deterministic branches are expanded into concrete slots.
+#[test]
+fn test_request_sharding_tuple_fixedarray_enum_layout() {
+    let (mut world, model_selector) = deploy_world_with_tuple_array_option();
+    let world_address = world.dispatcher.contract_address;
+
+    let bob: ContractAddress = 0xb0b.try_into().unwrap();
+    let value = TupleArrayOption {
+        player: bob,
+        pair: (10_u32, 20_u64),
+        samples: [1_u16, 2_u16, 3_u16],
+        status: Option::Some(9_u32),
+    };
+    world.write_model_test(@value);
+
+    let proxy_address = declare_and_deploy("mock_sharding_proxy");
+
+    let layout = Model::<TupleArrayOption>::layout();
+    let models = [(model_selector, layout).shard([bob.into()].span())].span();
+    world.dispatcher.request_sharding(proxy_address, models);
+
+    let (pair_selector, samples_selector, status_selector) = tuple_array_option_selectors();
+    let entity_id = entity_id_from_keys(@bob);
+
+    let pair_key = combine_key(entity_id, pair_selector);
+    let pair_item0_key = combine_key(pair_key, 0);
+    let pair_item0_slot = compute_dojo_packed_slot(model_selector, pair_item0_key);
+
+    let samples_key = combine_key(entity_id, samples_selector);
+    let samples_item1_key = combine_key(samples_key, 1);
+    let samples_item1_slot = compute_dojo_packed_slot(model_selector, samples_item1_key);
+
+    let status_key = combine_key(entity_id, status_selector);
+    let status_discriminator_slot = compute_dojo_packed_slot(model_selector, status_key);
+    let status_discriminator_address: starknet::storage_access::StorageAddress =
+        status_discriminator_slot.try_into().unwrap();
+    let current_discriminator = starknet::syscalls::storage_read_syscall(
+        0, status_discriminator_address,
+    )
+        .unwrap();
+
+    let sharding = IContractComponentDispatcher { contract_address: world_address };
+    snforge_std::start_cheat_caller_address(world_address, proxy_address);
+    sharding.update_shard_state(
+        array![
+            (pair_item0_slot, 55),
+            (samples_item1_slot, 66),
+            (status_discriminator_slot, current_discriminator),
+        ],
+    );
+    snforge_std::stop_cheat_caller_address(world_address);
+
+    let result: TupleArrayOption = world.read_model(bob);
+    assert(result.pair == (55_u32, 20_u64), 'tuple item update failed');
+    assert(result.samples == [1_u16, 66_u16, 3_u16], 'fixed array item update failed');
+    let status_discriminator_after = starknet::syscalls::storage_read_syscall(
+        0, status_discriminator_address,
+    )
+        .unwrap();
+    assert(status_discriminator_after == current_discriminator, 'enum discr mismatch');
+}
+
+/// Test: strict translator rejects mixed layouts that include dynamic fields.
+#[test]
+#[should_panic]
+fn test_request_sharding_strict_rejects_mixed_dynamic() {
+    let (world, model_selector) = deploy_world_with_mixed_dynamic();
+    let bob: ContractAddress = 0xb0b.try_into().unwrap();
+
+    let proxy_address = declare_and_deploy("mock_sharding_proxy");
+    let layout = Model::<MixedDynamic>::layout();
+    let models = [(model_selector, layout).shard_strict([bob.into()].span())].span();
+    world.dispatcher.request_sharding(proxy_address, models);
 }
 
 /// Test: end_shard forwards to the proxy.

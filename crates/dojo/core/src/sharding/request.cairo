@@ -48,15 +48,82 @@ pub struct ShardModel {
     pub fields: Span<ShardField>,
 }
 
-fn expand_layout(layout: Layout, crdt: CRDVariant) -> Span<ShardField> {
+#[derive(Copy, Drop)]
+enum ShardSelectionPolicy {
+    AutoSubset,
+    StrictAll,
+}
+
+/// Layout is deterministic when all of its storage slots can be derived
+/// without reading runtime lengths (no `Array` / `ByteArray` branches).
+fn is_deterministic_layout(layout: Layout) -> bool {
     match layout {
+        Layout::Fixed(_) => true,
         Layout::Struct(fields) => {
-            let mut result: Array<ShardField> = ArrayTrait::new();
             for field in fields {
-                result.append(ShardField { selector: (*field).selector, crdt });
+                if !is_deterministic_layout(*field.layout) {
+                    return false;
+                }
             };
-            result.span()
+            true
         },
+        Layout::Tuple(items) => {
+            for item in items {
+                if !is_deterministic_layout(*item) {
+                    return false;
+                }
+            };
+            true
+        },
+        Layout::FixedArray(fixed_array_layout) => {
+            let (item_layouts, _): (Span<Layout>, u32) = fixed_array_layout;
+            if item_layouts.len() == 0 {
+                return false;
+            }
+            is_deterministic_layout(*item_layouts[0])
+        },
+        Layout::Enum(variants) => {
+            for variant in variants {
+                if !is_deterministic_layout(*variant.layout) {
+                    return false;
+                }
+            };
+            true
+        },
+        Layout::Array(_) => false,
+        Layout::ByteArray => false,
+    }
+}
+
+/// Translate `Layout::Struct` into top-level `ShardField`s.
+///
+/// We keep member selectors top-level for protocol compatibility
+/// (`StoreUpdateMember` emission), while world-side request handling expands
+/// each selected member recursively into concrete deterministic slots.
+fn translate_struct_fields(
+    fields: Span<dojo::meta::FieldLayout>, crdt: CRDVariant, policy: ShardSelectionPolicy,
+) -> Span<ShardField> {
+    let mut result: Array<ShardField> = ArrayTrait::new();
+    for field in fields {
+        if is_deterministic_layout(*field.layout) {
+            result.append(ShardField { selector: (*field).selector, crdt });
+        } else {
+            // Auto policy intentionally skips dynamic members.
+            // Strict policy fails fast on the first unsupported member.
+            if let ShardSelectionPolicy::StrictAll = policy {
+                panic!("ShardModel: unsupported field layout");
+            }
+        }
+    };
+    assert(result.len() != 0, 'ShardModel: no shardable fields');
+    result.span()
+}
+
+fn translate_layout(
+    layout: Layout, crdt: CRDVariant, policy: ShardSelectionPolicy,
+) -> Span<ShardField> {
+    match layout {
+        Layout::Struct(fields) => translate_struct_fields(fields, crdt, policy),
         Layout::Fixed(sizes) => {
             let mut sizes = sizes;
             let num_slots = dojo::storage::packing::calculate_packed_size(ref sizes);
@@ -80,26 +147,66 @@ pub trait IntoShardModel {
     fn shard_add(self: (felt252, Layout), keys: Span<felt252>) -> ShardModel;
     fn shard_lock(self: (felt252, Layout), keys: Span<felt252>) -> ShardModel;
     fn shard_set_lock(self: (felt252, Layout), keys: Span<felt252>) -> ShardModel;
+    fn shard_strict(self: (felt252, Layout), keys: Span<felt252>) -> ShardModel;
+    fn shard_add_strict(self: (felt252, Layout), keys: Span<felt252>) -> ShardModel;
+    fn shard_lock_strict(self: (felt252, Layout), keys: Span<felt252>) -> ShardModel;
+    fn shard_set_lock_strict(self: (felt252, Layout), keys: Span<felt252>) -> ShardModel;
 }
 
 impl SelectorLayoutIntoShardModel of IntoShardModel {
     fn shard(self: (felt252, Layout), keys: Span<felt252>) -> ShardModel {
         let (selector, layout) = self;
-        ShardModel { selector, keys, fields: expand_layout(layout, CRDVariant::Set) }
+        ShardModel {
+            selector, keys, fields: translate_layout(layout, CRDVariant::Set, ShardSelectionPolicy::AutoSubset),
+        }
     }
 
     fn shard_add(self: (felt252, Layout), keys: Span<felt252>) -> ShardModel {
         let (selector, layout) = self;
-        ShardModel { selector, keys, fields: expand_layout(layout, CRDVariant::Add) }
+        ShardModel {
+            selector, keys, fields: translate_layout(layout, CRDVariant::Add, ShardSelectionPolicy::AutoSubset),
+        }
     }
 
     fn shard_lock(self: (felt252, Layout), keys: Span<felt252>) -> ShardModel {
         let (selector, layout) = self;
-        ShardModel { selector, keys, fields: expand_layout(layout, CRDVariant::Lock) }
+        ShardModel {
+            selector, keys, fields: translate_layout(layout, CRDVariant::Lock, ShardSelectionPolicy::AutoSubset),
+        }
     }
 
     fn shard_set_lock(self: (felt252, Layout), keys: Span<felt252>) -> ShardModel {
         let (selector, layout) = self;
-        ShardModel { selector, keys, fields: expand_layout(layout, CRDVariant::SetLock) }
+        ShardModel {
+            selector, keys: keys, fields: translate_layout(layout, CRDVariant::SetLock, ShardSelectionPolicy::AutoSubset),
+        }
+    }
+
+    fn shard_strict(self: (felt252, Layout), keys: Span<felt252>) -> ShardModel {
+        let (selector, layout) = self;
+        ShardModel {
+            selector, keys, fields: translate_layout(layout, CRDVariant::Set, ShardSelectionPolicy::StrictAll),
+        }
+    }
+
+    fn shard_add_strict(self: (felt252, Layout), keys: Span<felt252>) -> ShardModel {
+        let (selector, layout) = self;
+        ShardModel {
+            selector, keys, fields: translate_layout(layout, CRDVariant::Add, ShardSelectionPolicy::StrictAll),
+        }
+    }
+
+    fn shard_lock_strict(self: (felt252, Layout), keys: Span<felt252>) -> ShardModel {
+        let (selector, layout) = self;
+        ShardModel {
+            selector, keys, fields: translate_layout(layout, CRDVariant::Lock, ShardSelectionPolicy::StrictAll),
+        }
+    }
+
+    fn shard_set_lock_strict(self: (felt252, Layout), keys: Span<felt252>) -> ShardModel {
+        let (selector, layout) = self;
+        ShardModel {
+            selector, keys, fields: translate_layout(layout, CRDVariant::SetLock, ShardSelectionPolicy::StrictAll),
+        }
     }
 }

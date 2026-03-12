@@ -38,6 +38,8 @@ pub mod sharding_component {
         slot_model_selector: Map<felt252, felt252>,
         slot_entity_id: Map<felt252, felt252>,
         slot_member_selector: Map<felt252, felt252>,
+        /// Number of currently active metadata slots for each entity.
+        entity_active_slot_count: Map<felt252, u32>,
         /// Entity keys for StoreSetRecord emission (Torii needs keys for new entities).
         entity_keys_len: Map<felt252, u32>,
         entity_keys_data: Map<felt252, felt252>,
@@ -55,6 +57,7 @@ pub mod sharding_component {
         pub const ARITHMETIC_OVERFLOW: felt252 = 'Component: Arithmetic overflow';
         pub const SHARDING_PROXY_MISMATCH: felt252 = 'Component: Proxy mismatch';
         pub const DUPLICATE_SLOT: felt252 = 'Component: Duplicate slot';
+        pub const SLOT_METADATA_MISMATCH: felt252 = 'Component: Bad metadata';
     }
 
     #[embeddable_as(ContractComponentImpl)]
@@ -181,6 +184,18 @@ pub mod sharding_component {
             entity_id: felt252,
             member_selector: felt252,
         ) {
+            let prev_model = self.slot_model_selector.read(slot);
+            if prev_model == 0 {
+                let current_count = self.entity_active_slot_count.read(entity_id);
+                self.entity_active_slot_count.write(entity_id, current_count + 1);
+            } else {
+                assert(prev_model == model_selector, Errors::SLOT_METADATA_MISMATCH);
+                assert(self.slot_entity_id.read(slot) == entity_id, Errors::SLOT_METADATA_MISMATCH);
+                assert(
+                    self.slot_member_selector.read(slot) == member_selector,
+                    Errors::SLOT_METADATA_MISMATCH,
+                );
+            }
             self.slot_model_selector.write(slot, model_selector);
             self.slot_entity_id.write(slot, entity_id);
             self.slot_member_selector.write(slot, member_selector);
@@ -206,7 +221,30 @@ pub mod sharding_component {
             init_count != 0 && crd_type.is_exclusive()
         }
 
+        fn is_slot_active(
+            self: @ComponentState<TContractState>, slot: felt252,
+        ) -> bool {
+            let (_, init_count) = self.slots.read(slot);
+            init_count != 0
+        }
+
+        fn has_entity_active_slots(
+            self: @ComponentState<TContractState>, entity_id: felt252,
+        ) -> bool {
+            self.entity_active_slot_count.read(entity_id) != 0
+        }
+
         fn clear_slot_metadata(ref self: ComponentState<TContractState>, slot: felt252) {
+            let model_selector = self.slot_model_selector.read(slot);
+            if model_selector == 0 {
+                return;
+            }
+
+            let entity_id = self.slot_entity_id.read(slot);
+            let active_count = self.entity_active_slot_count.read(entity_id);
+            assert(active_count != 0, Errors::SLOT_METADATA_MISMATCH);
+            self.entity_active_slot_count.write(entity_id, active_count - 1);
+
             self.slot_model_selector.write(slot, 0);
             self.slot_entity_id.write(slot, 0);
             self.slot_member_selector.write(slot, 0);
