@@ -113,23 +113,44 @@ fn translate_struct_fields(
     fields: Span<dojo::meta::FieldLayout>, crdt: CRDVariant, selection: ShardFieldSelection,
 ) -> Span<ShardField> {
     let mut result: Array<ShardField> = ArrayTrait::new();
+    let include_dynamic = should_include_dynamic(selection);
+    let strict_all = is_strict_all(selection);
+
     for field in fields {
-        let include_dynamic = match selection {
-            ShardFieldSelection::AutoIncludeDynamic => true,
-            _ => false,
-        };
-        if is_deterministic_layout(*field.layout) || include_dynamic {
+        if is_deterministic_layout(*field.layout) {
             result.append(ShardField { selector: (*field).selector, crdt });
-        } else {
-            // Deterministic-only policy intentionally skips dynamic members.
-            // Strict policy fails fast on the first unsupported member.
-            if let ShardFieldSelection::StrictAll = selection {
-                panic!("ShardModel: unsupported field layout");
-            }
+            continue;
+        }
+
+        if include_dynamic {
+            result.append(ShardField { selector: (*field).selector, crdt });
+            continue;
+        }
+
+        // Deterministic-only policy intentionally skips dynamic members.
+        // Strict policy fails fast on the first unsupported member.
+        if strict_all {
+            panic!("ShardModel: unsupported field layout");
         }
     };
     assert(result.len() != 0, 'ShardModel: no shardable fields');
     result.span()
+}
+
+#[inline(always)]
+fn should_include_dynamic(selection: ShardFieldSelection) -> bool {
+    match selection {
+        ShardFieldSelection::AutoIncludeDynamic => true,
+        _ => false,
+    }
+}
+
+#[inline(always)]
+fn is_strict_all(selection: ShardFieldSelection) -> bool {
+    match selection {
+        ShardFieldSelection::StrictAll => true,
+        _ => false,
+    }
 }
 
 fn translate_layout(
