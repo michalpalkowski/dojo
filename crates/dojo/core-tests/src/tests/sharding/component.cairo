@@ -23,7 +23,7 @@ fn foo_field_selectors() -> (felt252, felt252) {
 }
 
 #[test]
-#[should_panic(expected: ('Component: Bad metadata',))]
+#[should_panic(expected: ('Component: Type change active',))]
 fn test_component_setlock_after_add_fails() {
     let (mut world, model_selector) = deploy_world_and_foo();
     let bob: ContractAddress = 0xb0b.try_into().unwrap();
@@ -155,7 +155,7 @@ fn test_component_update_requires_proxy_caller() {
     let slot_a = compute_dojo_field_slot(model_selector, entity_id, sel_a);
 
     let sharding_proxy = IShardingProxyDispatcher { contract_address: world_address };
-    sharding_proxy.settle_shard_changes(array![(slot_a, 999)], [].span(), [].span());
+    sharding_proxy.settle_shard_changes(1, array![(slot_a, 999)], [].span(), [].span(), [].span());
 }
 
 #[test]
@@ -175,7 +175,7 @@ fn test_component_cancel_requires_proxy_caller() {
     let slot_a = compute_dojo_field_slot(model_selector, entity_id, sel_a);
 
     let sharding_proxy = IShardingProxyDispatcher { contract_address: world_address };
-    sharding_proxy.cancel_shard_state(array![slot_a].span());
+    sharding_proxy.cancel_shard_state(1, array![slot_a].span());
 }
 
 #[test]
@@ -196,7 +196,7 @@ fn test_component_rejects_duplicate_slots_in_settlement() {
 
     let sharding_proxy = IShardingProxyDispatcher { contract_address: world_address };
     snforge_std::start_cheat_caller_address(world_address, proxy_address);
-    sharding_proxy.settle_shard_changes(array![(slot_a, 111), (slot_a, 222)], [].span(), [].span());
+    sharding_proxy.settle_shard_changes(1, array![(slot_a, 111), (slot_a, 222)], [].span(), [].span(), [].span());
 }
 
 #[test]
@@ -223,7 +223,7 @@ fn test_component_lock_settlement_does_not_write() {
 
     let sharding_proxy = IShardingProxyDispatcher { contract_address: world_address };
     snforge_std::start_cheat_caller_address(world_address, proxy_address);
-    sharding_proxy.settle_shard_changes(array![(slot_a, 999), (slot_b, 777)], [].span(), [].span());
+    sharding_proxy.settle_shard_changes(1, array![(slot_a, 999), (slot_b, 777)], [].span(), [].span(), [].span());
     snforge_std::stop_cheat_caller_address(world_address);
 
     let result: Foo = world.read_model(bob);
@@ -255,7 +255,7 @@ fn test_component_add_underflow_rejected() {
 
     let sharding_proxy = IShardingProxyDispatcher { contract_address: world_address };
     snforge_std::start_cheat_caller_address(world_address, proxy_address);
-    sharding_proxy.settle_shard_changes(array![(slot_a, 90)], [].span(), [].span());
+    sharding_proxy.settle_shard_changes(1, array![(slot_a, 90)], [].span(), [].span(), [].span());
 }
 
 #[test]
@@ -286,19 +286,30 @@ fn test_component_add_overflow_rejected() {
     let sharding_proxy = IShardingProxyDispatcher { contract_address: world_address };
     snforge_std::start_cheat_caller_address(world_address, proxy_address);
     // Delta = 1 - 0 = 1, current + delta = FIELD_PRIME -> cannot fit into felt252.
-    sharding_proxy.settle_shard_changes(array![(slot_a, 1)], [].span(), [].span());
+    sharding_proxy.settle_shard_changes(1, array![(slot_a, 1)], [].span(), [].span(), [].span());
 }
 
 #[starknet::contract]
 pub mod mock_sharding_proxy {
     use dojo::sharding::crdt::CRDType;
+    use starknet::storage::{Map, StorageMapReadAccess, StorageMapWriteAccess};
+    use starknet::{ContractAddress, get_caller_address};
 
     #[storage]
-    struct Storage {}
+    struct Storage {
+        shard_id: Map<ContractAddress, felt252>,
+    }
 
     #[abi(embed_v0)]
     impl IShardingImpl of dojo::sharding::interface::ISharding<ContractState> {
-        fn initialize_sharding(ref self: ContractState, storage_slots: Span<CRDType>) {}
+        fn initialize_sharding(ref self: ContractState, storage_slots: Span<CRDType>) {
+            let caller = get_caller_address();
+            let current = self.shard_id.read(caller);
+            self.shard_id.write(caller, current + 1);
+        }
+        fn get_shard_id(self: @ContractState, contract_address: ContractAddress) -> felt252 {
+            self.shard_id.read(contract_address)
+        }
         fn end_shard(ref self: ContractState) {}
     }
 }

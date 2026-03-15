@@ -358,10 +358,10 @@ pub trait IWorld<T> {
     /// * `models` - The models to shard with their CRDT strategies.
     fn request_sharding(ref self: T, proxy: ContractAddress, models: Span<ShardModel>);
 
-    /// Ends the current shard session.
+    /// Ends the current shard session in the active shard fork context.
     ///
     /// Forwards to the sharding proxy which emits `ShardFinished`.
-    /// Caller must be the configured sharding proxy contract.
+    /// Caller must be the shard initiator for this forked shard session or the world owner.
     fn end_shard(ref self: T);
 }
 

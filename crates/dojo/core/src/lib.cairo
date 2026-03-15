@@ -101,7 +101,11 @@ pub mod utils {
 
 pub mod sharding {
     pub mod slot;
-    pub use slot::{compute_dojo_field_slot, compute_dynamic_member_lock_slot};
+    pub use slot::{
+        compute_dojo_field_slot, compute_dynamic_member_changed_hash_slot,
+        compute_dynamic_member_changed_len_slot, compute_dynamic_member_lock_slot,
+        compute_dynamic_member_changed_slots_hash,
+    };
 
     pub mod crdt;
     pub mod interface;
@@ -124,11 +128,17 @@ pub mod world {
     #[cfg(target: "test")]
     pub use iworld::{IWorldTest, IWorldTestDispatcher, IWorldTestDispatcherTrait};
 
+    pub mod world_sharding;
+    #[cfg(feature: 'sharding')]
+    pub use world_sharding::{ShardDynamicMemberChanges, ShardSlotDescriptor};
+    #[cfg(feature: 'sharding')]
+    pub use world_sharding::{
+        IShardingMetadata, IShardingMetadataDispatcher, IShardingMetadataDispatcherTrait,
+        IShardingProxy, IShardingProxyDispatcher, IShardingProxyDispatcherTrait,
+    };
+
     mod world_contract;
     pub use world_contract::world;
-    pub use world_contract::{
-        IShardingProxy, IShardingProxyDispatcher, IShardingProxyDispatcherTrait, ShardMemberWrite,
-    };
 
     pub mod storage;
     pub use storage::{WorldStorage, WorldStorageTrait};

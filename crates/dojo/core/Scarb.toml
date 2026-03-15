@@ -18,6 +18,7 @@ dojo_cairo_macros = { path = "../macros", version = "1.8.0" }
 
 [features]
 sharding = []
+default = ["sharding"]
 
 [[target.starknet-contract]]
 sierra = true
