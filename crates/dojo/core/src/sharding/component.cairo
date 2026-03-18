@@ -208,6 +208,7 @@ pub mod sharding_component {
         pub const SLOT_OWNERSHIP_MISMATCH: felt252 = 'Shard: slot ownership mismatch';
         pub const ENTITY_NOT_IN_SHARD: felt252 = 'Shard: entity not in shard';
         pub const METADATA_LEN_MISMATCH: felt252 = 'Shard: metadata len mismatch';
+        pub const ENTITY_KEYS_MALFORMED: felt252 = 'Shard: entity_keys malformed';
     }
 
     #[embeddable_as(ContractComponentImpl)]
@@ -220,6 +221,21 @@ pub mod sharding_component {
             entity_keys_flat: Span<felt252>,
         ) -> felt252 {
             assert(entities.len() != 0, Errors::NO_ENTITIES);
+
+            // Validate entity_keys_flat format: [n_keys_0, key0..., n_keys_1, key1...]
+            // Must contain exactly one length-prefixed key group per entity.
+            if entity_keys_flat.len() != 0 {
+                let mut offset: u32 = 0;
+                let mut parsed_count: u32 = 0;
+                while offset < entity_keys_flat.len() {
+                    let n_keys: u256 = (*entity_keys_flat[offset]).into();
+                    let n: u32 = n_keys.try_into().expect(Errors::ENTITY_KEYS_MALFORMED);
+                    offset += 1 + n;
+                    parsed_count += 1;
+                };
+                assert(offset == entity_keys_flat.len(), Errors::ENTITY_KEYS_MALFORMED);
+                assert(parsed_count == entities.len(), Errors::ENTITY_KEYS_MALFORMED);
+            }
 
             for entity_id in entities {
                 let entity_id = *entity_id;
