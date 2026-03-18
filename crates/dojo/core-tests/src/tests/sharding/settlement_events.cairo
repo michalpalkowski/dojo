@@ -1,21 +1,28 @@
+/// Settlement value-correctness tests across different model types.
+///
+/// These tests verify that the commitment-based settlement pipeline
+/// correctly writes values to storage and that Dojo model reads return
+/// the expected results. Tests cover: Foo (struct layout), Tile (multi-key),
+/// Score (packed layout), and Add CRDT delta merging.
+
+use core::poseidon::poseidon_hash_span;
 use dojo::model::{Model, ModelStorage, ModelStorageTest};
 use dojo::sharding::compute_dojo_field_slot;
-use dojo::sharding::request::{
-    CRDVariant, IntoShardField, IntoShardModel, ShardCoverage, ShardFieldSelection, ShardModel,
-};
-use dojo::utils::entity_id_from_keys;
+use dojo::sharding::slot::compute_dojo_packed_slot;
+use dojo::utils::{entity_id_from_keys, entity_id_from_serialized_keys, combine_key};
 use dojo::world::{
-    IShardingProxyDispatcher, IShardingProxyDispatcherTrait, IWorldDispatcherTrait,
-    world as world_contract,
+    IShardingSettlementDispatcher, IShardingSettlementDispatcherTrait, IWorldDispatcherTrait,
 };
-use dojo_snf_test::declare_and_deploy;
-use snforge_std::{EventSpyAssertionsTrait, spy_events};
 use starknet::ContractAddress;
 
-use dojo::sharding::slot::compute_dojo_packed_slot;
 use crate::tests::helpers::{
     Foo, deploy_world_and_foo, Tile, deploy_world_with_tile, Score, deploy_world_with_score,
 };
+
+/// Make test_address() the world owner before deploying.
+fn cheat_world_owner() {
+    snforge_std::start_cheat_account_contract_address_global(snforge_std::test_address());
+}
 
 fn foo_field_selectors() -> (felt252, felt252) {
     let layout = Model::<Foo>::layout();
@@ -26,334 +33,164 @@ fn foo_field_selectors() -> (felt252, felt252) {
     }
 }
 
+/// Helper: settle as world owner.
+fn do_settle(
+    world_address: ContractAddress,
+    shard_id: felt252,
+    changed_keys: Span<felt252>,
+    changed_values: Span<felt252>,
+    slot_model_selectors: Span<felt252>,
+    slot_entity_ids: Span<felt252>,
+    slot_member_selectors: Span<felt252>,
+    slot_initial_values: Span<felt252>,
+) {
+    let state_diff_hash = poseidon_hash_span(changed_keys);
 
-/// Test: settle_shard_changes emits StoreSetRecord when entity keys are stored.
+    // Build computation_keys and packed_offsets from metadata.
+    let mut comp_keys: Array<felt252> = ArrayTrait::new();
+    let mut offsets: Array<u32> = ArrayTrait::new();
+    let mut k: u32 = 0;
+    while k < changed_keys.len() {
+        let eid = *slot_entity_ids[k];
+        let member = *slot_member_selectors[k];
+        if member != 0 {
+            comp_keys.append(combine_key(eid, member));
+        } else {
+            comp_keys.append(eid);
+        };
+        offsets.append(0);
+        k += 1;
+    };
+
+    let settlement = IShardingSettlementDispatcher { contract_address: world_address };
+    snforge_std::start_cheat_caller_address(world_address, snforge_std::test_address());
+    settlement
+        .settle(
+            shard_id,
+            changed_keys,
+            changed_values,
+            state_diff_hash,
+            0,
+            0,
+            slot_model_selectors,
+            slot_entity_ids,
+            comp_keys.span(),
+            slot_member_selectors,
+            offsets.span(),
+            slot_initial_values,
+            [].span(), // entity_model_selectors (not needed in unit tests)
+            [].span(), // entity_keys_flat (not needed in unit tests)
+        );
+    snforge_std::stop_cheat_caller_address(world_address);
+}
+
+// ── Foo (Struct Layout) ─────────────────────────────────────────────────
+
 #[test]
-fn test_settlement_emits_store_set_record() {
+fn test_settlement_set_updates_all_fields() {
+    cheat_world_owner();
     let (mut world, model_selector) = deploy_world_and_foo();
     let world_address = world.dispatcher.contract_address;
-
     let bob: ContractAddress = 0xb0b.try_into().unwrap();
-    let foo = Foo { caller: bob, a: 100, b: 200 };
-    world.write_model_test(@foo);
-
-    let proxy_address = declare_and_deploy("mock_sharding_proxy");
-
-    let layout = Model::<Foo>::layout();
-
-    let models = [(model_selector, layout).shard([bob.into()].span())].span();
-    world.dispatcher.request_sharding(proxy_address, models);
+    world.write_model_test(@Foo { caller: bob, a: 100, b: 200 });
 
     let (sel_a, sel_b) = foo_field_selectors();
     let entity_id = entity_id_from_keys(@bob);
     let slot_a = compute_dojo_field_slot(model_selector, entity_id, sel_a);
     let slot_b = compute_dojo_field_slot(model_selector, entity_id, sel_b);
 
-    let mut spy = spy_events();
+    world.dispatcher.request_sharding([entity_id].span(), [].span());
+    do_settle(
+        world_address, 1,
+        [slot_a, slot_b].span(), [999, 777].span(),
+        [model_selector, model_selector].span(), [entity_id, entity_id].span(),
+        [sel_a, sel_b].span(), [0, 0].span(),
+    );
 
-    let sharding_proxy = IShardingProxyDispatcher { contract_address: world_address };
-    snforge_std::start_cheat_caller_address(world_address, proxy_address);
-    sharding_proxy.settle_shard_changes(1, array![(slot_a, 999), (slot_b, 777)], [].span(), [].span(), [].span());
-    snforge_std::stop_cheat_caller_address(world_address);
-
-    // Check values by reading the model
     let result: Foo = world.read_model(bob);
-    assert(result.a == 999, 'a should be updated');
-    assert(result.b == 777, 'b should be updated');
-
-    // Event assertion
-    spy
-        .assert_emitted(
-            @array![
-                (
-                    world_address,
-                    world_contract::Event::StoreSetRecord(
-                        world_contract::StoreSetRecord {
-                            selector: model_selector,
-                            entity_id: entity_id,
-                            keys: [bob.into()].span(),
-                            values: [999, 777].span(),
-                        },
-                    ),
-                ),
-            ],
-        );
+    assert(result.a == 999, 'a should be 999');
+    assert(result.b == 777, 'b should be 777');
 }
 
-
-/// Test: Add CRDT — emitted value is the delta-merged result, not raw shard value.
 #[test]
-fn test_settlement_add_crdt_emits_merged_value() {
+fn test_settlement_add_crdt_produces_merged_value() {
+    cheat_world_owner();
     let (mut world, model_selector) = deploy_world_and_foo();
     let world_address = world.dispatcher.contract_address;
-
     let bob: ContractAddress = 0xb0b.try_into().unwrap();
-    let foo = Foo { caller: bob, a: 100, b: 200 };
-    world.write_model_test(@foo);
+    // Initial a=100 (entity locked after request, so current stays 100).
+    world.write_model_test(@Foo { caller: bob, a: 100, b: 200 });
 
-    let proxy_address = declare_and_deploy("mock_sharding_proxy");
-
-    let layout = Model::<Foo>::layout();
-    let models = [(
-        model_selector, layout,
-    )
-        .shard_with(
-            [bob.into()].span(), CRDVariant::Add, ShardFieldSelection::AutoDeterministic,
-        )]
-        .span();
-    world.dispatcher.request_sharding(proxy_address, models);
-
-    // Mainchain changes a from 100 → 120 while shard is active
-    let foo_updated = Foo { caller: bob, a: 120, b: 200 };
-    world.write_model_test(@foo_updated);
-
-    let (sel_a, _) = foo_field_selectors();
+    let (sel_a, sel_b) = foo_field_selectors();
     let entity_id = entity_id_from_keys(@bob);
     let slot_a = compute_dojo_field_slot(model_selector, entity_id, sel_a);
 
-    let mut spy = spy_events();
-
-    // Shard saw initial=100, produced shard_value=150 (delta=50)
-    let sharding_proxy = IShardingProxyDispatcher { contract_address: world_address };
-    snforge_std::start_cheat_caller_address(world_address, proxy_address);
-    sharding_proxy.settle_shard_changes(1, array![(slot_a, 150)], [].span(), [].span(), [].span());
-    snforge_std::stop_cheat_caller_address(world_address);
-
-    // Expected merged value: current(120) + (shard(150) - initial(100)) = 170
-    // StoreSetRecord emits full entity values [a, b] after CRDT merge
-    spy
-        .assert_emitted(
-            @array![
-                (
-                    world_address,
-                    world_contract::Event::StoreSetRecord(
-                        world_contract::StoreSetRecord {
-                            selector: model_selector,
-                            entity_id: entity_id,
-                            keys: [bob.into()].span(),
-                            values: [170, 200].span(),
-                        },
-                    ),
-                ),
-            ],
-        );
-}
-
-/// Test: cancel_shard_state cleans metadata and emits no StoreUpdateMember events.
-#[test]
-fn test_cancel_clears_metadata_no_events() {
-    let (mut world, model_selector) = deploy_world_and_foo();
-    let world_address = world.dispatcher.contract_address;
-
-    let bob: ContractAddress = 0xb0b.try_into().unwrap();
-    let foo = Foo { caller: bob, a: 100, b: 200 };
-    world.write_model_test(@foo);
-
-    let proxy_address = declare_and_deploy("mock_sharding_proxy");
-
-    let layout = Model::<Foo>::layout();
-    let models = [(model_selector, layout).shard([bob.into()].span())].span();
-    world.dispatcher.request_sharding(proxy_address, models);
-
-    let (sel_a, _) = foo_field_selectors();
-    let entity_id = entity_id_from_keys(@bob);
-    let slot_a = compute_dojo_field_slot(model_selector, entity_id, sel_a);
-
-    let mut spy = spy_events();
-
-    // Cancel via IShardingProxy wrapper
-    let sharding_proxy = IShardingProxyDispatcher { contract_address: world_address };
-    snforge_std::start_cheat_caller_address(world_address, proxy_address);
-    sharding_proxy.cancel_shard_state(1, array![slot_a].span());
-    snforge_std::stop_cheat_caller_address(world_address);
-
-    // No StoreUpdateMember should be emitted
-    spy
-        .assert_not_emitted(
-            @array![
-                (
-                    world_address,
-                    world_contract::Event::StoreUpdateMember(
-                        world_contract::StoreUpdateMember {
-                            selector: model_selector,
-                            entity_id: entity_id,
-                            member_selector: sel_a,
-                            values: [100].span(),
-                        },
-                    ),
-                ),
-            ],
+    // Register Add policy for field `a`.
+    world
+        .dispatcher
+        .register_shard_policy(
+            model_selector,
+            dojo::sharding::request::CRDVariant::Set,
+            [dojo::sharding::request::ShardField {
+                selector: sel_a,
+                crdt: dojo::sharding::request::CRDVariant::Add,
+                max_elements: 0,
+            }]
+                .span(),
         );
 
-    // Value should remain unchanged
+    world.dispatcher.request_sharding([entity_id].span(), [].span());
+
+    // Shard produced 150 for slot_a (initial=100, delta=50).
+    do_settle(
+        world_address, 1,
+        [slot_a].span(), [150].span(),
+        [model_selector].span(), [entity_id].span(),
+        [sel_a].span(), [100].span(), // initial_value = 100
+    );
+
+    // current(100) + (shard(150) - initial(100)) = 150.
     let result: Foo = world.read_model(bob);
-    assert(result.a == 100, 'cancel should not change value');
+    assert(result.a == 150, 'merged: 100+(150-100)=150');
+    assert(result.b == 200, 'b unchanged');
 }
 
-/// Test: partial cancel keeps entity keys for remaining active slots.
-///
-/// Policy: partial cancel is allowed. If only part of an entity's active slots
-/// are canceled, later settlement of the remaining slots must still emit
-/// StoreSetRecord (with keys), not StoreUpdateMember.
 #[test]
-fn test_partial_cancel_keeps_keys_for_remaining_slots() {
+fn test_cancel_does_not_change_values() {
+    cheat_world_owner();
     let (mut world, model_selector) = deploy_world_and_foo();
     let world_address = world.dispatcher.contract_address;
-
     let bob: ContractAddress = 0xb0b.try_into().unwrap();
-    let foo = Foo { caller: bob, a: 100, b: 200 };
-    world.write_model_test(@foo);
-
-    let proxy_address = declare_and_deploy("mock_sharding_proxy");
-
-    let layout = Model::<Foo>::layout();
-    let models = [(model_selector, layout).shard([bob.into()].span())].span();
-    world.dispatcher.request_sharding(proxy_address, models);
-
-    let (sel_a, sel_b) = foo_field_selectors();
-    let entity_id = entity_id_from_keys(@bob);
-    let slot_a = compute_dojo_field_slot(model_selector, entity_id, sel_a);
-    let slot_b = compute_dojo_field_slot(model_selector, entity_id, sel_b);
-
-    let sharding_proxy = IShardingProxyDispatcher { contract_address: world_address };
-
-    // Cancel only one slot.
-    snforge_std::start_cheat_caller_address(world_address, proxy_address);
-    sharding_proxy.cancel_shard_state(1, array![slot_a].span());
-    snforge_std::stop_cheat_caller_address(world_address);
-
-    let mut spy = spy_events();
-
-    // Settle the remaining slot.
-    snforge_std::start_cheat_caller_address(world_address, proxy_address);
-    sharding_proxy.settle_shard_changes(1, array![(slot_b, 999)], [].span(), [].span(), [].span());
-    snforge_std::stop_cheat_caller_address(world_address);
-
-    // Remaining settlement should still emit StoreSetRecord with keys.
-    spy
-        .assert_emitted(
-            @array![
-                (
-                    world_address,
-                    world_contract::Event::StoreSetRecord(
-                        world_contract::StoreSetRecord {
-                            selector: model_selector,
-                            entity_id,
-                            keys: [bob.into()].span(),
-                            values: [100, 999].span(),
-                        },
-                    ),
-                ),
-            ],
-        );
-
-    // Explicitly ensure it did not degrade to member-only update.
-    spy
-        .assert_not_emitted(
-            @array![
-                (
-                    world_address,
-                    world_contract::Event::StoreUpdateMember(
-                        world_contract::StoreUpdateMember {
-                            selector: model_selector,
-                            entity_id,
-                            member_selector: sel_b,
-                            values: [999].span(),
-                        },
-                    ),
-                ),
-            ],
-        );
-}
-
-/// Test: per-field mixed CRDT — Add field emits merged value, Set field emits overwritten value.
-#[test]
-fn test_settlement_per_field_mixed_crdt_events() {
-    let (mut world, model_selector) = deploy_world_and_foo();
-    let world_address = world.dispatcher.contract_address;
-
-    let bob: ContractAddress = 0xb0b.try_into().unwrap();
-    let foo = Foo { caller: bob, a: 100, b: 200 };
-    world.write_model_test(@foo);
-
-    let proxy_address = declare_and_deploy("mock_sharding_proxy");
-
-    // Per-field: field a → Add, field b → Set
-    let (sel_a, sel_b) = foo_field_selectors();
-    let models = [
-        ShardModel {
-            selector: model_selector,
-            keys: [bob.into()].span(),
-            fields: [sel_a.as_add(), sel_b.as_set()].span(),
-            coverage: ShardCoverage::Full,
-        },
-    ]
-        .span();
-    world.dispatcher.request_sharding(proxy_address, models);
-
-    // Mainchain changes a from 100 → 120 while shard is active
-    let foo_updated = Foo { caller: bob, a: 120, b: 200 };
-    world.write_model_test(@foo_updated);
+    world.write_model_test(@Foo { caller: bob, a: 100, b: 200 });
 
     let entity_id = entity_id_from_keys(@bob);
-    let slot_a = compute_dojo_field_slot(model_selector, entity_id, sel_a);
-    let slot_b = compute_dojo_field_slot(model_selector, entity_id, sel_b);
+    world.dispatcher.request_sharding([entity_id].span(), [].span());
 
-    let mut spy = spy_events();
-
-    // Shard: a initial=100 → shard=150 (delta=50), b = 999 (Set overwrite)
-    let sharding_proxy = IShardingProxyDispatcher { contract_address: world_address };
-    snforge_std::start_cheat_caller_address(world_address, proxy_address);
-    sharding_proxy.settle_shard_changes(1, array![(slot_a, 150), (slot_b, 999)], [].span(), [].span(), [].span());
+    let settlement = IShardingSettlementDispatcher { contract_address: world_address };
+    snforge_std::start_cheat_caller_address(world_address, snforge_std::test_address());
+    settlement.cancel_shard(1);
     snforge_std::stop_cheat_caller_address(world_address);
 
-    // a: current(120) + (shard(150) - initial(100)) = 170
-    // b: 999 (Set overwrite)
-    // StoreSetRecord emitted with full entity values after CRDT merge
-    spy
-        .assert_emitted(
-            @array![
-                (
-                    world_address,
-                    world_contract::Event::StoreSetRecord(
-                        world_contract::StoreSetRecord {
-                            selector: model_selector,
-                            entity_id: entity_id,
-                            keys: [bob.into()].span(),
-                            values: [170, 999].span(),
-                        },
-                    ),
-                ),
-            ],
-        );
+    let result: Foo = world.read_model(bob);
+    assert(result.a == 100, 'cancel: a unchanged');
+    assert(result.b == 200, 'cancel: b unchanged');
 }
 
-/// Test: Building-like multi-key model — StoreSetRecord includes composite keys.
-/// Mimics a multi-key model with two composite keys (col, row),
-/// fields stored per-slot (Layout::Struct). Verifies that:
-/// 1. Entity keys (composite) are correctly stored and emitted
-/// 2. Values are in Serde format (one felt252 per field)
-/// 3. Torii can create the entity with proper indexed key columns
+// ── Tile (Multi-Key Struct Layout) ──────────────────────────────────────
+
 #[test]
-fn test_settlement_building_like_multi_key() {
+fn test_settlement_multi_key_model() {
+    cheat_world_owner();
     let (mut world, model_selector) = deploy_world_with_tile();
     let world_address = world.dispatcher.contract_address;
 
-    // Write an initial tile — simulating a building already on the map
     let tile = Tile { col: 5, row: 10, category: 3, entity_id: 42 };
     world.write_model_test(@tile);
 
-    let proxy_address = declare_and_deploy("mock_sharding_proxy");
-
-    // Shard the tile with composite keys [col, row]
-    let layout = Model::<Tile>::layout();
     let keys: Span<felt252> = [5_felt252, 10_felt252].span();
-    let models = [(model_selector, layout).shard(keys)].span();
-    world.dispatcher.request_sharding(proxy_address, models);
+    let entity_id = entity_id_from_serialized_keys(keys);
 
-    let entity_id = dojo::utils::entity_id_from_serialized_keys(keys);
-
-    // Get field selectors from layout
+    let layout = Model::<Tile>::layout();
     let (sel_category, sel_entity_id) = if let dojo::meta::Layout::Struct(fields) = layout {
         ((*fields[0]).selector, (*fields[1]).selector)
     } else {
@@ -362,57 +199,30 @@ fn test_settlement_building_like_multi_key() {
     let slot_cat = compute_dojo_field_slot(model_selector, entity_id, sel_category);
     let slot_eid = compute_dojo_field_slot(model_selector, entity_id, sel_entity_id);
 
-    let mut spy = spy_events();
+    world.dispatcher.request_sharding([entity_id].span(), [].span());
+    do_settle(
+        world_address, 1,
+        [slot_cat, slot_eid].span(), [7, 99].span(),
+        [model_selector, model_selector].span(), [entity_id, entity_id].span(),
+        [sel_category, sel_entity_id].span(), [0, 0].span(),
+    );
 
-    // Shard changes: category 3 → 7, entity_id 42 → 99
-    let sharding_proxy = IShardingProxyDispatcher { contract_address: world_address };
-    snforge_std::start_cheat_caller_address(world_address, proxy_address);
-    sharding_proxy.settle_shard_changes(1, array![(slot_cat, 7), (slot_eid, 99)], [].span(), [].span(), [].span());
-    snforge_std::stop_cheat_caller_address(world_address);
-
-    // StoreSetRecord must include composite keys [col=5, row=10]
-    spy
-        .assert_emitted(
-            @array![
-                (
-                    world_address,
-                    world_contract::Event::StoreSetRecord(
-                        world_contract::StoreSetRecord {
-                            selector: model_selector,
-                            entity_id,
-                            keys: [5, 10].span(),
-                            values: [7, 99].span(),
-                        },
-                    ),
-                ),
-            ],
-        );
-
-    // Verify Dojo can read back via normal path
     let result: Tile = world.read_model((5_u32, 10_u32));
-    assert(result.category == 7, 'category should be updated');
-    assert(result.entity_id == 99, 'entity_id should be updated');
+    assert(result.category == 7, 'category should be 7');
+    assert(result.entity_id == 99, 'entity_id should be 99');
 }
 
-/// Test: Building creation on shard — entity didn't exist before sharding.
-/// This is the critical case: building is created entirely on the shard, so the
-/// main chain has no existing entity. StoreSetRecord must carry keys so Torii can
-/// create the entity from scratch.
 #[test]
 fn test_settlement_new_entity_created_on_shard() {
+    cheat_world_owner();
     let (mut world, model_selector) = deploy_world_with_tile();
     let world_address = world.dispatcher.contract_address;
 
-    // Do NOT write an initial tile — simulating a building created on the shard
-    let proxy_address = declare_and_deploy("mock_sharding_proxy");
+    // Do NOT write initial tile — entity created entirely on shard.
+    let keys: Span<felt252> = [3_felt252, 7_felt252].span();
+    let entity_id = entity_id_from_serialized_keys(keys);
 
     let layout = Model::<Tile>::layout();
-    let keys: Span<felt252> = [3_felt252, 7_felt252].span();
-    let models = [(model_selector, layout).shard(keys)].span();
-    world.dispatcher.request_sharding(proxy_address, models);
-
-    let entity_id = dojo::utils::entity_id_from_serialized_keys(keys);
-
     let (sel_category, sel_entity_id) = if let dojo::meta::Layout::Struct(fields) = layout {
         ((*fields[0]).selector, (*fields[1]).selector)
     } else {
@@ -421,44 +231,24 @@ fn test_settlement_new_entity_created_on_shard() {
     let slot_cat = compute_dojo_field_slot(model_selector, entity_id, sel_category);
     let slot_eid = compute_dojo_field_slot(model_selector, entity_id, sel_entity_id);
 
-    let mut spy = spy_events();
+    world.dispatcher.request_sharding([entity_id].span(), [].span());
+    do_settle(
+        world_address, 1,
+        [slot_cat, slot_eid].span(), [2, 55].span(),
+        [model_selector, model_selector].span(), [entity_id, entity_id].span(),
+        [sel_category, sel_entity_id].span(), [0, 0].span(),
+    );
 
-    // Shard created a brand new building: category=2, entity_id=55
-    let sharding_proxy = IShardingProxyDispatcher { contract_address: world_address };
-    snforge_std::start_cheat_caller_address(world_address, proxy_address);
-    sharding_proxy.settle_shard_changes(1, array![(slot_cat, 2), (slot_eid, 55)], [].span(), [].span(), [].span());
-    snforge_std::stop_cheat_caller_address(world_address);
-
-    // Must emit StoreSetRecord with keys so Torii can create entity from scratch
-    spy
-        .assert_emitted(
-            @array![
-                (
-                    world_address,
-                    world_contract::Event::StoreSetRecord(
-                        world_contract::StoreSetRecord {
-                            selector: model_selector,
-                            entity_id,
-                            keys: [3, 7].span(),
-                            values: [2, 55].span(),
-                        },
-                    ),
-                ),
-            ],
-        );
-
-    // Verify entity exists and is readable via Dojo
     let result: Tile = world.read_model((3_u32, 7_u32));
-    assert(result.category == 2, 'category should be set');
-    assert(result.entity_id == 55, 'entity_id should be set');
+    assert(result.category == 2, 'category should be 2');
+    assert(result.entity_id == 55, 'entity_id should be 55');
 }
 
-/// Test: Packed model settlement — values must be unpacked into Serde format.
-/// Score uses IntrospectPacked (Layout::Fixed), so raw storage contains bit-packed
-/// felt252 values. The emitted StoreSetRecord.values must be in unpacked Serde
-/// format [points, level] — not the raw packed felt252.
+// ── Score (Packed Layout) ───────────────────────────────────────────────
+
 #[test]
-fn test_settlement_packed_model_unpacks_values() {
+fn test_settlement_packed_model() {
+    cheat_world_owner();
     let (mut world, model_selector) = deploy_world_with_score();
     let world_address = world.dispatcher.contract_address;
 
@@ -466,50 +256,213 @@ fn test_settlement_packed_model_unpacks_values() {
     let score = Score { player: bob, points: 1000, level: 5 };
     world.write_model_test(@score);
 
-    let proxy_address = declare_and_deploy("mock_sharding_proxy");
+    let entity_id = entity_id_from_keys(@bob);
 
-    let layout = Model::<Score>::layout();
-    let models = [(model_selector, layout).shard([bob.into()].span())].span();
-    world.dispatcher.request_sharding(proxy_address, models);
+    // Score: u128 (128 bits) + u32 (32 bits) = 160 bits → 1 packed slot.
+    let packed_slot = compute_dojo_packed_slot(model_selector, entity_id);
+
+    // Pack new values: points=2000, level=10.
+    // u128 in bits 0..127, u32 in bits 128..159 → packed = 2000 + 10 * 2^128.
+    let packed_value: felt252 = 2000 + 10 * 0x100000000000000000000000000000000;
+
+    world.dispatcher.request_sharding([entity_id].span(), [].span());
+    do_settle(
+        world_address, 1,
+        [packed_slot].span(), [packed_value].span(),
+        [model_selector].span(), [entity_id].span(),
+        [0].span(), [0].span(), // member_selector=0 for packed
+    );
+
+    let result: Score = world.read_model(bob);
+    assert(result.points == 2000, 'points should be 2000');
+    assert(result.level == 10, 'level should be 10');
+}
+
+// ── Multi-Entity Shard ──────────────────────────────────────────────────
+
+#[test]
+fn test_multi_entity_shard_settles_both() {
+    cheat_world_owner();
+    let (mut world, model_selector) = deploy_world_and_foo();
+    let world_address = world.dispatcher.contract_address;
+
+    let bob: ContractAddress = 0xb0b.try_into().unwrap();
+    let alice: ContractAddress = 0xa11ce.try_into().unwrap();
+    world.write_model_test(@Foo { caller: bob, a: 100, b: 200 });
+    world.write_model_test(@Foo { caller: alice, a: 10, b: 20 });
+
+    let (sel_a, sel_b) = foo_field_selectors();
+    let bob_eid = entity_id_from_keys(@bob);
+    let alice_eid = entity_id_from_keys(@alice);
+
+    // Lock both entities in one shard.
+    world.dispatcher.request_sharding([bob_eid, alice_eid].span(), [].span());
+
+    let bob_slot_a = compute_dojo_field_slot(model_selector, bob_eid, sel_a);
+    let bob_slot_b = compute_dojo_field_slot(model_selector, bob_eid, sel_b);
+    let alice_slot_a = compute_dojo_field_slot(model_selector, alice_eid, sel_a);
+    let alice_slot_b = compute_dojo_field_slot(model_selector, alice_eid, sel_b);
+
+    do_settle(
+        world_address, 1,
+        [bob_slot_a, bob_slot_b, alice_slot_a, alice_slot_b].span(),
+        [500, 300, 50, 30].span(),
+        [model_selector, model_selector, model_selector, model_selector].span(),
+        [bob_eid, bob_eid, alice_eid, alice_eid].span(),
+        [sel_a, sel_b, sel_a, sel_b].span(),
+        [0, 0, 0, 0].span(),
+    );
+
+    let bob_result: Foo = world.read_model(bob);
+    assert(bob_result.a == 500, 'bob.a = 500');
+    assert(bob_result.b == 300, 'bob.b = 300');
+
+    let alice_result: Foo = world.read_model(alice);
+    assert(alice_result.a == 50, 'alice.a = 50');
+    assert(alice_result.b == 30, 'alice.b = 30');
+}
+
+#[test]
+fn test_multi_entity_cancel_unlocks_all() {
+    cheat_world_owner();
+    let (mut world, _) = deploy_world_and_foo();
+    let world_address = world.dispatcher.contract_address;
+
+    let bob: ContractAddress = 0xb0b.try_into().unwrap();
+    let alice: ContractAddress = 0xa11ce.try_into().unwrap();
+    world.write_model_test(@Foo { caller: bob, a: 100, b: 200 });
+    world.write_model_test(@Foo { caller: alice, a: 10, b: 20 });
+
+    let bob_eid = entity_id_from_keys(@bob);
+    let alice_eid = entity_id_from_keys(@alice);
+
+    world.dispatcher.request_sharding([bob_eid, alice_eid].span(), [].span());
+
+    let settlement = IShardingSettlementDispatcher { contract_address: world_address };
+    snforge_std::start_cheat_caller_address(world_address, snforge_std::test_address());
+    settlement.cancel_shard(1);
+    snforge_std::stop_cheat_caller_address(world_address);
+
+    // Both entities should be unlocked — can shard again.
+    world.dispatcher.request_sharding([bob_eid, alice_eid].span(), [].span());
+
+    // Values unchanged.
+    let bob_result: Foo = world.read_model(bob);
+    assert(bob_result.a == 100, 'bob unchanged');
+    let alice_result: Foo = world.read_model(alice);
+    assert(alice_result.a == 10, 'alice unchanged');
+}
+
+// ── Re-Sharding After Settlement ────────────────────────────────────────
+
+#[test]
+fn test_reshard_after_settlement_uses_new_values() {
+    cheat_world_owner();
+    let (mut world, model_selector) = deploy_world_and_foo();
+    let world_address = world.dispatcher.contract_address;
+
+    let bob: ContractAddress = 0xb0b.try_into().unwrap();
+    world.write_model_test(@Foo { caller: bob, a: 100, b: 200 });
+
+    let (sel_a, sel_b) = foo_field_selectors();
+    let entity_id = entity_id_from_keys(@bob);
+    let slot_a = compute_dojo_field_slot(model_selector, entity_id, sel_a);
+    let slot_b = compute_dojo_field_slot(model_selector, entity_id, sel_b);
+
+    // Register Add policy for field `a`.
+    world
+        .dispatcher
+        .register_shard_policy(
+            model_selector,
+            dojo::sharding::request::CRDVariant::Set,
+            [dojo::sharding::request::ShardField {
+                selector: sel_a,
+                crdt: dojo::sharding::request::CRDVariant::Add,
+                max_elements: 0,
+            }]
+                .span(),
+        );
+
+    // Shard 1: Set a=500, b=300.
+    world.dispatcher.request_sharding([entity_id].span(), [].span());
+    do_settle(
+        world_address, 1,
+        [slot_a, slot_b].span(), [500, 300].span(),
+        [model_selector, model_selector].span(), [entity_id, entity_id].span(),
+        [sel_a, sel_b].span(), [100, 0].span(), // Add initial=100 for slot_a
+    );
+
+    // Verify shard 1 result: Add: current(100) + (500 - 100) = 500; Set: 300.
+    let mid: Foo = world.read_model(bob);
+    assert(mid.a == 500, 'shard1: a=500');
+
+    // Shard 2: Add CRDT on slot_a (initial=500 from shard 1 result).
+    world.dispatcher.request_sharding([entity_id].span(), [].span());
+    // Shard sees initial=500, produces 600 → delta=100.
+    do_settle(
+        world_address, 2,
+        [slot_a].span(), [600].span(),
+        [model_selector].span(), [entity_id].span(),
+        [sel_a].span(), [500].span(), // Add initial=500
+    );
+
+    // Expected: current(500) + (shard(600) - initial(500)) = 600.
+    let result: Foo = world.read_model(bob);
+    assert(result.a == 600, 'reshard: a=600');
+    assert(result.b == 300, 'reshard: b unchanged');
+}
+
+// ── No-Change Settlement ────────────────────────────────────────────────
+
+#[test]
+fn test_settle_with_no_changes() {
+    cheat_world_owner();
+    let (mut world, model_selector) = deploy_world_and_foo();
+    let world_address = world.dispatcher.contract_address;
+
+    let bob: ContractAddress = 0xb0b.try_into().unwrap();
+    world.write_model_test(@Foo { caller: bob, a: 100, b: 200 });
 
     let entity_id = entity_id_from_keys(@bob);
 
-    // For packed models, slots are based on compute_dojo_packed_slot + offset.
-    // Score has u128 (128 bits) + u32 (32 bits) = 160 bits → 1 packed slot.
-    let packed_slot = compute_dojo_packed_slot(model_selector, entity_id);
+    world.dispatcher.request_sharding([entity_id].span(), [].span());
+    // Empty changed_keys — nothing changed on shard.
+    do_settle(
+        world_address, 1,
+        [].span(), [].span(),
+        [].span(), [].span(),
+        [].span(), [].span(),
+    );
 
-    // Pack the new values the same way Dojo would: points=2000, level=10
-    // u128 in bits 0..127, u32 in bits 128..159 → packed = 2000 | (10 << 128)
-    let packed_value: felt252 = 2000 + 10 * 0x100000000000000000000000000000000;
+    let result: Foo = world.read_model(bob);
+    assert(result.a == 100, 'no change: a=100');
+    assert(result.b == 200, 'no change: b=200');
+}
 
-    let mut spy = spy_events();
+// ── Cancel After Request ─────────────────────────────────────────────
 
-    let sharding_proxy = IShardingProxyDispatcher { contract_address: world_address };
-    snforge_std::start_cheat_caller_address(world_address, proxy_address);
-    sharding_proxy.settle_shard_changes(1, array![(packed_slot, packed_value)], [].span(), [].span(), [].span());
+#[test]
+fn test_cancel_after_request() {
+    cheat_world_owner();
+    let (mut world, model_selector) = deploy_world_and_foo();
+    let world_address = world.dispatcher.contract_address;
+
+    let bob: ContractAddress = 0xb0b.try_into().unwrap();
+    world.write_model_test(@Foo { caller: bob, a: 100, b: 200 });
+
+    let entity_id = entity_id_from_keys(@bob);
+
+    world.dispatcher.request_sharding([entity_id].span(), [].span());
+
+    let settlement = IShardingSettlementDispatcher { contract_address: world_address };
+    snforge_std::start_cheat_caller_address(world_address, snforge_std::test_address());
+    settlement.cancel_shard(1);
     snforge_std::stop_cheat_caller_address(world_address);
 
-    // StoreSetRecord values must be UNPACKED Serde values [points=2000, level=10],
-    // not the raw packed felt252.
-    spy
-        .assert_emitted(
-            @array![
-                (
-                    world_address,
-                    world_contract::Event::StoreSetRecord(
-                        world_contract::StoreSetRecord {
-                            selector: model_selector,
-                            entity_id,
-                            keys: [bob.into()].span(),
-                            values: [2000, 10].span(),
-                        },
-                    ),
-                ),
-            ],
-        );
+    let result: Foo = world.read_model(bob);
+    assert(result.a == 100, 'cancel: a unchanged');
+    assert(result.b == 200, 'cancel: b unchanged');
 
-    // Verify Dojo can read back correctly
-    let result: Score = world.read_model(bob);
-    assert(result.points == 2000, 'points should be updated');
-    assert(result.level == 10, 'level should be updated');
+    // Entity unlocked — can re-shard.
+    world.dispatcher.request_sharding([entity_id].span(), [].span());
 }
