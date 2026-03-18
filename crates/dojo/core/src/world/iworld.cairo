@@ -2,7 +2,6 @@
 
 use dojo::meta::Layout;
 use dojo::model::{ModelIndex, ResourceMetadata};
-use dojo::sharding::request::ShardModel;
 use starknet::{ClassHash, ContractAddress};
 use super::resource::Resource;
 
@@ -347,22 +346,32 @@ pub trait IWorld<T> {
     /// * `contract` - The address of the contract to revoke writer permission from.
     fn revoke_writer(ref self: T, resource: felt252, contract: ContractAddress);
 
-    /// Requests sharding for the given models.
+    /// Requests sharding for the given entities.
     ///
-    /// Auto-computes storage slots from model layouts and forwards to the sharding proxy.
-    /// Caller must have writer permission for each model being sharded.
+    /// Locks the specified entities and allocates a shard ID.
+    /// Caller must be the world owner.
     ///
     /// # Arguments
     ///
-    /// * `proxy` - The address of the sharding proxy contract.
-    /// * `models` - The models to shard with their CRDT strategies.
-    fn request_sharding(ref self: T, proxy: ContractAddress, models: Span<ShardModel>);
+    /// * `entities` - Entity IDs to lock for sharding.
+    fn request_sharding(ref self: T, entities: Span<felt252>, entity_keys_flat: Span<felt252>) -> felt252;
 
-    /// Ends the current shard session in the active shard fork context.
-    ///
-    /// Forwards to the sharding proxy which emits `ShardFinished`.
-    /// Caller must be the shard initiator for this forked shard session or the world owner.
-    fn end_shard(ref self: T);
+    /// Ends the shard session and emits `ShardFinished`.
+    /// Caller must be the world owner.
+    fn end_shard(ref self: T, shard_id: felt252);
+
+    /// Register CRDT policy for a model. Called once per model at deploy time.
+    fn register_shard_policy(
+        ref self: T,
+        model_selector: felt252,
+        default_crdt: dojo::sharding::request::CRDVariant,
+        field_overrides: Span<dojo::sharding::request::ShardField>,
+    );
+
+    /// Read the registered CRDT policy for a model.
+    fn get_shard_policy(
+        self: @T, model_selector: felt252,
+    ) -> (felt252, Span<dojo::sharding::request::ShardField>);
 }
 
 #[starknet::interface]

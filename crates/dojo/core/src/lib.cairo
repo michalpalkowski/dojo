@@ -101,14 +101,14 @@ pub mod utils {
 
 pub mod sharding {
     pub mod slot;
-    pub use slot::{
-        compute_dojo_field_slot, compute_dynamic_member_changed_hash_slot,
-        compute_dynamic_member_changed_len_slot, compute_dynamic_member_lock_slot,
-        compute_dynamic_member_changed_slots_hash,
-    };
+    pub use slot::{compute_dojo_field_slot, compute_dynamic_member_lock_slot};
 
     pub mod crdt;
     pub mod interface;
+    pub use interface::{
+        IStorageCommitmentVerifier, IStorageCommitmentVerifierDispatcher,
+        IStorageCommitmentVerifierDispatcherTrait,
+    };
     pub mod component;
     pub mod planner;
     pub mod request;
@@ -130,11 +130,13 @@ pub mod world {
 
     pub mod world_sharding;
     #[cfg(feature: 'sharding')]
-    pub use world_sharding::{ShardDynamicMemberChanges, ShardSlotDescriptor};
-    #[cfg(feature: 'sharding')]
     pub use world_sharding::{
-        IShardingMetadata, IShardingMetadataDispatcher, IShardingMetadataDispatcherTrait,
-        IShardingProxy, IShardingProxyDispatcher, IShardingProxyDispatcherTrait,
+        IShardingSettlement, IShardingSettlementDispatcher, IShardingSettlementDispatcherTrait,
+    };
+    #[cfg(feature: 'dev')]
+    pub use world_sharding::{
+        IShardingSettlementDev, IShardingSettlementDevDispatcher,
+        IShardingSettlementDevDispatcherTrait,
     };
 
     mod world_contract;
