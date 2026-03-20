@@ -1278,6 +1278,19 @@ pub mod world {
             assert(self.is_caller_world_owner(), sharding_cpt::Errors::UNAUTHORIZED_CALLER);
             self.sharding.set_sharding_proxy(proxy);
         }
+
+        fn enable_shard_fork_mode(ref self: ContractState) {
+            assert(self.is_caller_world_owner(), sharding_cpt::Errors::UNAUTHORIZED_CALLER);
+            self.sharding.enable_shard_fork_mode();
+        }
+
+        fn get_entity_shard(self: @ContractState, entity_id: felt252) -> felt252 {
+            self.sharding.entity_shard_id(entity_id)
+        }
+
+        fn get_active_shards(self: @ContractState) -> Array<felt252> {
+            self.sharding.get_active_shards()
+        }
     }
 
     #[cfg(feature: 'dev')]

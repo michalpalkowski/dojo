@@ -130,6 +130,13 @@ pub mod sharding_component {
         model_policy_fields: Map<(felt252, u32), felt252>,
         /// Max array elements per field: (model_selector, field_selector) → max_elements (0 = not dynamic).
         model_policy_max_elements: Map<(felt252, felt252), u32>,
+        /// Fork mode: when true, entity_lock checks are skipped in world contract writes.
+        /// Not exposed as public entrypoint — set via katana_setStorageAt (dev-only RPC)
+        /// which is unavailable on main chain sequencers.
+        shard_fork_mode: bool,
+        /// Active shard tracking: O(active) enumeration instead of O(total_ever_created).
+        active_shard_count: u32,
+        active_shard_list: Map<u32, felt252>,
     }
 
     /// Maximum entity_keys_flat felts per chunk event (stay well under Starknet's 300 data limit).
@@ -244,6 +251,11 @@ pub mod sharding_component {
 
             let shard_id = self.next_shard_id.read() + 1;
             self.next_shard_id.write(shard_id);
+
+            // Track active shard for O(active) enumeration.
+            let active_idx = self.active_shard_count.read();
+            self.active_shard_list.write(active_idx, shard_id);
+            self.active_shard_count.write(active_idx + 1);
 
             let entity_count: u32 = entities.len();
             self.shard_entity_count.write(shard_id, entity_count);
@@ -497,7 +509,35 @@ pub mod sharding_component {
         TContractState, +HasComponent<TContractState>,
     > of InternalTrait<TContractState> {
         fn is_entity_locked(self: @ComponentState<TContractState>, entity_id: felt252) -> bool {
+            if self.shard_fork_mode.read() {
+                return false;
+            }
             self.entity_lock.read(entity_id) != 0
+        }
+
+        fn enable_shard_fork_mode(ref self: ComponentState<TContractState>) {
+            assert(self.active_shard_count.read() > 0, 'Shard: no active shards');
+            assert(!self.shard_fork_mode.read(), 'Shard: fork mode already set');
+            self.shard_fork_mode.write(true);
+        }
+
+        fn is_shard_fork_mode(self: @ComponentState<TContractState>) -> bool {
+            self.shard_fork_mode.read()
+        }
+
+        fn get_next_shard_id(self: @ComponentState<TContractState>) -> felt252 {
+            self.next_shard_id.read()
+        }
+
+        fn get_active_shards(self: @ComponentState<TContractState>) -> Array<felt252> {
+            let count = self.active_shard_count.read();
+            let mut result = ArrayTrait::new();
+            let mut i: u32 = 0;
+            while i < count {
+                result.append(self.active_shard_list.read(i));
+                i += 1;
+            };
+            result
         }
 
         fn entity_shard_id(self: @ComponentState<TContractState>, entity_id: felt252) -> felt252 {
@@ -651,6 +691,33 @@ pub mod sharding_component {
             self.shard_entity_count.write(shard_id, 0);
 
             self.shard_commitment.write(shard_id, 0);
+
+            // Remove from active shard list (swap-remove for O(1)).
+            let count = self.active_shard_count.read();
+            let mut idx: u32 = 0;
+            let mut found = false;
+            while idx < count {
+                if self.active_shard_list.read(idx) == shard_id {
+                    found = true;
+                    break;
+                }
+                idx += 1;
+            };
+            if found {
+                let last = count - 1;
+                if idx != last {
+                    let last_val = self.active_shard_list.read(last);
+                    self.active_shard_list.write(idx, last_val);
+                }
+                self.active_shard_list.write(last, 0);
+                self.active_shard_count.write(last);
+
+                // Auto-reset fork mode when no active shards remain.
+                // Prevents permanent bypass if accidentally enabled on main chain.
+                if last == 0 && self.shard_fork_mode.read() {
+                    self.shard_fork_mode.write(false);
+                }
+            }
         }
     }
 

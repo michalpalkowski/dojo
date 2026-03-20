@@ -42,6 +42,19 @@ pub trait IShardingSettlement<T> {
 
     /// Configure the sharding proxy address (event bus). One-shot.
     fn set_sharding_proxy(ref self: T, proxy: starknet::ContractAddress);
+
+    /// Enable shard fork mode: skip entity_lock checks in write/delete paths.
+    /// Requires world owner + at least one active shard. One-shot (cannot re-enable).
+    /// Auto-resets on next `request_shard` call, preventing permanent bypass.
+    /// On main chain: equivalent to cancel_shard on all active shards (world owner
+    /// already has this power). On fork: enables gameplay without mass storage loading.
+    fn enable_shard_fork_mode(ref self: T);
+
+    /// Query entity lock: returns shard_id that holds this entity (0 = unlocked).
+    fn get_entity_shard(self: @T, entity_id: felt252) -> felt252;
+
+    /// List all active shard IDs (those with locked entities).
+    fn get_active_shards(self: @T) -> Array<felt252>;
 }
 
 /// Dev-only settlement interface (compiled only with `--features dev`).
