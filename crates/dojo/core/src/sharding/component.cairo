@@ -97,7 +97,7 @@ pub mod sharding_component {
     use starknet::storage::{Map, StorageMapReadAccess, StorageMapWriteAccess};
     use starknet::storage_access::StorageAddress;
     use starknet::syscalls::{storage_read_syscall, storage_write_syscall};
-    use starknet::{ContractAddress, get_contract_address};
+    use starknet::{ContractAddress, get_contract_address, get_execution_info};
     use core::poseidon::poseidon_hash_span;
     use dojo::sharding::interface::{
         IStorageCommitmentVerifierDispatcher, IStorageCommitmentVerifierDispatcherTrait,
@@ -114,6 +114,8 @@ pub mod sharding_component {
         shard_entities: Map<(felt252, u32), felt252>,
         /// Commitment: shard_id → H(sorted(entities)). Set atomically in request_shard.
         shard_commitment: Map<felt252, felt252>,
+        /// Request-time block number bound to the shard session.
+        shard_fork_block_number: Map<felt252, u64>,
         /// Internal shard ID counter.
         next_shard_id: felt252,
         /// Address of StorageCommitment verifier (0 = not configured).
@@ -251,6 +253,8 @@ pub mod sharding_component {
 
             let shard_id = self.next_shard_id.read() + 1;
             self.next_shard_id.write(shard_id);
+            let fork_block_number = get_execution_info().block_info.block_number;
+            self.shard_fork_block_number.write(shard_id, fork_block_number);
 
             // Track active shard for O(active) enumeration.
             let active_idx = self.active_shard_count.read();
@@ -546,6 +550,12 @@ pub mod sharding_component {
 
         fn shard_commitment(self: @ComponentState<TContractState>, shard_id: felt252) -> felt252 {
             self.shard_commitment.read(shard_id)
+        }
+
+        fn shard_attestation_fork_block_number(
+            self: @ComponentState<TContractState>, shard_id: felt252,
+        ) -> u64 {
+            self.shard_fork_block_number.read(shard_id)
         }
 
         fn shard_entities_list(

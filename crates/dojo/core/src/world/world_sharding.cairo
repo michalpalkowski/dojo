@@ -40,6 +40,9 @@ pub trait IShardingSettlement<T> {
     /// Return the stored commitment hash for a shard (0 if not set).
     fn get_shard_commitment(self: @T, shard_id: felt252) -> felt252;
 
+    /// Return the request-time block number bound to this shard.
+    fn get_shard_attestation_fork_block_number(self: @T, shard_id: felt252) -> u64;
+
     /// Configure the sharding proxy address (event bus). One-shot.
     fn set_sharding_proxy(ref self: T, proxy: starknet::ContractAddress);
 
