@@ -1259,7 +1259,7 @@ pub mod world {
         }
 
         fn cancel_shard(ref self: ContractState, shard_id: felt252) {
-            assert(self.is_caller_world_owner(), sharding_cpt::Errors::UNAUTHORIZED_CALLER);
+            self.assert_can_shard();
             self.sharding.cancel_shard(shard_id);
         }
 
@@ -1272,6 +1272,12 @@ pub mod world {
 
         fn get_shard_commitment(self: @ContractState, shard_id: felt252) -> felt252 {
             self.sharding.shard_commitment(shard_id)
+        }
+
+        fn get_shard_attestation_fork_block_number(
+            self: @ContractState, shard_id: felt252,
+        ) -> u64 {
+            self.sharding.shard_attestation_fork_block_number(shard_id)
         }
 
         fn set_sharding_proxy(ref self: ContractState, proxy: starknet::ContractAddress) {
