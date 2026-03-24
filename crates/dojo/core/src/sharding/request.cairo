@@ -14,6 +14,8 @@ pub enum CRDVariant {
 pub struct ShardField {
     pub selector: felt252,
     pub crdt: CRDVariant,
+    /// Maximum number of array elements to pre-allocate (0 = not a dynamic array).
+    pub max_elements: u32,
 }
 
 pub trait IntoShardField {
@@ -25,19 +27,19 @@ pub trait IntoShardField {
 
 impl Felt252IntoShardField of IntoShardField {
     fn as_set(self: felt252) -> ShardField {
-        ShardField { selector: self, crdt: CRDVariant::Set }
+        ShardField { selector: self, crdt: CRDVariant::Set, max_elements: 0 }
     }
 
     fn as_add(self: felt252) -> ShardField {
-        ShardField { selector: self, crdt: CRDVariant::Add }
+        ShardField { selector: self, crdt: CRDVariant::Add, max_elements: 0 }
     }
 
     fn as_lock(self: felt252) -> ShardField {
-        ShardField { selector: self, crdt: CRDVariant::Lock }
+        ShardField { selector: self, crdt: CRDVariant::Lock, max_elements: 0 }
     }
 
     fn as_set_lock(self: felt252) -> ShardField {
-        ShardField { selector: self, crdt: CRDVariant::SetLock }
+        ShardField { selector: self, crdt: CRDVariant::SetLock, max_elements: 0 }
     }
 }
 
@@ -118,12 +120,12 @@ fn translate_struct_fields(
 
     for field in fields {
         if is_deterministic_layout(*field.layout) {
-            result.append(ShardField { selector: (*field).selector, crdt });
+            result.append(ShardField { selector: (*field).selector, crdt, max_elements: 0 });
             continue;
         }
 
         if include_dynamic {
-            result.append(ShardField { selector: (*field).selector, crdt });
+            result.append(ShardField { selector: (*field).selector, crdt, max_elements: 0 });
             continue;
         }
 
@@ -165,7 +167,7 @@ fn translate_layout(
             let mut result: Array<ShardField> = ArrayTrait::new();
             let mut i: u32 = 0;
             while i < num_slots {
-                result.append(ShardField { selector: PACKED_SLOT_BASE + i.into(), crdt });
+                result.append(ShardField { selector: PACKED_SLOT_BASE + i.into(), crdt, max_elements: 0 });
                 i += 1;
             };
             result.span()

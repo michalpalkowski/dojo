@@ -105,6 +105,10 @@ pub mod sharding {
 
     pub mod crdt;
     pub mod interface;
+    pub use interface::{
+        IStorageCommitmentVerifier, IStorageCommitmentVerifierDispatcher,
+        IStorageCommitmentVerifierDispatcherTrait,
+    };
     pub mod component;
     pub mod planner;
     pub mod request;
@@ -124,11 +128,19 @@ pub mod world {
     #[cfg(target: "test")]
     pub use iworld::{IWorldTest, IWorldTestDispatcher, IWorldTestDispatcherTrait};
 
+    pub mod world_sharding;
+    #[cfg(feature: 'sharding')]
+    pub use world_sharding::{
+        IShardingSettlement, IShardingSettlementDispatcher, IShardingSettlementDispatcherTrait,
+    };
+    #[cfg(feature: 'dev')]
+    pub use world_sharding::{
+        IShardingSettlementDev, IShardingSettlementDevDispatcher,
+        IShardingSettlementDevDispatcherTrait,
+    };
+
     mod world_contract;
     pub use world_contract::world;
-    pub use world_contract::{
-        IShardingProxy, IShardingProxyDispatcher, IShardingProxyDispatcherTrait, ShardMemberWrite,
-    };
 
     pub mod storage;
     pub use storage::{WorldStorage, WorldStorageTrait};

@@ -4,6 +4,8 @@ use core::poseidon::poseidon_hash_span;
 
 /// Sentinel range for packed model slot offsets. Real selectors (Poseidon hashes) never collide.
 pub const PACKED_SLOT_BASE: felt252 = 'dojo_packed_slot';
+
+/// Domain separator for dynamic member lock slots (kept for off-chain slot computation).
 pub const DYNAMIC_MEMBER_LOCK_DOMAIN: felt252 = 'dojo_dynamic_member_lock';
 
 #[inline(always)]
