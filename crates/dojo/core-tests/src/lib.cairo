@@ -95,9 +95,11 @@ mod tests {
     }
 
     mod sharding {
+        mod helpers;
         mod slot;
         mod component;
         mod request;
+        mod settlement_commitment;
         mod settlement_events;
     }
 }
