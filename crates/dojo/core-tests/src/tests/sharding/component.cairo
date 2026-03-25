@@ -1,97 +1,19 @@
-use dojo::model::{Model, ModelStorage, ModelStorageTest};
+use dojo::model::{ModelStorage, ModelStorageTest};
 use dojo::sharding::compute_dojo_field_slot;
 use dojo::sharding::slot::compute_dojo_packed_slot;
 use dojo::sharding::request::{SlotEntry, SlotVerification, DeterministicProof};
 use dojo::utils::entity_id_from_keys;
-use dojo::world::{
-    IShardingSettlementDispatcher, IShardingSettlementDispatcherTrait,
-    IShardingSettlementDevDispatcher, IShardingSettlementDevDispatcherTrait,
-    IWorldDispatcherTrait,
-};
+use dojo::world::{IShardingSettlementDispatcher, IShardingSettlementDispatcherTrait, IWorldDispatcherTrait};
 use starknet::ContractAddress;
 
 use crate::tests::helpers::{Foo, PackedPair, deploy_world_and_foo, deploy_world_with_packed_pair};
+use crate::tests::sharding::helpers::{
+    foo_field_selectors, make_field_slot, register_mock_storage_commitment_verifier, setup_foo_shard,
+    settle_as_owner, settle_with_caller,
+};
 
 /// `felt252` max value (`FIELD_PRIME - 1`).
 const FELT_MAX: felt252 = 0x800000000000011000000000000000000000000000000000000000000000000;
-
-fn foo_field_selectors() -> (felt252, felt252) {
-    let layout = Model::<Foo>::layout();
-    if let dojo::meta::Layout::Struct(fields) = layout {
-        ((*fields[0]).selector, (*fields[1]).selector)
-    } else {
-        panic!("expected struct layout")
-    }
-}
-
-/// Deploy world + Foo, write initial data, compute slots.
-/// Returns (world, world_address, entity_id, slot_a, slot_b, model_selector).
-fn setup_foo_shard() -> (
-    dojo::world::WorldStorage,
-    ContractAddress,
-    felt252,
-    felt252,
-    felt252,
-    felt252,
-) {
-    // Make test_address() the world owner (constructor uses account_contract_address).
-    snforge_std::start_cheat_account_contract_address_global(snforge_std::test_address());
-    let (mut world, model_selector) = deploy_world_and_foo();
-    let world_address = world.dispatcher.contract_address;
-    let bob: ContractAddress = 0xb0b.try_into().unwrap();
-    world.write_model_test(@Foo { caller: bob, a: 100, b: 200 });
-
-    let (sel_a, sel_b) = foo_field_selectors();
-    let entity_id = entity_id_from_keys(@bob);
-    let slot_a = compute_dojo_field_slot(model_selector, entity_id, sel_a);
-    let slot_b = compute_dojo_field_slot(model_selector, entity_id, sel_b);
-
-    (world, world_address, entity_id, slot_a, slot_b, model_selector)
-}
-
-/// Build a SlotEntry for a struct-layout field (Deterministic with packed_offset=0).
-fn make_field_slot(
-    key: felt252,
-    value: felt252,
-    model_selector: felt252,
-    entity_id: felt252,
-    member_selector: felt252,
-    initial_value: felt252,
-) -> SlotEntry {
-    SlotEntry {
-        key,
-        value,
-        model_selector,
-        entity_id,
-        member_selector,
-        initial_value,
-        verification: SlotVerification::Deterministic(
-            DeterministicProof {
-                key_derivation_chain: [member_selector].span(),
-                packed_offset: 0,
-            },
-        ),
-    }
-}
-
-/// Helper: settle as world owner using settle_dev (no StorageCommitment proof).
-fn settle_as_owner(
-    world_address: ContractAddress,
-    shard_id: felt252,
-    slots: Span<SlotEntry>,
-) {
-    let settlement = IShardingSettlementDevDispatcher { contract_address: world_address };
-    snforge_std::start_cheat_caller_address(world_address, snforge_std::test_address());
-    settlement
-        .settle_dev(
-            shard_id,
-            0, // end_block_number
-            slots,
-            [].span(), // entity_model_selectors
-            [].span(), // entity_keys_flat
-        );
-    snforge_std::stop_cheat_caller_address(world_address);
-}
 
 // ── Entity Locking ──────────────────────────────────────────────────────
 
@@ -300,27 +222,22 @@ fn test_settle_mixed_add_and_set() {
 
 #[test]
 #[should_panic(expected: ('Shard: unauthorized caller',))]
-fn test_settle_dev_rejects_unauthorized_caller() {
+fn test_settle_rejects_unauthorized_caller() {
     let (world, world_address, entity_id, slot_a, slot_b, model_selector) = setup_foo_shard();
     world.dispatcher.request_sharding([entity_id].span(), [].span());
 
     let (sel_a, sel_b) = foo_field_selectors();
 
-    // Call settle_dev as non-owner.
     let not_owner: ContractAddress = 0xdead.try_into().unwrap();
-    let settlement = IShardingSettlementDevDispatcher { contract_address: world_address };
-    snforge_std::start_cheat_caller_address(world_address, not_owner);
-    settlement
-        .settle_dev(
-            1,
-            0, // end_block_number
-            [
-                make_field_slot(slot_a, 999, model_selector, entity_id, sel_a, 0),
-                make_field_slot(slot_b, 777, model_selector, entity_id, sel_b, 0),
-            ].span(),
-            [].span(),
-            [].span(),
-        );
+    settle_with_caller(
+        world_address,
+        not_owner,
+        1,
+        [
+            make_field_slot(slot_a, 999, model_selector, entity_id, sel_a, 0),
+            make_field_slot(slot_b, 777, model_selector, entity_id, sel_b, 0),
+        ].span(),
+    );
 }
 
 #[test]
@@ -359,6 +276,7 @@ fn test_settle_add_overflow_rejected() {
     snforge_std::start_cheat_account_contract_address_global(snforge_std::test_address());
     let (mut world, model_selector) = deploy_world_and_foo();
     let world_address = world.dispatcher.contract_address;
+    register_mock_storage_commitment_verifier(world_address);
     let bob: ContractAddress = 0xb0b.try_into().unwrap();
     // Set value near felt max BEFORE sharding (so entity lock doesn't block).
     world.write_model_test(@Foo { caller: bob, a: FELT_MAX, b: 200 });
@@ -577,33 +495,28 @@ fn test_settle_rejects_wrong_model_selector() {
 
     let (sel_a, sel_b) = foo_field_selectors();
 
-    let settlement = IShardingSettlementDevDispatcher { contract_address: world_address };
-    snforge_std::start_cheat_caller_address(world_address, snforge_std::test_address());
     // Pass wrong model_selector (0xdead) for first slot — hash won't match slot_a.
-    settlement
-        .settle_dev(
-            1,
-            0, // end_block_number
-            [
-                SlotEntry {
-                    key: slot_a,
-                    value: 999,
-                    model_selector: 0xdead, // wrong!
-                    entity_id,
-                    member_selector: sel_a,
-                    initial_value: 0,
-                    verification: SlotVerification::Deterministic(
-                        DeterministicProof {
-                            key_derivation_chain: [sel_a].span(),
-                            packed_offset: 0,
-                        },
-                    ),
-                },
-                make_field_slot(slot_b, 777, model_selector, entity_id, sel_b, 0),
-            ].span(),
-            [].span(),
-            [].span(),
-        );
+    settle_as_owner(
+        world_address,
+        1,
+        [
+            SlotEntry {
+                key: slot_a,
+                value: 999,
+                model_selector: 0xdead, // wrong!
+                entity_id,
+                member_selector: sel_a,
+                initial_value: 0,
+                verification: SlotVerification::Deterministic(
+                    DeterministicProof {
+                        key_derivation_chain: [sel_a].span(),
+                        packed_offset: 0,
+                    },
+                ),
+            },
+            make_field_slot(slot_b, 777, model_selector, entity_id, sel_b, 0),
+        ].span(),
+    );
 }
 
 #[test]
@@ -617,19 +530,11 @@ fn test_settle_rejects_unlocked_entity() {
     let (sel_a, _sel_b) = foo_field_selectors();
     let other_slot = dojo::sharding::compute_dojo_field_slot(model_selector, other_entity, sel_a);
 
-    let settlement = IShardingSettlementDevDispatcher { contract_address: world_address };
-    snforge_std::start_cheat_caller_address(world_address, snforge_std::test_address());
-    // Try to settle slot belonging to unlocked entity.
-    settlement
-        .settle_dev(
-            1,
-            0, // end_block_number
-            [
-                make_field_slot(other_slot, 42, model_selector, other_entity, sel_a, 0),
-            ].span(),
-            [].span(),
-            [].span(),
-        );
+    settle_as_owner(
+        world_address,
+        1,
+        [make_field_slot(other_slot, 42, model_selector, other_entity, sel_a, 0)].span(),
+    );
 }
 
 #[test]
@@ -639,33 +544,28 @@ fn test_settle_rejects_zero_comp_key_for_deterministic_slot() {
     world.dispatcher.request_sharding([entity_id].span(), [].span());
 
     let (sel_a, _sel_b) = foo_field_selectors();
-    let settlement = IShardingSettlementDevDispatcher { contract_address: world_address };
-    snforge_std::start_cheat_caller_address(world_address, snforge_std::test_address());
     // Pass empty key_derivation_chain — derives entity_id, not combine_key(entity_id, sel_a),
     // so the recomputed slot won't match slot_a.
-    settlement
-        .settle_dev(
-            1,
-            0, // end_block_number
-            [
-                SlotEntry {
-                    key: slot_a,
-                    value: 42,
-                    model_selector,
-                    entity_id,
-                    member_selector: sel_a,
-                    initial_value: 0,
-                    verification: SlotVerification::Deterministic(
-                        DeterministicProof {
-                            key_derivation_chain: [].span(), // empty — hash won't match
-                            packed_offset: 0,
-                        },
-                    ),
-                },
-            ].span(),
-            [].span(),
-            [].span(),
-        );
+    settle_as_owner(
+        world_address,
+        1,
+        [
+            SlotEntry {
+                key: slot_a,
+                value: 42,
+                model_selector,
+                entity_id,
+                member_selector: sel_a,
+                initial_value: 0,
+                verification: SlotVerification::Deterministic(
+                    DeterministicProof {
+                        key_derivation_chain: [].span(), // empty — hash won't match
+                        packed_offset: 0,
+                    },
+                ),
+            },
+        ].span(),
+    );
 }
 
 #[test]
@@ -674,6 +574,7 @@ fn test_settle_rejects_packed_offset_bypass_for_unlocked_entity() {
     snforge_std::start_cheat_account_contract_address_global(snforge_std::test_address());
     let (mut world, model_selector) = deploy_world_with_packed_pair();
     let world_address = world.dispatcher.contract_address;
+    register_mock_storage_commitment_verifier(world_address);
 
     let bob: ContractAddress = 0xb0b.try_into().unwrap();
     let alice: ContractAddress = 0xa11ce.try_into().unwrap();
@@ -685,31 +586,26 @@ fn test_settle_rejects_packed_offset_bypass_for_unlocked_entity() {
     world.dispatcher.request_sharding([bob_eid].span(), [].span());
 
     let forged_key = compute_dojo_packed_slot(model_selector, alice_eid) + 1;
-    let settlement = IShardingSettlementDevDispatcher { contract_address: world_address };
-    snforge_std::start_cheat_caller_address(world_address, snforge_std::test_address());
-    settlement
-        .settle_dev(
-            1,
-            0, // end_block_number
-            [
-                SlotEntry {
-                    key: forged_key,
-                    value: 999,
-                    model_selector,
-                    entity_id: alice_eid,
-                    member_selector: 0,
-                    initial_value: 0,
-                    verification: SlotVerification::Deterministic(
-                        DeterministicProof {
-                            key_derivation_chain: [].span(),
-                            packed_offset: 1,
-                        },
-                    ),
-                },
-            ].span(),
-            [].span(),
-            [].span(),
-        );
+    settle_as_owner(
+        world_address,
+        1,
+        [
+            SlotEntry {
+                key: forged_key,
+                value: 999,
+                model_selector,
+                entity_id: alice_eid,
+                member_selector: 0,
+                initial_value: 0,
+                verification: SlotVerification::Deterministic(
+                    DeterministicProof {
+                        key_derivation_chain: [].span(),
+                        packed_offset: 1,
+                    },
+                ),
+            },
+        ].span(),
+    );
 }
 
 // ── member_selector binding tests ───────────────────────────────────
@@ -722,30 +618,26 @@ fn test_settle_rejects_empty_chain_with_nonzero_member_selector() {
 
     let (sel_a, _sel_b) = foo_field_selectors();
     let packed_slot = compute_dojo_packed_slot(model_selector, entity_id);
-    let settlement = IShardingSettlementDevDispatcher { contract_address: world_address };
-    snforge_std::start_cheat_caller_address(world_address, snforge_std::test_address());
-    settlement
-        .settle_dev(
-            1, 0,
-            [
-                SlotEntry {
-                    key: packed_slot,
-                    value: 42,
-                    model_selector,
-                    entity_id,
-                    member_selector: sel_a, // non-zero but chain is empty
-                    initial_value: 0,
-                    verification: SlotVerification::Deterministic(
-                        DeterministicProof {
-                            key_derivation_chain: [].span(),
-                            packed_offset: 0,
-                        },
-                    ),
-                },
-            ].span(),
-            [].span(),
-            [].span(),
-        );
+    settle_as_owner(
+        world_address,
+        1,
+        [
+            SlotEntry {
+                key: packed_slot,
+                value: 42,
+                model_selector,
+                entity_id,
+                member_selector: sel_a, // non-zero but chain is empty
+                initial_value: 0,
+                verification: SlotVerification::Deterministic(
+                    DeterministicProof {
+                        key_derivation_chain: [].span(),
+                        packed_offset: 0,
+                    },
+                ),
+            },
+        ].span(),
+    );
 }
 
 #[test]
@@ -755,30 +647,26 @@ fn test_settle_rejects_member_selector_not_matching_chain() {
     world.dispatcher.request_sharding([entity_id].span(), [].span());
 
     let (sel_a, sel_b) = foo_field_selectors();
-    let settlement = IShardingSettlementDevDispatcher { contract_address: world_address };
-    snforge_std::start_cheat_caller_address(world_address, snforge_std::test_address());
-    settlement
-        .settle_dev(
-            1, 0,
-            [
-                SlotEntry {
-                    key: slot_a,
-                    value: 42,
-                    model_selector,
-                    entity_id,
-                    member_selector: sel_b, // wrong! chain[0] = sel_a
-                    initial_value: 0,
-                    verification: SlotVerification::Deterministic(
-                        DeterministicProof {
-                            key_derivation_chain: [sel_a].span(),
-                            packed_offset: 0,
-                        },
-                    ),
-                },
-            ].span(),
-            [].span(),
-            [].span(),
-        );
+    settle_as_owner(
+        world_address,
+        1,
+        [
+            SlotEntry {
+                key: slot_a,
+                value: 42,
+                model_selector,
+                entity_id,
+                member_selector: sel_b, // wrong! chain[0] = sel_a
+                initial_value: 0,
+                verification: SlotVerification::Deterministic(
+                    DeterministicProof {
+                        key_derivation_chain: [sel_a].span(),
+                        packed_offset: 0,
+                    },
+                ),
+            },
+        ].span(),
+    );
 }
 
 // ── DynamicLock wrong entity ────────────────────────────────────────
@@ -795,25 +683,21 @@ fn test_settle_rejects_dynamic_lock_with_wrong_entity() {
         model_selector, wrong_entity, sel_a,
     );
 
-    let settlement = IShardingSettlementDevDispatcher { contract_address: world_address };
-    snforge_std::start_cheat_caller_address(world_address, snforge_std::test_address());
-    settlement
-        .settle_dev(
-            1, 0,
-            [
-                SlotEntry {
-                    key: wrong_lock_slot,
-                    value: 1,
-                    model_selector,
-                    entity_id,
-                    member_selector: sel_a,
-                    initial_value: 0,
-                    verification: SlotVerification::DynamicLock,
-                },
-            ].span(),
-            [].span(),
-            [].span(),
-        );
+    settle_as_owner(
+        world_address,
+        1,
+        [
+            SlotEntry {
+                key: wrong_lock_slot,
+                value: 1,
+                model_selector,
+                entity_id,
+                member_selector: sel_a,
+                initial_value: 0,
+                verification: SlotVerification::DynamicLock,
+            },
+        ].span(),
+    );
 }
 
 // ── cancel_shard creator auth ───────────────────────────────────────
