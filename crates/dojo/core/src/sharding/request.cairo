@@ -10,6 +10,47 @@ pub enum CRDVariant {
     SetLock,
 }
 
+/// A single changed storage slot for settlement.
+/// Groups key/value, ownership metadata, and verification proof into one struct.
+#[derive(Drop, Serde, Copy)]
+pub struct SlotEntry {
+    /// Storage key (Poseidon hash of the Dojo storage path).
+    pub key: felt252,
+    /// Value from the shard fork.
+    pub value: felt252,
+    /// Dojo model selector that owns this slot.
+    pub model_selector: felt252,
+    /// Entity ID this slot belongs to (must be locked by the shard).
+    pub entity_id: felt252,
+    /// Member/field selector for CRDT policy resolution.
+    pub member_selector: felt252,
+    /// Initial main-chain value at fork time (for Add CRDT delta computation; 0 for non-Add).
+    pub initial_value: felt252,
+    /// How to verify this slot belongs to the claimed entity.
+    pub verification: SlotVerification,
+}
+
+/// Slot ownership verification proof.
+/// Each variant carries only the data needed for its verification formula,
+/// making invalid states unrepresentable.
+#[derive(Drop, Serde, Copy)]
+pub enum SlotVerification {
+    /// Standard Dojo storage: key = H(DOJO_STORAGE, model_sel, computation_key) + packed_offset.
+    Deterministic: DeterministicProof,
+    /// Dynamic array member lock: key = H(LOCK_DOMAIN, model_sel, entity_id, member_sel).
+    DynamicLock,
+}
+
+/// Proof data for deterministic (field-layout or packed) Dojo storage slots.
+#[derive(Drop, Serde, Copy)]
+pub struct DeterministicProof {
+    /// Poseidon computation key: `combine_key(entity_id, field_selector)` for struct fields,
+    /// or `entity_id` for packed models.
+    pub computation_key: felt252,
+    /// Offset within packed model storage (0 for struct-layout fields).
+    pub packed_offset: u32,
+}
+
 #[derive(Drop, Serde, Copy, Debug, PartialEq)]
 pub struct ShardField {
     pub selector: felt252,

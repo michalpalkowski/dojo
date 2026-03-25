@@ -4,29 +4,21 @@
 //! The types define the ABI surface for sharding settlement
 //! and metadata queries used by the operator.
 
+use dojo::sharding::request::SlotEntry;
+
 /// Sharding settlement methods on the world contract.
 /// Called by the world owner (operator) to settle or cancel shards.
 #[starknet::interface]
 pub trait IShardingSettlement<T> {
     /// Settle changed slots with StorageCommitment verification.
-    /// Per-slot metadata enables on-chain ownership verification and Torii notification.
-    /// `slot_initial_values` provides Add CRDT initial values for delta computation.
     /// `entity_model_selectors` + `entity_keys_flat` provide entity keys for Torii
     /// StoreSetRecord emission (one entry per unique entity).
     fn settle(
         ref self: T,
         shard_id: felt252,
-        changed_keys: Span<felt252>,
-        changed_values: Span<felt252>,
         global_state_root: felt252,
         end_block_number: u64,
-        slot_model_selectors: Span<felt252>,
-        slot_entity_ids: Span<felt252>,
-        slot_computation_keys: Span<felt252>,
-        slot_kinds: Span<felt252>,
-        slot_member_selectors: Span<felt252>,
-        slot_packed_offsets: Span<u32>,
-        slot_initial_values: Span<felt252>,
+        slots: Span<SlotEntry>,
         entity_model_selectors: Span<felt252>,
         entity_keys_flat: Span<felt252>,
     );
@@ -73,16 +65,8 @@ pub trait IShardingSettlementDev<T> {
     fn settle_dev(
         ref self: T,
         shard_id: felt252,
-        changed_keys: Span<felt252>,
-        changed_values: Span<felt252>,
         end_block_number: u64,
-        slot_model_selectors: Span<felt252>,
-        slot_entity_ids: Span<felt252>,
-        slot_computation_keys: Span<felt252>,
-        slot_kinds: Span<felt252>,
-        slot_member_selectors: Span<felt252>,
-        slot_packed_offsets: Span<u32>,
-        slot_initial_values: Span<felt252>,
+        slots: Span<SlotEntry>,
         entity_model_selectors: Span<felt252>,
         entity_keys_flat: Span<felt252>,
     );

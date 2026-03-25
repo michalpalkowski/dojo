@@ -1219,43 +1219,17 @@ pub mod world {
         fn settle(
             ref self: ContractState,
             shard_id: felt252,
-            changed_keys: Span<felt252>,
-            changed_values: Span<felt252>,
             global_state_root: felt252,
             end_block_number: u64,
-            slot_model_selectors: Span<felt252>,
-            slot_entity_ids: Span<felt252>,
-            slot_computation_keys: Span<felt252>,
-            slot_kinds: Span<felt252>,
-            slot_member_selectors: Span<felt252>,
-            slot_packed_offsets: Span<u32>,
-            slot_initial_values: Span<felt252>,
+            slots: Span<dojo::sharding::request::SlotEntry>,
             entity_model_selectors: Span<felt252>,
             entity_keys_flat: Span<felt252>,
         ) {
             assert(self.is_caller_world_owner(), sharding_cpt::Errors::UNAUTHORIZED_CALLER);
-            self
-                .sharding
-                .settle(
-                    shard_id,
-                    changed_keys,
-                    changed_values,
-                    global_state_root,
-                    end_block_number,
-                    slot_model_selectors,
-                    slot_entity_ids,
-                    slot_computation_keys,
-                    slot_kinds,
-                    slot_member_selectors,
-                    slot_packed_offsets,
-                    slot_initial_values,
-                );
+            self.sharding.settle(shard_id, global_state_root, end_block_number, slots);
 
             // Emit StoreSetRecord per entity so Torii indexes with correct keys.
-            self
-                .emit_settlement_updates(
-                    entity_model_selectors, entity_keys_flat,
-                );
+            self.emit_settlement_updates(entity_model_selectors, entity_keys_flat);
         }
 
         fn cancel_shard(ref self: ContractState, shard_id: felt252) {
@@ -1309,41 +1283,16 @@ pub mod world {
         fn settle_dev(
             ref self: ContractState,
             shard_id: felt252,
-            changed_keys: Span<felt252>,
-            changed_values: Span<felt252>,
             end_block_number: u64,
-            slot_model_selectors: Span<felt252>,
-            slot_entity_ids: Span<felt252>,
-            slot_computation_keys: Span<felt252>,
-            slot_kinds: Span<felt252>,
-            slot_member_selectors: Span<felt252>,
-            slot_packed_offsets: Span<u32>,
-            slot_initial_values: Span<felt252>,
+            slots: Span<dojo::sharding::request::SlotEntry>,
             entity_model_selectors: Span<felt252>,
             entity_keys_flat: Span<felt252>,
         ) {
             assert(self.is_caller_world_owner(), sharding_cpt::Errors::UNAUTHORIZED_CALLER);
-            self
-                .sharding
-                .settle_dev(
-                    shard_id,
-                    changed_keys,
-                    changed_values,
-                    end_block_number,
-                    slot_model_selectors,
-                    slot_entity_ids,
-                    slot_computation_keys,
-                    slot_kinds,
-                    slot_member_selectors,
-                    slot_packed_offsets,
-                    slot_initial_values,
-                );
+            self.sharding.settle_dev(shard_id, end_block_number, slots);
 
             // Emit StoreSetRecord per entity so Torii indexes with correct keys.
-            self
-                .emit_settlement_updates(
-                    entity_model_selectors, entity_keys_flat,
-                );
+            self.emit_settlement_updates(entity_model_selectors, entity_keys_flat);
         }
     }
 
