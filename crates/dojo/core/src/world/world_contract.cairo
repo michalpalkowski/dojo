@@ -1161,12 +1161,12 @@ pub mod world {
             entities: Span<felt252>,
             entity_keys_flat: Span<felt252>,
         ) -> felt252 {
-            self.assert_can_shard();
+            self.assert_caller_is_shard_writer();
             self.sharding.request_shard(entities, entity_keys_flat)
         }
 
         fn end_shard(ref self: ContractState, shard_id: felt252) {
-            self.assert_can_shard();
+            self.assert_caller_is_shard_writer();
             self.sharding.end_shard(shard_id);
         }
 
@@ -1176,7 +1176,7 @@ pub mod world {
             default_crdt: dojo::sharding::request::CRDVariant,
             field_overrides: Span<dojo::sharding::request::ShardField>,
         ) {
-            self.assert_can_shard();
+            self.assert_caller_is_shard_writer();
             self.sharding.register_shard_policy(model_selector, default_crdt, field_overrides);
         }
 
@@ -1339,7 +1339,7 @@ pub mod world {
         /// - World owner (operator) — can always shard.
         /// - WORLD writer — game system contracts granted `grant_writer(WORLD, addr)`
         ///   during migration, so any authorized game system can trigger sharding.
-        fn assert_can_shard(self: @ContractState) {
+        fn assert_caller_is_shard_writer(self: @ContractState) {
             let caller = get_caller_address();
             if self.is_writer(WORLD, caller) {
                 return;
