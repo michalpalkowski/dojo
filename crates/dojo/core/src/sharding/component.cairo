@@ -81,7 +81,7 @@ pub mod sharding_component {
     use starknet::storage::{Map, StorageMapReadAccess, StorageMapWriteAccess};
     use starknet::storage_access::StorageAddress;
     use starknet::syscalls::{storage_read_syscall, storage_write_syscall};
-    use starknet::{ContractAddress, get_contract_address, get_execution_info};
+    use starknet::{ContractAddress, get_caller_address, get_contract_address, get_execution_info};
     use core::poseidon::poseidon_hash_span;
     use dojo::sharding::interface::{
         IStorageCommitmentVerifierDispatcher, IStorageCommitmentVerifierDispatcherTrait,
@@ -120,6 +120,9 @@ pub mod sharding_component {
         /// Not exposed as public entrypoint — set via katana_setStorageAt (dev-only RPC)
         /// which is unavailable on main chain sequencers.
         shard_fork_mode: bool,
+        /// Shard creator: shard_id → caller address at request time.
+        /// Used by cancel_shard to restrict cancellation to creator or world owner.
+        shard_creator: Map<felt252, ContractAddress>,
         /// Active shard tracking: O(active) enumeration instead of O(total_ever_created).
         active_shard_count: u32,
         active_shard_list: Map<u32, felt252>,
@@ -237,6 +240,7 @@ pub mod sharding_component {
             self.next_shard_id.write(shard_id);
             let fork_block_number = get_execution_info().block_info.block_number;
             self.shard_fork_block_number.write(shard_id, fork_block_number);
+            self.shard_creator.write(shard_id, get_caller_address());
 
             // Track active shard for O(active) enumeration.
             let active_idx = self.active_shard_count.read();
@@ -656,6 +660,8 @@ pub mod sharding_component {
                 i += 1;
             };
             self.shard_entity_count.write(shard_id, 0);
+            self.shard_fork_block_number.write(shard_id, 0);
+            self.shard_creator.write(shard_id, core::num::traits::Zero::zero());
 
             // Remove from active shard list (swap-remove for O(1)).
             let count = self.active_shard_count.read();
