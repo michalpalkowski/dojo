@@ -5,6 +5,7 @@
 
 use dojo::model::{Model, ModelStorage, ModelStorageTest};
 use dojo::sharding::compute_dojo_field_slot;
+use dojo::sharding::request::{SlotEntry, SlotVerification, DeterministicProof};
 use dojo::utils::{entity_id_from_keys, combine_key};
 use dojo::world::{
     IShardingSettlementDispatcher, IShardingSettlementDispatcherTrait, IWorldDispatcherTrait,
@@ -12,31 +13,6 @@ use dojo::world::{
 use starknet::ContractAddress;
 
 use crate::tests::helpers::{Foo, deploy_world_and_foo};
-
-const SLOT_KIND_DETERMINISTIC: felt252 = 1;
-
-fn build_comp_keys(entity_ids: Span<felt252>, member_selectors: Span<felt252>) -> Span<felt252> {
-    let mut keys: Array<felt252> = ArrayTrait::new();
-    let mut i: u32 = 0;
-    while i < entity_ids.len() {
-        let eid = *entity_ids[i];
-        let member = *member_selectors[i];
-        if member != 0 { keys.append(combine_key(eid, member)); }
-        else { keys.append(eid); };
-        i += 1;
-    };
-    keys.span()
-}
-
-fn build_slot_kinds(count: u32, kind: felt252) -> Span<felt252> {
-    let mut kinds: Array<felt252> = ArrayTrait::new();
-    let mut i: u32 = 0;
-    while i < count {
-        kinds.append(kind);
-        i += 1;
-    };
-    kinds.span()
-}
 
 fn cheat_world_owner() {
     snforge_std::start_cheat_account_contract_address_global(snforge_std::test_address());
@@ -49,6 +25,51 @@ fn foo_field_selectors() -> (felt252, felt252) {
     } else {
         panic!("expected struct layout")
     }
+}
+
+/// Build a deterministic SlotEntry for a struct-layout field.
+fn field_slot_entry(
+    key: felt252,
+    value: felt252,
+    model_selector: felt252,
+    entity_id: felt252,
+    member_selector: felt252,
+    initial_value: felt252,
+) -> SlotEntry {
+    SlotEntry {
+        key,
+        value,
+        model_selector,
+        entity_id,
+        member_selector,
+        initial_value,
+        verification: SlotVerification::Deterministic(
+            DeterministicProof {
+                computation_key: combine_key(entity_id, member_selector),
+                packed_offset: 0,
+            },
+        ),
+    }
+}
+
+/// Helper: settle as world owner.
+fn do_settle(
+    world_address: ContractAddress,
+    shard_id: felt252,
+    slots: Span<SlotEntry>,
+) {
+    let settlement = IShardingSettlementDispatcher { contract_address: world_address };
+    snforge_std::start_cheat_caller_address(world_address, snforge_std::test_address());
+    settlement
+        .settle(
+            shard_id,
+            0, // global_state_root
+            0, // end_block_number
+            slots,
+            [].span(), // entity_model_selectors
+            [].span(), // entity_keys_flat
+        );
+    snforge_std::stop_cheat_caller_address(world_address);
 }
 
 // ── Multi-Entity Shard ──────────────────────────────────────────────────
@@ -77,22 +98,15 @@ fn test_multi_entity_shard_settles_both() {
     let alice_slot_a = compute_dojo_field_slot(model_selector, alice_eid, sel_a);
     let alice_slot_b = compute_dojo_field_slot(model_selector, alice_eid, sel_b);
 
-    let all_keys: Span<felt252> = [bob_slot_a, bob_slot_b, alice_slot_a, alice_slot_b].span();
-    let settlement = IShardingSettlementDispatcher { contract_address: world_address };
-    snforge_std::start_cheat_caller_address(world_address, snforge_std::test_address());
-    settlement.settle(
-        1, all_keys, [500, 300, 50, 30].span(), 0, 0,
-        [model_selector, model_selector, model_selector, model_selector].span(),
-        [bob_eid, bob_eid, alice_eid, alice_eid].span(),
-        build_comp_keys([bob_eid, bob_eid, alice_eid, alice_eid].span(), [sel_a, sel_b, sel_a, sel_b].span()),
-        build_slot_kinds(4, SLOT_KIND_DETERMINISTIC),
-        [sel_a, sel_b, sel_a, sel_b].span(),
-        [0, 0, 0, 0].span(),
-        [0, 0, 0, 0].span(),
-        [].span(),
-        [].span(),
+    do_settle(
+        world_address, 1,
+        [
+            field_slot_entry(bob_slot_a, 500, model_selector, bob_eid, sel_a, 0),
+            field_slot_entry(bob_slot_b, 300, model_selector, bob_eid, sel_b, 0),
+            field_slot_entry(alice_slot_a, 50, model_selector, alice_eid, sel_a, 0),
+            field_slot_entry(alice_slot_b, 30, model_selector, alice_eid, sel_b, 0),
+        ].span(),
     );
-    snforge_std::stop_cheat_caller_address(world_address);
 
     let bob_result: Foo = world.read_model(bob);
     assert(bob_result.a == 500, 'bob.a = 500');
@@ -149,52 +163,26 @@ fn test_reshard_after_settlement_uses_new_values() {
     let entity_id = entity_id_from_keys(@bob);
     let slot_a = compute_dojo_field_slot(model_selector, entity_id, sel_a);
     let slot_b = compute_dojo_field_slot(model_selector, entity_id, sel_b);
-    let all_keys: Span<felt252> = [slot_a, slot_b].span();
-
-    let settlement = IShardingSettlementDispatcher { contract_address: world_address };
 
     // Shard 1: Set a=500, b=300.
     world.dispatcher.request_sharding([entity_id].span(), [].span());
-    snforge_std::start_cheat_caller_address(world_address, snforge_std::test_address());
-    settlement.settle(
-        1,
-        all_keys,
-        [500, 300].span(),
-        0,
-        0,
-        [model_selector, model_selector].span(),
-        [entity_id, entity_id].span(),
-        build_comp_keys([entity_id, entity_id].span(), [sel_a, sel_b].span()),
-        build_slot_kinds(2, SLOT_KIND_DETERMINISTIC),
-        [sel_a, sel_b].span(),
-        [0, 0].span(),
-        [0, 0].span(),
-        [].span(),
-        [].span(),
+    do_settle(
+        world_address, 1,
+        [
+            field_slot_entry(slot_a, 500, model_selector, entity_id, sel_a, 0),
+            field_slot_entry(slot_b, 300, model_selector, entity_id, sel_b, 0),
+        ].span(),
     );
-    snforge_std::stop_cheat_caller_address(world_address);
 
     // Shard 2: Add CRDT on slot_a (initial=500 from shard 1 result).
     world.dispatcher.request_sharding([entity_id].span(), [].span());
-    snforge_std::start_cheat_caller_address(world_address, snforge_std::test_address());
     // Shard sees initial=500, produces 600 → delta=100.
-    settlement.settle(
-        2,
-        [slot_a].span(),
-        [600].span(),
-        0,
-        0,
-        [model_selector].span(),
-        [entity_id].span(),
-        build_comp_keys([entity_id].span(), [sel_a].span()),
-        build_slot_kinds(1, SLOT_KIND_DETERMINISTIC),
-        [sel_a].span(),
-        [0].span(),
-        [500].span(),
-        [].span(),
-        [].span(),
+    do_settle(
+        world_address, 2,
+        [
+            field_slot_entry(slot_a, 600, model_selector, entity_id, sel_a, 500),
+        ].span(),
     );
-    snforge_std::stop_cheat_caller_address(world_address);
 
     // Expected: current(500) + (shard(600) - initial(500)) = 600.
     let result: Foo = world.read_model(bob);
@@ -220,25 +208,8 @@ fn test_settle_with_no_changes() {
 
     world.dispatcher.request_sharding([entity_id].span(), [].span());
 
-    let settlement = IShardingSettlementDispatcher { contract_address: world_address };
-    snforge_std::start_cheat_caller_address(world_address, snforge_std::test_address());
-    settlement.settle(
-        1,
-        [].span(),
-        [].span(),
-        0,
-        0,
-        [].span(),
-        [].span(),
-        [].span(),
-        [].span(),
-        [].span(),
-        [].span(),
-        [].span(),
-        [].span(),
-        [].span(),
-    );
-    snforge_std::stop_cheat_caller_address(world_address);
+    // Empty slots — nothing changed on shard.
+    do_settle(world_address, 1, [].span());
 
     let result: Foo = world.read_model(bob);
     assert(result.a == 100, 'no change: a=100');
