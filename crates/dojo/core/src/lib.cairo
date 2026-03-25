@@ -103,14 +103,12 @@ pub mod sharding {
     pub mod slot;
     pub use slot::{compute_dojo_field_slot, compute_dynamic_member_lock_slot};
 
-    pub mod crdt;
     pub mod interface;
     pub use interface::{
         IStorageCommitmentVerifier, IStorageCommitmentVerifierDispatcher,
         IStorageCommitmentVerifierDispatcherTrait,
     };
     pub mod component;
-    pub mod planner;
     pub mod request;
 }
 
