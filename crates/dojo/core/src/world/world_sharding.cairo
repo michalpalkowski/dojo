@@ -18,12 +18,12 @@ pub trait IShardingSettlement<T> {
         shard_id: felt252,
         changed_keys: Span<felt252>,
         changed_values: Span<felt252>,
-        state_diff_hash: felt252,
         global_state_root: felt252,
         end_block_number: u64,
         slot_model_selectors: Span<felt252>,
         slot_entity_ids: Span<felt252>,
         slot_computation_keys: Span<felt252>,
+        slot_kinds: Span<felt252>,
         slot_member_selectors: Span<felt252>,
         slot_packed_offsets: Span<u32>,
         slot_initial_values: Span<felt252>,
@@ -42,6 +42,9 @@ pub trait IShardingSettlement<T> {
 
     /// Return the request-time block number bound to this shard.
     fn get_shard_attestation_fork_block_number(self: @T, shard_id: felt252) -> u64;
+
+    /// Return the configured sharding proxy address (0 if unset).
+    fn get_sharding_proxy(self: @T) -> starknet::ContractAddress;
 
     /// Configure the sharding proxy address (event bus). One-shot.
     fn set_sharding_proxy(ref self: T, proxy: starknet::ContractAddress);
@@ -76,6 +79,7 @@ pub trait IShardingSettlementDev<T> {
         slot_model_selectors: Span<felt252>,
         slot_entity_ids: Span<felt252>,
         slot_computation_keys: Span<felt252>,
+        slot_kinds: Span<felt252>,
         slot_member_selectors: Span<felt252>,
         slot_packed_offsets: Span<u32>,
         slot_initial_values: Span<felt252>,

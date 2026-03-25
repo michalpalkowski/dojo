@@ -5,7 +5,6 @@
 /// the expected results. Tests cover: Foo (struct layout), Tile (multi-key),
 /// Score (packed layout), and Add CRDT delta merging.
 
-use core::poseidon::poseidon_hash_span;
 use dojo::model::{Model, ModelStorage, ModelStorageTest};
 use dojo::sharding::compute_dojo_field_slot;
 use dojo::sharding::slot::compute_dojo_packed_slot;
@@ -18,6 +17,8 @@ use starknet::ContractAddress;
 use crate::tests::helpers::{
     Foo, deploy_world_and_foo, Tile, deploy_world_with_tile, Score, deploy_world_with_score,
 };
+
+const SLOT_KIND_DETERMINISTIC: felt252 = 1;
 
 /// Make test_address() the world owner before deploying.
 fn cheat_world_owner() {
@@ -44,10 +45,9 @@ fn do_settle(
     slot_member_selectors: Span<felt252>,
     slot_initial_values: Span<felt252>,
 ) {
-    let state_diff_hash = poseidon_hash_span(changed_keys);
-
     // Build computation_keys and packed_offsets from metadata.
     let mut comp_keys: Array<felt252> = ArrayTrait::new();
+    let mut slot_kinds: Array<felt252> = ArrayTrait::new();
     let mut offsets: Array<u32> = ArrayTrait::new();
     let mut k: u32 = 0;
     while k < changed_keys.len() {
@@ -58,6 +58,7 @@ fn do_settle(
         } else {
             comp_keys.append(eid);
         };
+        slot_kinds.append(SLOT_KIND_DETERMINISTIC);
         offsets.append(0);
         k += 1;
     };
@@ -69,12 +70,12 @@ fn do_settle(
             shard_id,
             changed_keys,
             changed_values,
-            state_diff_hash,
             0,
             0,
             slot_model_selectors,
             slot_entity_ids,
             comp_keys.span(),
+            slot_kinds.span(),
             slot_member_selectors,
             offsets.span(),
             slot_initial_values,

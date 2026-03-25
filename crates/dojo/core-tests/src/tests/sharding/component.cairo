@@ -1,13 +1,16 @@
-use core::poseidon::poseidon_hash_span;
 use dojo::model::{Model, ModelStorage, ModelStorageTest};
 use dojo::sharding::compute_dojo_field_slot;
+use dojo::sharding::slot::compute_dojo_packed_slot;
 use dojo::utils::{entity_id_from_keys, combine_key};
 use dojo::world::{
     IShardingSettlementDispatcher, IShardingSettlementDispatcherTrait, IWorldDispatcherTrait,
 };
 use starknet::ContractAddress;
 
-use crate::tests::helpers::{Foo, deploy_world_and_foo};
+use crate::tests::helpers::{Foo, PackedPair, deploy_world_and_foo, deploy_world_with_packed_pair};
+
+const SLOT_KIND_DETERMINISTIC: felt252 = 1;
+const SLOT_KIND_DYNAMIC_LOCK: felt252 = 2;
 
 /// Build computation_keys span from entity_ids and member_selectors.
 /// For struct fields (member != 0): comp_key = combine_key(entity, member).
@@ -26,6 +29,16 @@ fn build_comp_keys(entity_ids: Span<felt252>, member_selectors: Span<felt252>) -
         i += 1;
     };
     keys.span()
+}
+
+fn build_slot_kinds(count: u32, kind: felt252) -> Span<felt252> {
+    let mut kinds: Array<felt252> = ArrayTrait::new();
+    let mut i: u32 = 0;
+    while i < count {
+        kinds.append(kind);
+        i += 1;
+    };
+    kinds.span()
 }
 
 /// `felt252` max value (`FIELD_PRIME - 1`).
@@ -76,7 +89,6 @@ fn settle_as_owner(
     slot_member_selectors: Span<felt252>,
     slot_initial_values: Span<felt252>,
 ) {
-    let state_diff_hash = poseidon_hash_span(changed_keys);
     let comp_keys = build_comp_keys(slot_entity_ids, slot_member_selectors);
     let mut offsets: Array<u32> = ArrayTrait::new();
     let mut k: u32 = 0;
@@ -92,12 +104,12 @@ fn settle_as_owner(
             shard_id,
             changed_keys,
             changed_values,
-            state_diff_hash,
             0,
             0,
             slot_model_selectors,
             slot_entity_ids,
             comp_keys,
+            build_slot_kinds(changed_keys.len(), SLOT_KIND_DETERMINISTIC),
             slot_member_selectors,
             offsets.span(),
             slot_initial_values,
@@ -319,30 +331,11 @@ fn test_settle_rejects_unauthorized_caller() {
     let not_owner: ContractAddress = 0xdead.try_into().unwrap();
     let settlement = IShardingSettlementDispatcher { contract_address: world_address };
     let changed_keys = [slot_a, slot_b].span();
-    let state_diff_hash = poseidon_hash_span(changed_keys);
     snforge_std::start_cheat_caller_address(world_address, not_owner);
     settlement
         .settle(
-            1, changed_keys, [999, 777].span(), state_diff_hash, 0, 0,
-            [].span(), [].span(), [].span(), [].span(), [].span(), [].span(),
-            [].span(), [].span(),
-        );
-}
-
-#[test]
-#[should_panic(expected: ('Shard: state diff mismatch',))]
-fn test_settle_rejects_state_diff_mismatch() {
-    let (world, world_address, entity_id, slot_a, slot_b, _) = setup_foo_shard();
-    world.dispatcher.request_sharding([entity_id].span(), [].span());
-
-    // Settle as world owner with wrong state_diff_hash.
-    let settlement = IShardingSettlementDispatcher { contract_address: world_address };
-    let changed_keys = [slot_a, slot_b].span();
-    snforge_std::start_cheat_caller_address(world_address, snforge_std::test_address());
-    settlement
-        .settle(
-            1, changed_keys, [999, 777].span(), 0xdead, 0, 0,
-            [].span(), [].span(), [].span(), [].span(), [].span(), [].span(),
+            1, changed_keys, [999, 777].span(), 0, 0,
+            [].span(), [].span(), [].span(), [].span(), [].span(), [].span(), [].span(),
             [].span(), [].span(),
         );
 }
@@ -355,13 +348,12 @@ fn test_settle_rejects_keys_values_length_mismatch() {
 
     // 2 changed keys but only 1 value.
     let changed_keys = [slot_a, slot_b].span();
-    let state_diff_hash = poseidon_hash_span(changed_keys);
     let settlement = IShardingSettlementDispatcher { contract_address: world_address };
     snforge_std::start_cheat_caller_address(world_address, snforge_std::test_address());
     settlement
         .settle(
-            1, changed_keys, [999].span(), state_diff_hash, 0, 0,
-            [].span(), [].span(), [].span(), [].span(), [].span(), [].span(),
+            1, changed_keys, [999].span(), 0, 0,
+            [].span(), [].span(), [].span(), [].span(), [].span(), [].span(), [].span(),
             [].span(), [].span(),
         );
 }
@@ -617,7 +609,6 @@ fn test_settle_rejects_wrong_model_selector() {
 
     let (sel_a, sel_b) = foo_field_selectors();
     let changed_keys = [slot_a, slot_b].span();
-    let state_diff_hash = poseidon_hash_span(changed_keys);
     let comp_keys = build_comp_keys([entity_id, entity_id].span(), [sel_a, sel_b].span());
 
     let settlement = IShardingSettlementDispatcher { contract_address: world_address };
@@ -625,9 +616,10 @@ fn test_settle_rejects_wrong_model_selector() {
     // Pass wrong model_selector (0xdead) for first slot — hash won't match slot_a.
     settlement
         .settle(
-            1, changed_keys, [999, 777].span(), state_diff_hash, 0, 0,
+            1, changed_keys, [999, 777].span(), 0, 0,
             [0xdead, model_selector].span(), [entity_id, entity_id].span(),
-            comp_keys, [sel_a, sel_b].span(), [0, 0].span(), [0, 0].span(),
+            comp_keys, build_slot_kinds(2, SLOT_KIND_DETERMINISTIC), [sel_a, sel_b].span(),
+            [0, 0].span(), [0, 0].span(),
             [].span(), [].span(),
         );
 }
@@ -644,7 +636,6 @@ fn test_settle_rejects_unlocked_entity() {
     let other_slot = dojo::sharding::compute_dojo_field_slot(model_selector, other_entity, sel_a);
 
     let changed_keys = [other_slot].span();
-    let state_diff_hash = poseidon_hash_span(changed_keys);
     let comp_keys = build_comp_keys([other_entity].span(), [sel_a].span());
 
     let settlement = IShardingSettlementDispatcher { contract_address: world_address };
@@ -652,9 +643,10 @@ fn test_settle_rejects_unlocked_entity() {
     // Try to settle slot belonging to unlocked entity.
     settlement
         .settle(
-            1, changed_keys, [42].span(), state_diff_hash, 0, 0,
+            1, changed_keys, [42].span(), 0, 0,
             [model_selector].span(), [other_entity].span(),
-            comp_keys, [sel_a].span(), [0].span(), [0].span(),
+            comp_keys, build_slot_kinds(1, SLOT_KIND_DETERMINISTIC), [sel_a].span(),
+            [0].span(), [0].span(),
             [].span(), [].span(),
         );
 }
@@ -667,17 +659,82 @@ fn test_settle_rejects_metadata_length_mismatch() {
 
     let (sel_a, _sel_b) = foo_field_selectors();
     let changed_keys = [slot_a, slot_b].span();
-    let state_diff_hash = poseidon_hash_span(changed_keys);
 
     let settlement = IShardingSettlementDispatcher { contract_address: world_address };
     snforge_std::start_cheat_caller_address(world_address, snforge_std::test_address());
     // 2 changed slots but only 1 metadata entry.
     settlement
         .settle(
-            1, changed_keys, [999, 777].span(), state_diff_hash, 0, 0,
+            1, changed_keys, [999, 777].span(), 0, 0,
             [model_selector].span(), [entity_id].span(),
             build_comp_keys([entity_id].span(), [sel_a].span()),
-            [sel_a].span(), [0].span(), [0].span(),
+            build_slot_kinds(1, SLOT_KIND_DETERMINISTIC), [sel_a].span(), [0].span(), [0].span(),
             [].span(), [].span(),
+        );
+}
+
+#[test]
+#[should_panic(expected: ('Shard: bad det slot',))]
+fn test_settle_rejects_zero_comp_key_for_deterministic_slot() {
+    let (world, world_address, entity_id, slot_a, _slot_b, model_selector) = setup_foo_shard();
+    world.dispatcher.request_sharding([entity_id].span(), [].span());
+
+    let (sel_a, _sel_b) = foo_field_selectors();
+    let settlement = IShardingSettlementDispatcher { contract_address: world_address };
+    snforge_std::start_cheat_caller_address(world_address, snforge_std::test_address());
+    settlement
+        .settle(
+            1,
+            [slot_a].span(),
+            [42].span(),
+            0,
+            0,
+            [model_selector].span(),
+            [entity_id].span(),
+            [0].span(),
+            build_slot_kinds(1, SLOT_KIND_DETERMINISTIC),
+            [sel_a].span(),
+            [0].span(),
+            [0].span(),
+            [].span(),
+            [].span(),
+        );
+}
+
+#[test]
+#[should_panic(expected: ('Shard: entity not in shard',))]
+fn test_settle_rejects_packed_offset_bypass_for_unlocked_entity() {
+    snforge_std::start_cheat_account_contract_address_global(snforge_std::test_address());
+    let (mut world, model_selector) = deploy_world_with_packed_pair();
+    let world_address = world.dispatcher.contract_address;
+
+    let bob: ContractAddress = 0xb0b.try_into().unwrap();
+    let alice: ContractAddress = 0xa11ce.try_into().unwrap();
+    world.write_model_test(@PackedPair { player: bob, left: 10, right: 20 });
+    world.write_model_test(@PackedPair { player: alice, left: 30, right: 40 });
+
+    let bob_eid = entity_id_from_keys(@bob);
+    let alice_eid = entity_id_from_keys(@alice);
+    world.dispatcher.request_sharding([bob_eid].span(), [].span());
+
+    let forged_key = compute_dojo_packed_slot(model_selector, alice_eid) + 1;
+    let settlement = IShardingSettlementDispatcher { contract_address: world_address };
+    snforge_std::start_cheat_caller_address(world_address, snforge_std::test_address());
+    settlement
+        .settle(
+            1,
+            [forged_key].span(),
+            [999].span(),
+            0,
+            0,
+            [model_selector].span(),
+            [alice_eid].span(),
+            [alice_eid].span(),
+            build_slot_kinds(1, SLOT_KIND_DETERMINISTIC),
+            [0].span(),
+            [1].span(),
+            [0].span(),
+            [].span(),
+            [].span(),
         );
 }

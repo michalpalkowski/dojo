@@ -53,12 +53,12 @@ pub trait IContractComponent<TContractState> {
         shard_id: felt252,
         changed_keys: Span<felt252>,
         changed_values: Span<felt252>,
-        state_diff_hash: felt252,
         global_state_root: felt252,
         end_block_number: u64,
         slot_model_selectors: Span<felt252>,
         slot_entity_ids: Span<felt252>,
         slot_computation_keys: Span<felt252>,
+        slot_kinds: Span<felt252>,
         slot_member_selectors: Span<felt252>,
         slot_packed_offsets: Span<u32>,
         slot_initial_values: Span<felt252>,
@@ -84,6 +84,7 @@ pub trait IContractComponent<TContractState> {
         slot_model_selectors: Span<felt252>,
         slot_entity_ids: Span<felt252>,
         slot_computation_keys: Span<felt252>,
+        slot_kinds: Span<felt252>,
         slot_member_selectors: Span<felt252>,
         slot_packed_offsets: Span<u32>,
         slot_initial_values: Span<felt252>,
@@ -102,6 +103,7 @@ pub mod sharding_component {
     use dojo::sharding::interface::{
         IStorageCommitmentVerifierDispatcher, IStorageCommitmentVerifierDispatcherTrait,
     };
+    use dojo::sharding::slot::compute_dynamic_member_lock_slot;
     use dojo::storage::database::DOJO_STORAGE;
     use super::{IShardingProxyDispatcher, IShardingProxyDispatcherTrait};
 
@@ -199,10 +201,12 @@ pub mod sharding_component {
         }
     }
 
+    const SLOT_KIND_DETERMINISTIC: felt252 = 1;
+    const SLOT_KIND_DYNAMIC_LOCK: felt252 = 2;
+
     pub mod Errors {
         pub const ENTITY_ALREADY_SHARDED: felt252 = 'Shard: entity already sharded';
         pub const SHARD_NOT_FOUND: felt252 = 'Shard: not found';
-        pub const STATE_DIFF_MISMATCH: felt252 = 'Shard: state diff mismatch';
         pub const CHANGED_KEYS_VALUES_LEN: felt252 = 'Shard: keys/values len';
         pub const ADD_DELTA_UNDERFLOW: felt252 = 'Shard: add delta underflow';
         pub const ARITHMETIC_OVERFLOW: felt252 = 'Shard: arithmetic overflow';
@@ -218,6 +222,9 @@ pub mod sharding_component {
         pub const ENTITY_NOT_IN_SHARD: felt252 = 'Shard: entity not in shard';
         pub const METADATA_LEN_MISMATCH: felt252 = 'Shard: metadata len mismatch';
         pub const ENTITY_KEYS_MALFORMED: felt252 = 'Shard: entity_keys malformed';
+        pub const INVALID_SLOT_KIND: felt252 = 'Shard: invalid slot kind';
+        pub const INVALID_DETERMINISTIC_SLOT_METADATA: felt252 = 'Shard: bad det slot';
+        pub const INVALID_LOCK_SLOT_METADATA: felt252 = 'Shard: bad lock slot';
     }
 
     #[embeddable_as(ContractComponentImpl)]
@@ -322,20 +329,20 @@ pub mod sharding_component {
             shard_id: felt252,
             changed_keys: Span<felt252>,
             changed_values: Span<felt252>,
-            state_diff_hash: felt252,
             global_state_root: felt252,
             end_block_number: u64,
             slot_model_selectors: Span<felt252>,
             slot_entity_ids: Span<felt252>,
             slot_computation_keys: Span<felt252>,
+            slot_kinds: Span<felt252>,
             slot_member_selectors: Span<felt252>,
             slot_packed_offsets: Span<u32>,
             slot_initial_values: Span<felt252>,
         ) {
             assert(shard_id != 0, 'Shard: invalid shard id');
 
-            // Verify shard is active and state diff hash matches changed keys.
-            self.verify_shard_and_diff(shard_id, changed_keys, state_diff_hash);
+            // Verify shard is active (commitment registered).
+            self.verify_shard_active(shard_id);
 
             // StorageCommitment verification: only when registry is configured.
             // Production deployments MUST set the registry; tests may skip.
@@ -379,6 +386,7 @@ pub mod sharding_component {
                     slot_model_selectors,
                     slot_entity_ids,
                     slot_computation_keys,
+                    slot_kinds,
                     slot_member_selectors,
                     slot_packed_offsets,
                     slot_initial_values,
@@ -408,6 +416,8 @@ pub mod sharding_component {
         }
 
         fn end_shard(ref self: ComponentState<TContractState>, shard_id: felt252) {
+            assert(self.shard_entity_count.read(shard_id) != 0, Errors::SHARD_NOT_FOUND);
+
             self.emit(ShardFinished { shard_id });
 
             // Forward to proxy so the operator (watching proxy) sees ShardFinished.
@@ -483,15 +493,15 @@ pub mod sharding_component {
             slot_model_selectors: Span<felt252>,
             slot_entity_ids: Span<felt252>,
             slot_computation_keys: Span<felt252>,
+            slot_kinds: Span<felt252>,
             slot_member_selectors: Span<felt252>,
             slot_packed_offsets: Span<u32>,
             slot_initial_values: Span<felt252>,
         ) {
             assert(shard_id != 0, 'Shard: invalid shard id');
 
-            // Dev mode: compute state_diff_hash locally from changed_keys.
-            let state_diff_hash = poseidon_hash_span(changed_keys);
-            self.verify_shard_and_diff(shard_id, changed_keys, state_diff_hash);
+            // Verify shard is active (commitment registered).
+            self.verify_shard_active(shard_id);
 
             self
                 .apply_settle(
@@ -501,6 +511,7 @@ pub mod sharding_component {
                     slot_model_selectors,
                     slot_entity_ids,
                     slot_computation_keys,
+                    slot_kinds,
                     slot_member_selectors,
                     slot_packed_offsets,
                     slot_initial_values,
@@ -558,6 +569,10 @@ pub mod sharding_component {
             self.shard_fork_block_number.read(shard_id)
         }
 
+        fn get_sharding_proxy(self: @ComponentState<TContractState>) -> ContractAddress {
+            self.sharding_proxy.read()
+        }
+
         fn shard_entities_list(
             self: @ComponentState<TContractState>, shard_id: felt252,
         ) -> Array<felt252> {
@@ -571,22 +586,14 @@ pub mod sharding_component {
             entities
         }
 
-        /// Verify shard is active and state diff hash matches changed keys.
-        fn verify_shard_and_diff(
+        /// Verify shard is active (commitment was registered in request_shard).
+        fn verify_shard_active(
             self: @ComponentState<TContractState>,
             shard_id: felt252,
-            changed_keys: Span<felt252>,
-            state_diff_hash: felt252,
         ) {
             // Commitment was set atomically in request_shard. Non-zero proves shard exists.
             let stored_commitment = self.shard_commitment.read(shard_id);
             assert(stored_commitment != 0, Errors::SHARD_NOT_FOUND);
-
-            // Verify state_diff_hash = H(changed_keys).
-            // This binds the changed keys to the TEE attestation (production)
-            // or is locally recomputed (dev mode).
-            let computed_diff = poseidon_hash_span(changed_keys);
-            assert(computed_diff == state_diff_hash, Errors::STATE_DIFF_MISMATCH);
         }
 
         /// Shared apply logic for settle() and settle_dev():
@@ -602,6 +609,7 @@ pub mod sharding_component {
             slot_model_selectors: Span<felt252>,
             slot_entity_ids: Span<felt252>,
             slot_computation_keys: Span<felt252>,
+            slot_kinds: Span<felt252>,
             slot_member_selectors: Span<felt252>,
             slot_packed_offsets: Span<u32>,
             slot_initial_values: Span<felt252>,
@@ -611,6 +619,7 @@ pub mod sharding_component {
             assert(slot_model_selectors.len() == changes_len, Errors::METADATA_LEN_MISMATCH);
             assert(slot_entity_ids.len() == changes_len, Errors::METADATA_LEN_MISMATCH);
             assert(slot_computation_keys.len() == changes_len, Errors::METADATA_LEN_MISMATCH);
+            assert(slot_kinds.len() == changes_len, Errors::METADATA_LEN_MISMATCH);
             assert(slot_member_selectors.len() == changes_len, Errors::METADATA_LEN_MISMATCH);
             assert(slot_packed_offsets.len() == changes_len, Errors::METADATA_LEN_MISMATCH);
             assert(slot_initial_values.len() == changes_len, Errors::METADATA_LEN_MISMATCH);
@@ -622,19 +631,35 @@ pub mod sharding_component {
                 let model_sel = *slot_model_selectors[i];
                 let entity_id = *slot_entity_ids[i];
                 let comp_key = *slot_computation_keys[i];
+                let slot_kind = *slot_kinds[i];
                 let member_sel = *slot_member_selectors[i];
                 let offset: felt252 = (*slot_packed_offsets[i]).into();
                 let initial_value = *slot_initial_values[i];
 
                 // ── SLOT OWNERSHIP VERIFICATION ──
-                // Generic verification via computation_key: works for ALL layout
-                // types (Fixed, Struct, Enum, Tuple, FixedArray, any nesting depth).
-                // comp_key == 0 → lock slot (skip Poseidon verify, entity_lock sufficient).
-                if comp_key != 0 {
+                if slot_kind == SLOT_KIND_DETERMINISTIC {
+                    assert(comp_key != 0, Errors::INVALID_DETERMINISTIC_SLOT_METADATA);
                     let expected_key = poseidon_hash_span(
                         [DOJO_STORAGE, model_sel, comp_key].span(),
                     ) + offset;
                     assert(expected_key == key, Errors::SLOT_OWNERSHIP_MISMATCH);
+                    assert(
+                        self.entity_lock.read(entity_id) == shard_id,
+                        Errors::ENTITY_NOT_IN_SHARD,
+                    );
+                } else if slot_kind == SLOT_KIND_DYNAMIC_LOCK {
+                    assert(comp_key == 0, Errors::INVALID_LOCK_SLOT_METADATA);
+                    assert(offset == 0, Errors::INVALID_LOCK_SLOT_METADATA);
+                    let expected_key = compute_dynamic_member_lock_slot(
+                        model_sel, entity_id, member_sel,
+                    );
+                    assert(expected_key == key, Errors::SLOT_OWNERSHIP_MISMATCH);
+                    assert(
+                        self.entity_lock.read(entity_id) == shard_id,
+                        Errors::ENTITY_NOT_IN_SHARD,
+                    );
+                } else {
+                    assert(false, Errors::INVALID_SLOT_KIND);
                 }
 
                 // Derive Add CRDT flag from on-chain CRDT policies.
@@ -642,17 +667,6 @@ pub mod sharding_component {
                 let default_crdt = self.model_policy_default.read(model_sel);
                 let effective_crdt = if field_crdt != 0 { field_crdt } else { default_crdt };
                 let is_add = (effective_crdt == 2); // 2 = Add encoded
-
-                // Entity lock enforcement:
-                // - Add CRDT slots: exempt (delta merge is safe without exclusive lock)
-                // - Packed offset > 0: exempt (base slot at offset 0 already verified)
-                // - Set CRDT slots at offset 0: MUST belong to a locked entity
-                if !is_add && offset == 0 {
-                    assert(
-                        self.entity_lock.read(entity_id) == shard_id,
-                        Errors::ENTITY_NOT_IN_SHARD,
-                    );
-                }
 
                 // ── CRDT WRITE ──
                 let storage_address: StorageAddress = key.try_into().unwrap();

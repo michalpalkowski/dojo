@@ -1,9 +1,8 @@
-/// Integration tests for the sharding request → register → settle pipeline.
+/// Integration tests for the sharding request → settle pipeline.
 ///
 /// These tests exercise the full lifecycle across different scenarios:
 /// multi-entity shards, re-sharding after settlement, and cancellation.
 
-use core::poseidon::poseidon_hash_span;
 use dojo::model::{Model, ModelStorage, ModelStorageTest};
 use dojo::sharding::compute_dojo_field_slot;
 use dojo::utils::{entity_id_from_keys, combine_key};
@@ -13,6 +12,8 @@ use dojo::world::{
 use starknet::ContractAddress;
 
 use crate::tests::helpers::{Foo, deploy_world_and_foo};
+
+const SLOT_KIND_DETERMINISTIC: felt252 = 1;
 
 fn build_comp_keys(entity_ids: Span<felt252>, member_selectors: Span<felt252>) -> Span<felt252> {
     let mut keys: Array<felt252> = ArrayTrait::new();
@@ -25,6 +26,16 @@ fn build_comp_keys(entity_ids: Span<felt252>, member_selectors: Span<felt252>) -
         i += 1;
     };
     keys.span()
+}
+
+fn build_slot_kinds(count: u32, kind: felt252) -> Span<felt252> {
+    let mut kinds: Array<felt252> = ArrayTrait::new();
+    let mut i: u32 = 0;
+    while i < count {
+        kinds.append(kind);
+        i += 1;
+    };
+    kinds.span()
 }
 
 fn cheat_world_owner() {
@@ -59,7 +70,7 @@ fn test_multi_entity_shard_settles_both() {
     let alice_eid = entity_id_from_keys(@alice);
 
     // Lock both entities in one shard.
-    world.dispatcher.request_sharding([bob_eid, alice_eid].span());
+    world.dispatcher.request_sharding([bob_eid, alice_eid].span(), [].span());
 
     let bob_slot_a = compute_dojo_field_slot(model_selector, bob_eid, sel_a);
     let bob_slot_b = compute_dojo_field_slot(model_selector, bob_eid, sel_b);
@@ -67,19 +78,20 @@ fn test_multi_entity_shard_settles_both() {
     let alice_slot_b = compute_dojo_field_slot(model_selector, alice_eid, sel_b);
 
     let all_keys: Span<felt252> = [bob_slot_a, bob_slot_b, alice_slot_a, alice_slot_b].span();
-    let commitment = poseidon_hash_span(all_keys);
-    let state_diff_hash = poseidon_hash_span(all_keys);
-
     let settlement = IShardingSettlementDispatcher { contract_address: world_address };
     snforge_std::start_cheat_caller_address(world_address, snforge_std::test_address());
-    settlement.register_commitment(1, commitment, 4, [].span(), [].span());
     settlement.settle(
-        1, all_keys, [0, 1, 2, 3].span(), [500, 300, 50, 30].span(), state_diff_hash, 0, 0,
+        1, all_keys, [500, 300, 50, 30].span(), 0, 0,
         [model_selector, model_selector, model_selector, model_selector].span(),
         [bob_eid, bob_eid, alice_eid, alice_eid].span(),
         build_comp_keys([bob_eid, bob_eid, alice_eid, alice_eid].span(), [sel_a, sel_b, sel_a, sel_b].span()),
+        build_slot_kinds(4, SLOT_KIND_DETERMINISTIC),
         [sel_a, sel_b, sel_a, sel_b].span(),
-        [0, 0, 0, 0].span());
+        [0, 0, 0, 0].span(),
+        [0, 0, 0, 0].span(),
+        [].span(),
+        [].span(),
+    );
     snforge_std::stop_cheat_caller_address(world_address);
 
     let bob_result: Foo = world.read_model(bob);
@@ -105,7 +117,7 @@ fn test_multi_entity_cancel_unlocks_all() {
     let bob_eid = entity_id_from_keys(@bob);
     let alice_eid = entity_id_from_keys(@alice);
 
-    world.dispatcher.request_sharding([bob_eid, alice_eid].span());
+    world.dispatcher.request_sharding([bob_eid, alice_eid].span(), [].span());
 
     let settlement = IShardingSettlementDispatcher { contract_address: world_address };
     snforge_std::start_cheat_caller_address(world_address, snforge_std::test_address());
@@ -113,7 +125,7 @@ fn test_multi_entity_cancel_unlocks_all() {
     snforge_std::stop_cheat_caller_address(world_address);
 
     // Both entities should be unlocked — can shard again.
-    world.dispatcher.request_sharding([bob_eid, alice_eid].span());
+    world.dispatcher.request_sharding([bob_eid, alice_eid].span(), [].span());
 
     // Values unchanged.
     let bob_result: Foo = world.read_model(bob);
@@ -138,27 +150,50 @@ fn test_reshard_after_settlement_uses_new_values() {
     let slot_a = compute_dojo_field_slot(model_selector, entity_id, sel_a);
     let slot_b = compute_dojo_field_slot(model_selector, entity_id, sel_b);
     let all_keys: Span<felt252> = [slot_a, slot_b].span();
-    let commitment = poseidon_hash_span(all_keys);
-    let state_diff_hash = poseidon_hash_span(all_keys);
 
     let settlement = IShardingSettlementDispatcher { contract_address: world_address };
 
     // Shard 1: Set a=500, b=300.
-    world.dispatcher.request_sharding([entity_id].span());
+    world.dispatcher.request_sharding([entity_id].span(), [].span());
     snforge_std::start_cheat_caller_address(world_address, snforge_std::test_address());
-    settlement.register_commitment(1, commitment, 2, [].span(), [].span());
-    settlement.settle(1, all_keys, [0, 1].span(), [500, 300].span(), state_diff_hash, 0, 0,
-        [model_selector, model_selector].span(), [entity_id, entity_id].span(), build_comp_keys([entity_id, entity_id].span(), [sel_a, sel_b].span()), [sel_a, sel_b].span(), [0, 0].span());
+    settlement.settle(
+        1,
+        all_keys,
+        [500, 300].span(),
+        0,
+        0,
+        [model_selector, model_selector].span(),
+        [entity_id, entity_id].span(),
+        build_comp_keys([entity_id, entity_id].span(), [sel_a, sel_b].span()),
+        build_slot_kinds(2, SLOT_KIND_DETERMINISTIC),
+        [sel_a, sel_b].span(),
+        [0, 0].span(),
+        [0, 0].span(),
+        [].span(),
+        [].span(),
+    );
     snforge_std::stop_cheat_caller_address(world_address);
 
     // Shard 2: Add CRDT on slot_a (initial=500 from shard 1 result).
-    world.dispatcher.request_sharding([entity_id].span());
+    world.dispatcher.request_sharding([entity_id].span(), [].span());
     snforge_std::start_cheat_caller_address(world_address, snforge_std::test_address());
-    settlement.register_commitment(2, commitment, 2, [slot_a].span(), [500].span());
     // Shard sees initial=500, produces 600 → delta=100.
-    let diff_hash_a = poseidon_hash_span([slot_a].span());
-    settlement.settle(2, all_keys, [0].span(), [600].span(), diff_hash_a, 0, 0,
-        [model_selector].span(), [entity_id].span(), build_comp_keys([entity_id].span(), [sel_a].span()), [sel_a].span(), [0].span());
+    settlement.settle(
+        2,
+        [slot_a].span(),
+        [600].span(),
+        0,
+        0,
+        [model_selector].span(),
+        [entity_id].span(),
+        build_comp_keys([entity_id].span(), [sel_a].span()),
+        build_slot_kinds(1, SLOT_KIND_DETERMINISTIC),
+        [sel_a].span(),
+        [0].span(),
+        [500].span(),
+        [].span(),
+        [].span(),
+    );
     snforge_std::stop_cheat_caller_address(world_address);
 
     // Expected: current(500) + (shard(600) - initial(500)) = 600.
@@ -183,17 +218,26 @@ fn test_settle_with_no_changes() {
     let slot_a = compute_dojo_field_slot(model_selector, entity_id, sel_a);
     let slot_b = compute_dojo_field_slot(model_selector, entity_id, sel_b);
 
-    world.dispatcher.request_sharding([entity_id].span());
-    let all_keys: Span<felt252> = [slot_a, slot_b].span();
-    let commitment = poseidon_hash_span(all_keys);
-    // Empty changed_indices — nothing changed on shard.
-    let empty_diff_hash = poseidon_hash_span([].span());
+    world.dispatcher.request_sharding([entity_id].span(), [].span());
 
     let settlement = IShardingSettlementDispatcher { contract_address: world_address };
     snforge_std::start_cheat_caller_address(world_address, snforge_std::test_address());
-    settlement.register_commitment(1, commitment, 2, [].span(), [].span());
-    settlement.settle(1, all_keys, [].span(), [].span(), empty_diff_hash, 0, 0,
-        [].span(), [].span(), [].span(), [].span(), [].span());
+    settlement.settle(
+        1,
+        [].span(),
+        [].span(),
+        0,
+        0,
+        [].span(),
+        [].span(),
+        [].span(),
+        [].span(),
+        [].span(),
+        [].span(),
+        [].span(),
+        [].span(),
+        [].span(),
+    );
     snforge_std::stop_cheat_caller_address(world_address);
 
     let result: Foo = world.read_model(bob);
@@ -201,10 +245,10 @@ fn test_settle_with_no_changes() {
     assert(result.b == 200, 'no change: b=200');
 }
 
-// ── Cancel After Commitment ─────────────────────────────────────────────
+// ── Cancel After Request ────────────────────────────────────────────────
 
 #[test]
-fn test_cancel_after_commitment_registered() {
+fn test_cancel_after_request_unlocks_entity() {
     cheat_world_owner();
     let (mut world, model_selector) = deploy_world_and_foo();
     let world_address = world.dispatcher.contract_address;
@@ -217,14 +261,11 @@ fn test_cancel_after_commitment_registered() {
     let slot_a = compute_dojo_field_slot(model_selector, entity_id, sel_a);
     let slot_b = compute_dojo_field_slot(model_selector, entity_id, sel_b);
 
-    world.dispatcher.request_sharding([entity_id].span());
-    let all_keys: Span<felt252> = [slot_a, slot_b].span();
-    let commitment = poseidon_hash_span(all_keys);
+    world.dispatcher.request_sharding([entity_id].span(), [].span());
 
     let settlement = IShardingSettlementDispatcher { contract_address: world_address };
     snforge_std::start_cheat_caller_address(world_address, snforge_std::test_address());
-    settlement.register_commitment(1, commitment, 2, [slot_a].span(), [100].span());
-    // Cancel instead of settling — should clean up commitment + add state.
+    // Cancel instead of settling — should clean up shard state.
     settlement.cancel_shard(1);
     snforge_std::stop_cheat_caller_address(world_address);
 
@@ -233,5 +274,5 @@ fn test_cancel_after_commitment_registered() {
     assert(result.b == 200, 'cancel: b unchanged');
 
     // Entity unlocked — can re-shard.
-    world.dispatcher.request_sharding([entity_id].span());
+    world.dispatcher.request_sharding([entity_id].span(), [].span());
 }

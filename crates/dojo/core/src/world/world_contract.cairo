@@ -1221,12 +1221,12 @@ pub mod world {
             shard_id: felt252,
             changed_keys: Span<felt252>,
             changed_values: Span<felt252>,
-            state_diff_hash: felt252,
             global_state_root: felt252,
             end_block_number: u64,
             slot_model_selectors: Span<felt252>,
             slot_entity_ids: Span<felt252>,
             slot_computation_keys: Span<felt252>,
+            slot_kinds: Span<felt252>,
             slot_member_selectors: Span<felt252>,
             slot_packed_offsets: Span<u32>,
             slot_initial_values: Span<felt252>,
@@ -1240,12 +1240,12 @@ pub mod world {
                     shard_id,
                     changed_keys,
                     changed_values,
-                    state_diff_hash,
                     global_state_root,
                     end_block_number,
                     slot_model_selectors,
                     slot_entity_ids,
                     slot_computation_keys,
+                    slot_kinds,
                     slot_member_selectors,
                     slot_packed_offsets,
                     slot_initial_values,
@@ -1280,6 +1280,10 @@ pub mod world {
             self.sharding.shard_attestation_fork_block_number(shard_id)
         }
 
+        fn get_sharding_proxy(self: @ContractState) -> starknet::ContractAddress {
+            self.sharding.get_sharding_proxy()
+        }
+
         fn set_sharding_proxy(ref self: ContractState, proxy: starknet::ContractAddress) {
             assert(self.is_caller_world_owner(), sharding_cpt::Errors::UNAUTHORIZED_CALLER);
             self.sharding.set_sharding_proxy(proxy);
@@ -1311,6 +1315,7 @@ pub mod world {
             slot_model_selectors: Span<felt252>,
             slot_entity_ids: Span<felt252>,
             slot_computation_keys: Span<felt252>,
+            slot_kinds: Span<felt252>,
             slot_member_selectors: Span<felt252>,
             slot_packed_offsets: Span<u32>,
             slot_initial_values: Span<felt252>,
@@ -1328,6 +1333,7 @@ pub mod world {
                     slot_model_selectors,
                     slot_entity_ids,
                     slot_computation_keys,
+                    slot_kinds,
                     slot_member_selectors,
                     slot_packed_offsets,
                     slot_initial_values,
