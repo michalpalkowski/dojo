@@ -1235,7 +1235,7 @@ pub mod world {
         fn cancel_shard(ref self: ContractState, shard_id: felt252) {
             // Only the shard creator or world owner may cancel.
             let caller = starknet::get_caller_address();
-            let creator = self.sharding.shard_creator.read(shard_id);
+            let creator = self.sharding.get_shard_creator(shard_id);
             assert(
                 caller == creator || self.is_caller_world_owner(),
                 sharding_cpt::Errors::UNAUTHORIZED_CALLER,

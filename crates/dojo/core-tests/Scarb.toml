@@ -7,7 +7,7 @@ edition = "2024_07"
 [dependencies]
 starknet = "2.13"
 
-dojo = { path = "../core" }
+dojo = { path = "../core", features = ["dev"] }
 dojo_cairo_macros = { path = "../macros" }
 dojo_snf_test = { path = "../dojo-snf-test" }
 

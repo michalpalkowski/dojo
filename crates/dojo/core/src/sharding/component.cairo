@@ -12,9 +12,6 @@ pub trait IShardingProxy<T> {
 pub trait IContractComponent<TContractState> {
     /// Lock entities and allocate shard. Returns shard_id.
     ///
-    /// Commitment is computed atomically as `H(sorted(entities))` and stored
-    /// on-chain — no separate registration step needed.
-    ///
     /// `entities` must contain **Dojo entity_ids** (= `Poseidon(serialized_keys)`),
     /// NOT raw model keys. The world contract's write-protection computes
     /// `entity_id_from_serialized_keys(keys)` before checking `entity_lock`,
@@ -231,11 +228,6 @@ pub mod sharding_component {
                 assert(parsed_count == entities.len(), Errors::ENTITY_KEYS_MALFORMED);
             }
 
-            for entity_id in entities {
-                let entity_id = *entity_id;
-                assert(self.entity_lock.read(entity_id) == 0, Errors::ENTITY_ALREADY_SHARDED);
-            };
-
             let shard_id = self.next_shard_id.read() + 1;
             self.next_shard_id.write(shard_id);
             let fork_block_number = get_execution_info().block_info.block_number;
@@ -247,45 +239,20 @@ pub mod sharding_component {
             self.active_shard_list.write(active_idx, shard_id);
             self.active_shard_count.write(active_idx + 1);
 
+            // Single pass: validate unlocked + lock + record entity.
             let entity_count: u32 = entities.len();
             self.shard_entity_count.write(shard_id, entity_count);
             let mut i: u32 = 0;
             for entity_id in entities {
                 let entity_id = *entity_id;
+                assert(self.entity_lock.read(entity_id) == 0, Errors::ENTITY_ALREADY_SHARDED);
                 self.entity_lock.write(entity_id, shard_id);
                 self.shard_entities.write((shard_id, i), entity_id);
                 i += 1;
             };
 
-            // Emit main event + chunked entity keys (Starknet event data limit = 300 felts).
-            let total_keys_len = entity_keys_flat.len();
-            let num_chunks = if total_keys_len == 0 {
-                0_u32
-            } else {
-                let full = total_keys_len / MAX_KEYS_PER_CHUNK;
-                if total_keys_len % MAX_KEYS_PER_CHUNK != 0 { full + 1 } else { full }
-            };
+            let num_chunks = self.emit_chunked_entity_keys(shard_id, entity_keys_flat);
             self.emit(ShardRequested { shard_id, entities, entity_key_chunks: num_chunks });
-
-            let mut chunk_idx: u32 = 0;
-            let mut key_offset: u32 = 0;
-            while key_offset < total_keys_len {
-                let remaining = total_keys_len - key_offset;
-                let chunk_size = if remaining < MAX_KEYS_PER_CHUNK {
-                    remaining
-                } else {
-                    MAX_KEYS_PER_CHUNK
-                };
-                let chunk = entity_keys_flat.slice(key_offset, chunk_size);
-                self
-                    .emit(
-                        ShardEntityKeysChunk {
-                            shard_id, chunk_index: chunk_idx, entity_keys_flat: chunk,
-                        },
-                    );
-                key_offset += chunk_size;
-                chunk_idx += 1;
-            };
 
             // Notify the sharding proxy (event bus) so the operator discovers this shard.
             let proxy_addr = self.sharding_proxy.read();
@@ -383,6 +350,10 @@ pub mod sharding_component {
             field_overrides: Span<super::ShardField>,
         ) {
             assert(model_selector != 0, Errors::POLICY_NO_MODEL);
+            assert(
+                self.active_shard_count.read() == 0,
+                'Shard: active shards exist',
+            );
             let encoded_default = encode_crdt(default_crdt);
 
             // Clear previous field overrides if re-registering.
@@ -497,6 +468,12 @@ pub mod sharding_component {
             self.sharding_proxy.read()
         }
 
+        fn get_shard_creator(
+            self: @ComponentState<TContractState>, shard_id: felt252,
+        ) -> ContractAddress {
+            self.shard_creator.read(shard_id)
+        }
+
         fn shard_entities_list(
             self: @ComponentState<TContractState>, shard_id: felt252,
         ) -> Array<felt252> {
@@ -553,85 +530,8 @@ pub mod sharding_component {
         ) {
             for entry in slots {
                 let entry = *entry;
-
-                // ── SLOT OWNERSHIP VERIFICATION ──
-                match entry.verification {
-                    SlotVerification::Deterministic(proof) => {
-                        // Recompute derived_key from entity_id by walking the chain.
-                        // This binds the slot to its owning entity — the caller cannot
-                        // redirect a slot to a different entity because entry.key is
-                        // fixed by the storage commitment while entity_id is fixed by
-                        // the entity lock.
-                        let mut derived_key = entry.entity_id;
-                        for selector in proof.key_derivation_chain {
-                            derived_key = poseidon_hash_span(
-                                [derived_key, *selector].span(),
-                            );
-                        };
-                        let expected_key = poseidon_hash_span(
-                            [DOJO_STORAGE, entry.model_selector, derived_key].span(),
-                        ) + proof.packed_offset.into();
-                        assert(expected_key == entry.key, Errors::SLOT_OWNERSHIP_MISMATCH);
-
-                        // Bind member_selector to the derivation chain.
-                        //
-                        // member_selector controls CRDT policy lookup:
-                        //   field_crdt_override[(model, member_selector)] → Add / Set / ...
-                        // Without this check, the caller could write to field A's slot
-                        // (via chain = [A]) but claim member_selector = B to use field B's
-                        // CRDT policy. For example, if A is Set and B is Add, the caller
-                        // gets delta-merge semantics on a field that should be overwritten.
-                        //
-                        // chain[0] is always the top-level field selector (or empty for
-                        // packed models where member_selector must be 0).
-                        if proof.key_derivation_chain.is_empty() {
-                            assert(
-                                entry.member_selector == 0,
-                                Errors::MEMBER_SELECTOR_MISMATCH,
-                            );
-                        } else {
-                            assert(
-                                entry.member_selector == *proof.key_derivation_chain[0],
-                                Errors::MEMBER_SELECTOR_MISMATCH,
-                            );
-                        };
-                    },
-                    SlotVerification::DynamicLock => {
-                        let expected_key = compute_dynamic_member_lock_slot(
-                            entry.model_selector, entry.entity_id, entry.member_selector,
-                        );
-                        assert(expected_key == entry.key, Errors::SLOT_OWNERSHIP_MISMATCH);
-                    },
-                }
-                assert(
-                    self.entity_lock.read(entry.entity_id) == shard_id,
-                    Errors::ENTITY_NOT_IN_SHARD,
-                );
-
-                // Resolve CRDT variant: per-field override if set, otherwise model default.
-                let field_crdt = self.field_crdt_override.read(
-                    (entry.model_selector, entry.member_selector),
-                );
-                let default_crdt = self.model_default_crdt.read(entry.model_selector);
-                let effective_encoded = if field_crdt != 0 { field_crdt } else { default_crdt };
-                let effective_crdt = decode_crdt(effective_encoded);
-                let is_add = effective_crdt == super::CRDVariant::Add;
-
-                // ── CRDT WRITE ──
-                let storage_address: StorageAddress = entry.key.try_into().unwrap();
-                if is_add {
-                    let current_value = storage_read_syscall(0, storage_address).unwrap_syscall();
-                    let current_u256: u256 = current_value.into();
-                    let shard_u256: u256 = entry.value.into();
-                    let initial_u256: u256 = entry.initial_value.into();
-                    assert(shard_u256 >= initial_u256, Errors::ADD_DELTA_UNDERFLOW);
-                    let delta = shard_u256 - initial_u256;
-                    let sum = current_u256 + delta;
-                    let new_value: felt252 = sum.try_into().expect(Errors::ARITHMETIC_OVERFLOW);
-                    storage_write_syscall(0, storage_address, new_value).unwrap_syscall();
-                } else {
-                    storage_write_syscall(0, storage_address, entry.value).unwrap_syscall();
-                }
+                Self::verify_slot_ownership(entry, shard_id, @self);
+                self.write_slot_with_crdt(entry);
             };
 
             // Note: StoreUpdateRecord events are emitted by the world contract
@@ -640,6 +540,125 @@ pub mod sharding_component {
 
             self.unlock_entities(shard_id);
             self.clear_shard_state(shard_id);
+        }
+
+        /// Verify that the slot belongs to a locked entity in this shard.
+        ///
+        /// Checks two properties:
+        /// 1. The storage key is derived from entity_id (key derivation or dynamic lock).
+        /// 2. The entity is locked by the given shard_id.
+        ///
+        /// For Deterministic slots, also binds member_selector to key_derivation_chain[0]
+        /// to prevent CRDT policy faking (e.g. claiming Add for a Set field).
+        fn verify_slot_ownership(
+            entry: SlotEntry,
+            shard_id: felt252,
+            self: @ComponentState<TContractState>,
+        ) {
+            match entry.verification {
+                SlotVerification::Deterministic(proof) => {
+                    // Recompute derived_key from entity_id by walking the chain.
+                    let mut derived_key = entry.entity_id;
+                    for selector in proof.key_derivation_chain {
+                        derived_key = poseidon_hash_span(
+                            [derived_key, *selector].span(),
+                        );
+                    };
+                    let expected_key = poseidon_hash_span(
+                        [DOJO_STORAGE, entry.model_selector, derived_key].span(),
+                    ) + proof.packed_offset.into();
+                    assert(expected_key == entry.key, Errors::SLOT_OWNERSHIP_MISMATCH);
+
+                    // Bind member_selector to the derivation chain so the caller
+                    // cannot fake the CRDT policy lookup.
+                    if proof.key_derivation_chain.is_empty() {
+                        assert(
+                            entry.member_selector == 0,
+                            Errors::MEMBER_SELECTOR_MISMATCH,
+                        );
+                    } else {
+                        assert(
+                            entry.member_selector == *proof.key_derivation_chain[0],
+                            Errors::MEMBER_SELECTOR_MISMATCH,
+                        );
+                    };
+                },
+                SlotVerification::DynamicLock => {
+                    let expected_key = compute_dynamic_member_lock_slot(
+                        entry.model_selector, entry.entity_id, entry.member_selector,
+                    );
+                    assert(expected_key == entry.key, Errors::SLOT_OWNERSHIP_MISMATCH);
+                },
+            }
+            assert(
+                self.entity_lock.read(entry.entity_id) == shard_id,
+                Errors::ENTITY_NOT_IN_SHARD,
+            );
+        }
+
+        /// Resolve CRDT policy and write the slot value accordingly.
+        ///
+        /// - Add: `new = current + (shard_value - initial_value)`
+        /// - Set/Lock/SetLock: direct overwrite with shard_value
+        fn write_slot_with_crdt(
+            ref self: ComponentState<TContractState>,
+            entry: SlotEntry,
+        ) {
+            let field_crdt = self.field_crdt_override.read(
+                (entry.model_selector, entry.member_selector),
+            );
+            let default_crdt = self.model_default_crdt.read(entry.model_selector);
+            let effective_encoded = if field_crdt != 0 { field_crdt } else { default_crdt };
+            let is_add = decode_crdt(effective_encoded) == super::CRDVariant::Add;
+
+            let storage_address: StorageAddress = entry.key.try_into().unwrap();
+            if is_add {
+                let current_value = storage_read_syscall(0, storage_address).unwrap_syscall();
+                let current_u256: u256 = current_value.into();
+                let shard_u256: u256 = entry.value.into();
+                let initial_u256: u256 = entry.initial_value.into();
+                assert(shard_u256 >= initial_u256, Errors::ADD_DELTA_UNDERFLOW);
+                let delta = shard_u256 - initial_u256;
+                let sum = current_u256 + delta;
+                let new_value: felt252 = sum.try_into().expect(Errors::ARITHMETIC_OVERFLOW);
+                storage_write_syscall(0, storage_address, new_value).unwrap_syscall();
+            } else {
+                storage_write_syscall(0, storage_address, entry.value).unwrap_syscall();
+            }
+        }
+
+        /// Emit entity keys in chunks to stay within Starknet's event data limit.
+        /// Returns the number of chunks emitted (0 if entity_keys_flat is empty).
+        fn emit_chunked_entity_keys(
+            ref self: ComponentState<TContractState>,
+            shard_id: felt252,
+            entity_keys_flat: Span<felt252>,
+        ) -> u32 {
+            let total_len = entity_keys_flat.len();
+            if total_len == 0 {
+                return 0;
+            }
+            let full = total_len / MAX_KEYS_PER_CHUNK;
+            let num_chunks = if total_len % MAX_KEYS_PER_CHUNK != 0 { full + 1 } else { full };
+
+            let mut chunk_idx: u32 = 0;
+            let mut offset: u32 = 0;
+            while offset < total_len {
+                let remaining = total_len - offset;
+                let chunk_size = if remaining < MAX_KEYS_PER_CHUNK {
+                    remaining
+                } else {
+                    MAX_KEYS_PER_CHUNK
+                };
+                self.emit(ShardEntityKeysChunk {
+                    shard_id,
+                    chunk_index: chunk_idx,
+                    entity_keys_flat: entity_keys_flat.slice(offset, chunk_size),
+                });
+                offset += chunk_size;
+                chunk_idx += 1;
+            };
+            num_chunks
         }
 
         fn unlock_entities(ref self: ComponentState<TContractState>, shard_id: felt252) {

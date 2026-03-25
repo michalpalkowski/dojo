@@ -4,7 +4,9 @@ use dojo::sharding::slot::compute_dojo_packed_slot;
 use dojo::sharding::request::{SlotEntry, SlotVerification, DeterministicProof};
 use dojo::utils::entity_id_from_keys;
 use dojo::world::{
-    IShardingSettlementDispatcher, IShardingSettlementDispatcherTrait, IWorldDispatcherTrait,
+    IShardingSettlementDispatcher, IShardingSettlementDispatcherTrait,
+    IShardingSettlementDevDispatcher, IShardingSettlementDevDispatcherTrait,
+    IWorldDispatcherTrait,
 };
 use starknet::ContractAddress;
 
@@ -72,22 +74,21 @@ fn make_field_slot(
     }
 }
 
-/// Helper: settle as world owner with Set CRDT (no Add, no StorageCommitment).
+/// Helper: settle as world owner using settle_dev (no StorageCommitment proof).
 fn settle_as_owner(
     world_address: ContractAddress,
     shard_id: felt252,
     slots: Span<SlotEntry>,
 ) {
-    let settlement = IShardingSettlementDispatcher { contract_address: world_address };
+    let settlement = IShardingSettlementDevDispatcher { contract_address: world_address };
     snforge_std::start_cheat_caller_address(world_address, snforge_std::test_address());
     settlement
-        .settle(
+        .settle_dev(
             shard_id,
-            0, // global_state_root
             0, // end_block_number
             slots,
-            [].span(), // entity_model_selectors (not needed in unit tests)
-            [].span(), // entity_keys_flat (not needed in unit tests)
+            [].span(), // entity_model_selectors
+            [].span(), // entity_keys_flat
         );
     snforge_std::stop_cheat_caller_address(world_address);
 }
@@ -299,20 +300,19 @@ fn test_settle_mixed_add_and_set() {
 
 #[test]
 #[should_panic(expected: ('Shard: unauthorized caller',))]
-fn test_settle_rejects_unauthorized_caller() {
+fn test_settle_dev_rejects_unauthorized_caller() {
     let (world, world_address, entity_id, slot_a, slot_b, model_selector) = setup_foo_shard();
     world.dispatcher.request_sharding([entity_id].span(), [].span());
 
     let (sel_a, sel_b) = foo_field_selectors();
 
-    // Call settle as non-owner.
+    // Call settle_dev as non-owner.
     let not_owner: ContractAddress = 0xdead.try_into().unwrap();
-    let settlement = IShardingSettlementDispatcher { contract_address: world_address };
+    let settlement = IShardingSettlementDevDispatcher { contract_address: world_address };
     snforge_std::start_cheat_caller_address(world_address, not_owner);
     settlement
-        .settle(
+        .settle_dev(
             1,
-            0, // global_state_root
             0, // end_block_number
             [
                 make_field_slot(slot_a, 999, model_selector, entity_id, sel_a, 0),
@@ -577,13 +577,12 @@ fn test_settle_rejects_wrong_model_selector() {
 
     let (sel_a, sel_b) = foo_field_selectors();
 
-    let settlement = IShardingSettlementDispatcher { contract_address: world_address };
+    let settlement = IShardingSettlementDevDispatcher { contract_address: world_address };
     snforge_std::start_cheat_caller_address(world_address, snforge_std::test_address());
     // Pass wrong model_selector (0xdead) for first slot — hash won't match slot_a.
     settlement
-        .settle(
+        .settle_dev(
             1,
-            0, // global_state_root
             0, // end_block_number
             [
                 SlotEntry {
@@ -618,13 +617,12 @@ fn test_settle_rejects_unlocked_entity() {
     let (sel_a, _sel_b) = foo_field_selectors();
     let other_slot = dojo::sharding::compute_dojo_field_slot(model_selector, other_entity, sel_a);
 
-    let settlement = IShardingSettlementDispatcher { contract_address: world_address };
+    let settlement = IShardingSettlementDevDispatcher { contract_address: world_address };
     snforge_std::start_cheat_caller_address(world_address, snforge_std::test_address());
     // Try to settle slot belonging to unlocked entity.
     settlement
-        .settle(
+        .settle_dev(
             1,
-            0, // global_state_root
             0, // end_block_number
             [
                 make_field_slot(other_slot, 42, model_selector, other_entity, sel_a, 0),
@@ -641,14 +639,13 @@ fn test_settle_rejects_zero_comp_key_for_deterministic_slot() {
     world.dispatcher.request_sharding([entity_id].span(), [].span());
 
     let (sel_a, _sel_b) = foo_field_selectors();
-    let settlement = IShardingSettlementDispatcher { contract_address: world_address };
+    let settlement = IShardingSettlementDevDispatcher { contract_address: world_address };
     snforge_std::start_cheat_caller_address(world_address, snforge_std::test_address());
     // Pass empty key_derivation_chain — derives entity_id, not combine_key(entity_id, sel_a),
     // so the recomputed slot won't match slot_a.
     settlement
-        .settle(
+        .settle_dev(
             1,
-            0, // global_state_root
             0, // end_block_number
             [
                 SlotEntry {
@@ -688,12 +685,11 @@ fn test_settle_rejects_packed_offset_bypass_for_unlocked_entity() {
     world.dispatcher.request_sharding([bob_eid].span(), [].span());
 
     let forged_key = compute_dojo_packed_slot(model_selector, alice_eid) + 1;
-    let settlement = IShardingSettlementDispatcher { contract_address: world_address };
+    let settlement = IShardingSettlementDevDispatcher { contract_address: world_address };
     snforge_std::start_cheat_caller_address(world_address, snforge_std::test_address());
     settlement
-        .settle(
+        .settle_dev(
             1,
-            0, // global_state_root
             0, // end_block_number
             [
                 SlotEntry {
@@ -714,4 +710,179 @@ fn test_settle_rejects_packed_offset_bypass_for_unlocked_entity() {
             [].span(),
             [].span(),
         );
+}
+
+// ── member_selector binding tests ───────────────────────────────────
+
+#[test]
+#[should_panic(expected: ('Shard: member_sel mismatch',))]
+fn test_settle_rejects_empty_chain_with_nonzero_member_selector() {
+    let (world, world_address, entity_id, _, _, model_selector) = setup_foo_shard();
+    world.dispatcher.request_sharding([entity_id].span(), [].span());
+
+    let (sel_a, _sel_b) = foo_field_selectors();
+    let packed_slot = compute_dojo_packed_slot(model_selector, entity_id);
+    let settlement = IShardingSettlementDevDispatcher { contract_address: world_address };
+    snforge_std::start_cheat_caller_address(world_address, snforge_std::test_address());
+    settlement
+        .settle_dev(
+            1, 0,
+            [
+                SlotEntry {
+                    key: packed_slot,
+                    value: 42,
+                    model_selector,
+                    entity_id,
+                    member_selector: sel_a, // non-zero but chain is empty
+                    initial_value: 0,
+                    verification: SlotVerification::Deterministic(
+                        DeterministicProof {
+                            key_derivation_chain: [].span(),
+                            packed_offset: 0,
+                        },
+                    ),
+                },
+            ].span(),
+            [].span(),
+            [].span(),
+        );
+}
+
+#[test]
+#[should_panic(expected: ('Shard: member_sel mismatch',))]
+fn test_settle_rejects_member_selector_not_matching_chain() {
+    let (world, world_address, entity_id, slot_a, _, model_selector) = setup_foo_shard();
+    world.dispatcher.request_sharding([entity_id].span(), [].span());
+
+    let (sel_a, sel_b) = foo_field_selectors();
+    let settlement = IShardingSettlementDevDispatcher { contract_address: world_address };
+    snforge_std::start_cheat_caller_address(world_address, snforge_std::test_address());
+    settlement
+        .settle_dev(
+            1, 0,
+            [
+                SlotEntry {
+                    key: slot_a,
+                    value: 42,
+                    model_selector,
+                    entity_id,
+                    member_selector: sel_b, // wrong! chain[0] = sel_a
+                    initial_value: 0,
+                    verification: SlotVerification::Deterministic(
+                        DeterministicProof {
+                            key_derivation_chain: [sel_a].span(),
+                            packed_offset: 0,
+                        },
+                    ),
+                },
+            ].span(),
+            [].span(),
+            [].span(),
+        );
+}
+
+// ── DynamicLock wrong entity ────────────────────────────────────────
+
+#[test]
+#[should_panic(expected: ('Shard: slot ownership mismatch',))]
+fn test_settle_rejects_dynamic_lock_with_wrong_entity() {
+    let (world, world_address, entity_id, _, _, model_selector) = setup_foo_shard();
+    world.dispatcher.request_sharding([entity_id].span(), [].span());
+
+    let (sel_a, _sel_b) = foo_field_selectors();
+    let wrong_entity: felt252 = 0xBAD;
+    let wrong_lock_slot = dojo::sharding::slot::compute_dynamic_member_lock_slot(
+        model_selector, wrong_entity, sel_a,
+    );
+
+    let settlement = IShardingSettlementDevDispatcher { contract_address: world_address };
+    snforge_std::start_cheat_caller_address(world_address, snforge_std::test_address());
+    settlement
+        .settle_dev(
+            1, 0,
+            [
+                SlotEntry {
+                    key: wrong_lock_slot,
+                    value: 1,
+                    model_selector,
+                    entity_id,
+                    member_selector: sel_a,
+                    initial_value: 0,
+                    verification: SlotVerification::DynamicLock,
+                },
+            ].span(),
+            [].span(),
+            [].span(),
+        );
+}
+
+// ── cancel_shard creator auth ───────────────────────────────────────
+
+#[test]
+fn test_cancel_shard_by_creator_succeeds() {
+    let (mut world, world_address, entity_id, _, _, _) = setup_foo_shard();
+    world.dispatcher.request_sharding([entity_id].span(), [].span());
+
+    let settlement = IShardingSettlementDispatcher { contract_address: world_address };
+    snforge_std::start_cheat_caller_address(world_address, snforge_std::test_address());
+    settlement.cancel_shard(1);
+    snforge_std::stop_cheat_caller_address(world_address);
+
+    let bob: ContractAddress = 0xb0b.try_into().unwrap();
+    world.write_model_test(@Foo { caller: bob, a: 42, b: 42 });
+}
+
+// ── register_shard_policy blocked during active shard ───────────────
+
+#[test]
+#[should_panic(expected: ('Shard: active shards exist',))]
+fn test_register_policy_rejected_while_shard_active() {
+    let (world, world_address, entity_id, _, _, model_selector) = setup_foo_shard();
+    world.dispatcher.request_sharding([entity_id].span(), [].span());
+
+    snforge_std::start_cheat_caller_address(world_address, snforge_std::test_address());
+    let world_disp = dojo::world::IWorldDispatcher { contract_address: world_address };
+    world_disp.register_shard_policy(
+        model_selector,
+        dojo::sharding::request::CRDVariant::Add,
+        [].span(),
+    );
+}
+
+// ── Double settlement blocked ───────────────────────────────────────
+
+#[test]
+#[should_panic(expected: ('Shard: not found',))]
+fn test_settle_same_shard_twice_rejected() {
+    let (world, world_address, entity_id, slot_a, slot_b, model_selector) = setup_foo_shard();
+    world.dispatcher.request_sharding([entity_id].span(), [].span());
+
+    let (sel_a, sel_b) = foo_field_selectors();
+    settle_as_owner(
+        world_address, 1,
+        [
+            make_field_slot(slot_a, 500, model_selector, entity_id, sel_a, 0),
+            make_field_slot(slot_b, 300, model_selector, entity_id, sel_b, 0),
+        ].span(),
+    );
+
+    // Second settle for same shard_id → cleared, should fail.
+    settle_as_owner(
+        world_address, 1,
+        [
+            make_field_slot(slot_a, 999, model_selector, entity_id, sel_a, 0),
+        ].span(),
+    );
+}
+
+// ── Cancel nonexistent shard ────────────────────────────────────────
+
+#[test]
+#[should_panic(expected: ('Shard: not found',))]
+fn test_cancel_nonexistent_shard_rejected() {
+    let (_world, world_address, _, _, _, _) = setup_foo_shard();
+
+    let settlement = IShardingSettlementDispatcher { contract_address: world_address };
+    snforge_std::start_cheat_caller_address(world_address, snforge_std::test_address());
+    settlement.cancel_shard(999);
 }

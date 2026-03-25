@@ -8,7 +8,9 @@ use dojo::sharding::compute_dojo_field_slot;
 use dojo::sharding::request::{SlotEntry, SlotVerification, DeterministicProof};
 use dojo::utils::entity_id_from_keys;
 use dojo::world::{
-    IShardingSettlementDispatcher, IShardingSettlementDispatcherTrait, IWorldDispatcherTrait,
+    IShardingSettlementDispatcher, IShardingSettlementDispatcherTrait,
+    IShardingSettlementDevDispatcher, IShardingSettlementDevDispatcherTrait,
+    IWorldDispatcherTrait,
 };
 use starknet::ContractAddress;
 
@@ -58,12 +60,11 @@ fn do_settle(
     shard_id: felt252,
     slots: Span<SlotEntry>,
 ) {
-    let settlement = IShardingSettlementDispatcher { contract_address: world_address };
+    let settlement = IShardingSettlementDevDispatcher { contract_address: world_address };
     snforge_std::start_cheat_caller_address(world_address, snforge_std::test_address());
     settlement
-        .settle(
+        .settle_dev(
             shard_id,
-            0, // global_state_root
             0, // end_block_number
             slots,
             [].span(), // entity_model_selectors
