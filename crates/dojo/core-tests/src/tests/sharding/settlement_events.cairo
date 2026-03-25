@@ -1,9 +1,8 @@
 /// Settlement value-correctness tests across different model types.
 ///
-/// These tests verify that the commitment-based settlement pipeline
-/// correctly writes values to storage and that Dojo model reads return
-/// the expected results. Tests cover: Foo (struct layout), Tile (multi-key),
-/// Score (packed layout), and Add CRDT delta merging.
+/// Uses production `settle()` with a mock [`crate::tests::sharding::helpers::mock_storage_commitment_verifier`]
+/// registered on the world (see [`register_mock_storage_commitment_verifier`]).
+/// Covers: Foo (struct layout), Tile (multi-key), Score (packed layout), and Add CRDT delta merging.
 
 use dojo::model::{Model, ModelStorage, ModelStorageTest};
 use dojo::sharding::compute_dojo_field_slot;
@@ -11,15 +10,14 @@ use dojo::sharding::slot::compute_dojo_packed_slot;
 use dojo::sharding::request::{SlotEntry, SlotVerification, DeterministicProof};
 use dojo::utils::{entity_id_from_keys, entity_id_from_serialized_keys};
 use dojo::world::{
-    IShardingSettlementDispatcher, IShardingSettlementDispatcherTrait,
-    IShardingSettlementDevDispatcher, IShardingSettlementDevDispatcherTrait,
-    IWorldDispatcherTrait,
+    IShardingSettlementDispatcher, IShardingSettlementDispatcherTrait, IWorldDispatcherTrait,
 };
 use starknet::ContractAddress;
 
 use crate::tests::helpers::{
     Foo, deploy_world_and_foo, Tile, deploy_world_with_tile, Score, deploy_world_with_score,
 };
+use crate::tests::sharding::helpers::{register_mock_storage_commitment_verifier, settle_as_owner};
 
 /// Make test_address() the world owner before deploying.
 fn cheat_world_owner() {
@@ -81,25 +79,6 @@ fn packed_slot_entry(
     }
 }
 
-/// Helper: settle as world owner.
-fn do_settle(
-    world_address: ContractAddress,
-    shard_id: felt252,
-    slots: Span<SlotEntry>,
-) {
-    let settlement = IShardingSettlementDevDispatcher { contract_address: world_address };
-    snforge_std::start_cheat_caller_address(world_address, snforge_std::test_address());
-    settlement
-        .settle_dev(
-            shard_id,
-            0, // end_block_number
-            slots,
-            [].span(), // entity_model_selectors (not needed in unit tests)
-            [].span(), // entity_keys_flat (not needed in unit tests)
-        );
-    snforge_std::stop_cheat_caller_address(world_address);
-}
-
 // ── Foo (Struct Layout) ─────────────────────────────────────────────────
 
 #[test]
@@ -107,6 +86,7 @@ fn test_settlement_set_updates_all_fields() {
     cheat_world_owner();
     let (mut world, model_selector) = deploy_world_and_foo();
     let world_address = world.dispatcher.contract_address;
+    register_mock_storage_commitment_verifier(world_address);
     let bob: ContractAddress = 0xb0b.try_into().unwrap();
     world.write_model_test(@Foo { caller: bob, a: 100, b: 200 });
 
@@ -116,7 +96,7 @@ fn test_settlement_set_updates_all_fields() {
     let slot_b = compute_dojo_field_slot(model_selector, entity_id, sel_b);
 
     world.dispatcher.request_sharding([entity_id].span(), [].span());
-    do_settle(
+    settle_as_owner(
         world_address, 1,
         [
             field_slot_entry(slot_a, 999, model_selector, entity_id, sel_a, 0),
@@ -134,11 +114,12 @@ fn test_settlement_add_crdt_produces_merged_value() {
     cheat_world_owner();
     let (mut world, model_selector) = deploy_world_and_foo();
     let world_address = world.dispatcher.contract_address;
+    register_mock_storage_commitment_verifier(world_address);
     let bob: ContractAddress = 0xb0b.try_into().unwrap();
     // Initial a=100 (entity locked after request, so current stays 100).
     world.write_model_test(@Foo { caller: bob, a: 100, b: 200 });
 
-    let (sel_a, sel_b) = foo_field_selectors();
+    let (sel_a, _sel_b) = foo_field_selectors();
     let entity_id = entity_id_from_keys(@bob);
     let slot_a = compute_dojo_field_slot(model_selector, entity_id, sel_a);
 
@@ -159,7 +140,7 @@ fn test_settlement_add_crdt_produces_merged_value() {
     world.dispatcher.request_sharding([entity_id].span(), [].span());
 
     // Shard produced 150 for slot_a (initial=100, delta=50).
-    do_settle(
+    settle_as_owner(
         world_address, 1,
         [
             field_slot_entry(slot_a, 150, model_selector, entity_id, sel_a, 100),
@@ -175,7 +156,7 @@ fn test_settlement_add_crdt_produces_merged_value() {
 #[test]
 fn test_cancel_does_not_change_values() {
     cheat_world_owner();
-    let (mut world, model_selector) = deploy_world_and_foo();
+    let (mut world, _model_selector) = deploy_world_and_foo();
     let world_address = world.dispatcher.contract_address;
     let bob: ContractAddress = 0xb0b.try_into().unwrap();
     world.write_model_test(@Foo { caller: bob, a: 100, b: 200 });
@@ -200,6 +181,7 @@ fn test_settlement_multi_key_model() {
     cheat_world_owner();
     let (mut world, model_selector) = deploy_world_with_tile();
     let world_address = world.dispatcher.contract_address;
+    register_mock_storage_commitment_verifier(world_address);
 
     let tile = Tile { col: 5, row: 10, category: 3, entity_id: 42 };
     world.write_model_test(@tile);
@@ -217,7 +199,7 @@ fn test_settlement_multi_key_model() {
     let slot_eid = compute_dojo_field_slot(model_selector, entity_id, sel_entity_id);
 
     world.dispatcher.request_sharding([entity_id].span(), [].span());
-    do_settle(
+    settle_as_owner(
         world_address, 1,
         [
             field_slot_entry(slot_cat, 7, model_selector, entity_id, sel_category, 0),
@@ -235,6 +217,7 @@ fn test_settlement_new_entity_created_on_shard() {
     cheat_world_owner();
     let (mut world, model_selector) = deploy_world_with_tile();
     let world_address = world.dispatcher.contract_address;
+    register_mock_storage_commitment_verifier(world_address);
 
     // Do NOT write initial tile — entity created entirely on shard.
     let keys: Span<felt252> = [3_felt252, 7_felt252].span();
@@ -250,7 +233,7 @@ fn test_settlement_new_entity_created_on_shard() {
     let slot_eid = compute_dojo_field_slot(model_selector, entity_id, sel_entity_id);
 
     world.dispatcher.request_sharding([entity_id].span(), [].span());
-    do_settle(
+    settle_as_owner(
         world_address, 1,
         [
             field_slot_entry(slot_cat, 2, model_selector, entity_id, sel_category, 0),
@@ -270,6 +253,7 @@ fn test_settlement_packed_model() {
     cheat_world_owner();
     let (mut world, model_selector) = deploy_world_with_score();
     let world_address = world.dispatcher.contract_address;
+    register_mock_storage_commitment_verifier(world_address);
 
     let bob: ContractAddress = 0xb0b.try_into().unwrap();
     let score = Score { player: bob, points: 1000, level: 5 };
@@ -285,7 +269,7 @@ fn test_settlement_packed_model() {
     let packed_value: felt252 = 2000 + 10 * 0x100000000000000000000000000000000;
 
     world.dispatcher.request_sharding([entity_id].span(), [].span());
-    do_settle(
+    settle_as_owner(
         world_address, 1,
         [
             packed_slot_entry(packed_slot, packed_value, model_selector, entity_id, 0),
@@ -304,6 +288,7 @@ fn test_multi_entity_shard_settles_both() {
     cheat_world_owner();
     let (mut world, model_selector) = deploy_world_and_foo();
     let world_address = world.dispatcher.contract_address;
+    register_mock_storage_commitment_verifier(world_address);
 
     let bob: ContractAddress = 0xb0b.try_into().unwrap();
     let alice: ContractAddress = 0xa11ce.try_into().unwrap();
@@ -322,7 +307,7 @@ fn test_multi_entity_shard_settles_both() {
     let alice_slot_a = compute_dojo_field_slot(model_selector, alice_eid, sel_a);
     let alice_slot_b = compute_dojo_field_slot(model_selector, alice_eid, sel_b);
 
-    do_settle(
+    settle_as_owner(
         world_address, 1,
         [
             field_slot_entry(bob_slot_a, 500, model_selector, bob_eid, sel_a, 0),
@@ -379,6 +364,7 @@ fn test_reshard_after_settlement_uses_new_values() {
     cheat_world_owner();
     let (mut world, model_selector) = deploy_world_and_foo();
     let world_address = world.dispatcher.contract_address;
+    register_mock_storage_commitment_verifier(world_address);
 
     let bob: ContractAddress = 0xb0b.try_into().unwrap();
     world.write_model_test(@Foo { caller: bob, a: 100, b: 200 });
@@ -404,7 +390,7 @@ fn test_reshard_after_settlement_uses_new_values() {
 
     // Shard 1: Set a=500, b=300.
     world.dispatcher.request_sharding([entity_id].span(), [].span());
-    do_settle(
+    settle_as_owner(
         world_address, 1,
         [
             field_slot_entry(slot_a, 500, model_selector, entity_id, sel_a, 100),
@@ -419,7 +405,7 @@ fn test_reshard_after_settlement_uses_new_values() {
     // Shard 2: Add CRDT on slot_a (initial=500 from shard 1 result).
     world.dispatcher.request_sharding([entity_id].span(), [].span());
     // Shard sees initial=500, produces 600 → delta=100.
-    do_settle(
+    settle_as_owner(
         world_address, 2,
         [
             field_slot_entry(slot_a, 600, model_selector, entity_id, sel_a, 500),
@@ -437,8 +423,9 @@ fn test_reshard_after_settlement_uses_new_values() {
 #[test]
 fn test_settle_with_no_changes() {
     cheat_world_owner();
-    let (mut world, model_selector) = deploy_world_and_foo();
+    let (mut world, _model_selector) = deploy_world_and_foo();
     let world_address = world.dispatcher.contract_address;
+    register_mock_storage_commitment_verifier(world_address);
 
     let bob: ContractAddress = 0xb0b.try_into().unwrap();
     world.write_model_test(@Foo { caller: bob, a: 100, b: 200 });
@@ -447,7 +434,7 @@ fn test_settle_with_no_changes() {
 
     world.dispatcher.request_sharding([entity_id].span(), [].span());
     // Empty slots — nothing changed on shard.
-    do_settle(world_address, 1, [].span());
+    settle_as_owner(world_address, 1, [].span());
 
     let result: Foo = world.read_model(bob);
     assert(result.a == 100, 'no change: a=100');
@@ -459,7 +446,7 @@ fn test_settle_with_no_changes() {
 #[test]
 fn test_cancel_after_request() {
     cheat_world_owner();
-    let (mut world, model_selector) = deploy_world_and_foo();
+    let (mut world, _model_selector) = deploy_world_and_foo();
     let world_address = world.dispatcher.contract_address;
 
     let bob: ContractAddress = 0xb0b.try_into().unwrap();
