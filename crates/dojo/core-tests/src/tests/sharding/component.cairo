@@ -2,7 +2,7 @@ use dojo::model::{Model, ModelStorage, ModelStorageTest};
 use dojo::sharding::compute_dojo_field_slot;
 use dojo::sharding::slot::compute_dojo_packed_slot;
 use dojo::sharding::request::{SlotEntry, SlotVerification, DeterministicProof};
-use dojo::utils::{entity_id_from_keys, combine_key};
+use dojo::utils::entity_id_from_keys;
 use dojo::world::{
     IShardingSettlementDispatcher, IShardingSettlementDispatcherTrait, IWorldDispatcherTrait,
 };
@@ -65,7 +65,7 @@ fn make_field_slot(
         initial_value,
         verification: SlotVerification::Deterministic(
             DeterministicProof {
-                computation_key: combine_key(entity_id, member_selector),
+                key_derivation_chain: [member_selector].span(),
                 packed_offset: 0,
             },
         ),
@@ -595,7 +595,7 @@ fn test_settle_rejects_wrong_model_selector() {
                     initial_value: 0,
                     verification: SlotVerification::Deterministic(
                         DeterministicProof {
-                            computation_key: combine_key(entity_id, sel_a),
+                            key_derivation_chain: [sel_a].span(),
                             packed_offset: 0,
                         },
                     ),
@@ -643,7 +643,8 @@ fn test_settle_rejects_zero_comp_key_for_deterministic_slot() {
     let (sel_a, _sel_b) = foo_field_selectors();
     let settlement = IShardingSettlementDispatcher { contract_address: world_address };
     snforge_std::start_cheat_caller_address(world_address, snforge_std::test_address());
-    // Pass zero computation_key — the recomputed slot won't match slot_a.
+    // Pass empty key_derivation_chain — derives entity_id, not combine_key(entity_id, sel_a),
+    // so the recomputed slot won't match slot_a.
     settlement
         .settle(
             1,
@@ -659,7 +660,7 @@ fn test_settle_rejects_zero_comp_key_for_deterministic_slot() {
                     initial_value: 0,
                     verification: SlotVerification::Deterministic(
                         DeterministicProof {
-                            computation_key: 0, // zero — hash won't match
+                            key_derivation_chain: [].span(), // empty — hash won't match
                             packed_offset: 0,
                         },
                     ),
@@ -704,7 +705,7 @@ fn test_settle_rejects_packed_offset_bypass_for_unlocked_entity() {
                     initial_value: 0,
                     verification: SlotVerification::Deterministic(
                         DeterministicProof {
-                            computation_key: alice_eid,
+                            key_derivation_chain: [].span(),
                             packed_offset: 1,
                         },
                     ),

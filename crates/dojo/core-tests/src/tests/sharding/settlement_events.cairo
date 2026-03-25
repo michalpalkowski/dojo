@@ -9,7 +9,7 @@ use dojo::model::{Model, ModelStorage, ModelStorageTest};
 use dojo::sharding::compute_dojo_field_slot;
 use dojo::sharding::slot::compute_dojo_packed_slot;
 use dojo::sharding::request::{SlotEntry, SlotVerification, DeterministicProof};
-use dojo::utils::{entity_id_from_keys, entity_id_from_serialized_keys, combine_key};
+use dojo::utils::{entity_id_from_keys, entity_id_from_serialized_keys};
 use dojo::world::{
     IShardingSettlementDispatcher, IShardingSettlementDispatcherTrait, IWorldDispatcherTrait,
 };
@@ -51,7 +51,7 @@ fn field_slot_entry(
         initial_value,
         verification: SlotVerification::Deterministic(
             DeterministicProof {
-                computation_key: combine_key(entity_id, member_selector),
+                key_derivation_chain: [member_selector].span(),
                 packed_offset: 0,
             },
         ),
@@ -74,7 +74,7 @@ fn packed_slot_entry(
         member_selector: 0,
         initial_value,
         verification: SlotVerification::Deterministic(
-            DeterministicProof { computation_key: entity_id, packed_offset: 0 },
+            DeterministicProof { key_derivation_chain: [].span(), packed_offset: 0 },
         ),
     }
 }
