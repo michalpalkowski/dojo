@@ -35,18 +35,35 @@ pub struct SlotEntry {
 /// making invalid states unrepresentable.
 #[derive(Drop, Serde, Copy)]
 pub enum SlotVerification {
-    /// Standard Dojo storage: key = H(DOJO_STORAGE, model_sel, computation_key) + packed_offset.
+    /// Standard Dojo storage: key is recomputed from entity_id + key_derivation_chain.
     Deterministic: DeterministicProof,
     /// Dynamic array member lock: key = H(LOCK_DOMAIN, model_sel, entity_id, member_sel).
     DynamicLock,
 }
 
 /// Proof data for deterministic (field-layout or packed) Dojo storage slots.
+///
+/// The `key_derivation_chain` replaces the former `computation_key` field.
+/// Instead of trusting a caller-provided derived key, the contract recomputes
+/// it from `entity_id` by walking the chain of selectors/indices:
+///
+///   derived_key = entity_id
+///   for each selector in key_derivation_chain:
+///       derived_key = Poseidon(derived_key, selector)
+///   expected_slot = H(DOJO_STORAGE, model_selector, derived_key) + packed_offset
+///
+/// Examples:
+///   Packed model (depth 0):      chain = []            → derived_key = entity_id
+///   Struct field (depth 1):      chain = [field_sel]   → derived_key = combine_key(entity_id, field_sel)
+///   Nested struct (depth 2):     chain = [outer, inner] → combine_key(combine_key(entity_id, outer), inner)
+///   Array element:               chain = [field_sel, index] → combine_key(combine_key(entity_id, field_sel), index)
 #[derive(Drop, Serde, Copy)]
 pub struct DeterministicProof {
-    /// Poseidon computation key: `combine_key(entity_id, field_selector)` for struct fields,
-    /// or `entity_id` for packed models.
-    pub computation_key: felt252,
+    /// Selector chain from entity_id to the storage key.
+    /// Each element is either a field selector or an array/tuple index.
+    /// The contract walks this chain starting from `entity_id` to recompute
+    /// the derived key, ensuring the slot is bound to the claimed entity.
+    pub key_derivation_chain: Span<felt252>,
     /// Offset within packed model storage (0 for struct-layout fields).
     pub packed_offset: u32,
 }

@@ -29,9 +29,6 @@ pub trait IShardingSettlement<T> {
     /// Cancel shard: unlock entities without applying changes.
     fn cancel_shard(ref self: T, shard_id: felt252);
 
-    /// Return the stored commitment hash for a shard (0 if not set).
-    fn get_shard_commitment(self: @T, shard_id: felt252) -> felt252;
-
     /// Return the request-time block number bound to this shard.
     fn get_shard_attestation_fork_block_number(self: @T, shard_id: felt252) -> u64;
 

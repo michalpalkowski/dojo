@@ -1244,10 +1244,6 @@ pub mod world {
             self.sharding.set_storage_commitment_registry(registry);
         }
 
-        fn get_shard_commitment(self: @ContractState, shard_id: felt252) -> felt252 {
-            self.sharding.shard_commitment(shard_id)
-        }
-
         fn get_shard_attestation_fork_block_number(
             self: @ContractState, shard_id: felt252,
         ) -> u64 {
