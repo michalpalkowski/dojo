@@ -426,8 +426,6 @@ pub mod sharding_component {
         fn set_storage_commitment_registry(
             ref self: ComponentState<TContractState>, registry: ContractAddress,
         ) {
-            let current = self.storage_commitment_registry.read();
-            assert(current == core::num::traits::Zero::zero(), Errors::REGISTRY_ALREADY_SET);
             self.storage_commitment_registry.write(registry);
         }
 
