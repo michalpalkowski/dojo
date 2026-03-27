@@ -295,15 +295,15 @@ pub mod sharding_component {
             let verifier = IStorageCommitmentVerifierDispatcher {
                 contract_address: registry_addr,
             };
-            assert(
-                verifier.verify(
+            let (verified, _proven_game_contract, proven_shard_id) = verifier
+                .verify(
                     raw_storage_commitment,
                     get_contract_address(),
                     global_state_root,
                     end_block_number,
-                ),
-                Errors::COMMITMENT_NOT_VERIFIED,
-            );
+                );
+            assert(verified, Errors::COMMITMENT_NOT_VERIFIED);
+            assert(proven_shard_id == shard_id, 'Shard: proven shard_id mismatch');
 
             self.apply_settle(shard_id, slots);
         }

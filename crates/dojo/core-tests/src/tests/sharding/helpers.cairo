@@ -29,8 +29,8 @@ pub mod mock_storage_commitment_verifier {
             contract_address: ContractAddress,
             global_state_root: felt252,
             end_block_number: u64,
-        ) -> bool {
-            true
+        ) -> (bool, felt252, felt252) {
+            (true, 0, 0)
         }
     }
 }
