@@ -1224,9 +1224,12 @@ pub mod world {
             slots: Span<dojo::sharding::request::SlotEntry>,
             entity_model_selectors: Span<felt252>,
             entity_keys_flat: Span<felt252>,
+            initial_proof: dojo::sharding::request::InitialProof,
         ) {
             assert(self.is_caller_world_owner(), sharding_cpt::Errors::UNAUTHORIZED_CALLER);
-            self.sharding.settle(shard_id, global_state_root, end_block_number, slots);
+            self
+                .sharding
+                .settle(shard_id, global_state_root, end_block_number, slots, initial_proof);
 
             // Emit StoreSetRecord per entity so Torii indexes with correct keys.
             self.emit_settlement_updates(entity_model_selectors, entity_keys_flat);

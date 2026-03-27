@@ -21,6 +21,7 @@ pub trait IShardingSettlement<T> {
         slots: Span<SlotEntry>,
         entity_model_selectors: Span<felt252>,
         entity_keys_flat: Span<felt252>,
+        initial_proof: dojo::sharding::request::InitialProof,
     );
 
     /// Configure StorageCommitment verifier contract. One-shot.

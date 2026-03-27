@@ -1,6 +1,7 @@
+use core::poseidon::poseidon_hash_span;
 use dojo::model::{Model, ModelStorageTest};
 use dojo::sharding::compute_dojo_field_slot;
-use dojo::sharding::request::{SlotEntry, SlotVerification, DeterministicProof};
+use dojo::sharding::request::{InitialProof, SlotEntry, SlotVerification, DeterministicProof};
 use dojo::utils::entity_id_from_keys;
 use dojo::world::{
     IShardingSettlementDispatcher, IShardingSettlementDispatcherTrait,
@@ -49,7 +50,9 @@ pub fn foo_field_selectors() -> (felt252, felt252) {
 // ── Setup helpers ─────────────────────────────────────────────────
 
 /// Deploy mock verifier and register it on the world (world owner caller).
-pub fn register_mock_storage_commitment_verifier(world_address: ContractAddress) {
+pub fn register_mock_storage_commitment_verifier(
+    world_address: ContractAddress,
+) {
     let mock_verifier = declare_and_deploy("mock_storage_commitment_verifier");
     let settlement = IShardingSettlementDispatcher { contract_address: world_address };
     snforge_std::start_cheat_caller_address(world_address, snforge_std::test_address());
@@ -121,12 +124,48 @@ pub fn settle_as_owner(
 }
 
 /// Same as [`settle_as_owner`] but with an explicit caller (e.g. non-owner panic tests).
+///
+/// Automatically builds initial proof data from slots that have non-zero `initial_value`,
+/// so Add CRDT tests work without manually constructing initial proofs.
 pub fn settle_with_caller(
     world_address: ContractAddress,
     caller: ContractAddress,
     shard_id: felt252,
     slots: Span<SlotEntry>,
 ) {
+    // Include all slots in the initial proof so Add CRDT verification works
+    // even when initial_value is zero (valid fork-time state).
+    let mut initial_keys: Array<felt252> = ArrayTrait::new();
+    let mut initial_values: Array<felt252> = ArrayTrait::new();
+    for entry in slots {
+        initial_keys.append(*entry.key);
+        initial_values.append(*entry.initial_value);
+    };
+
+    // Build InitialProof from collected Add CRDT slots.
+    let initial_proof: InitialProof = if initial_keys.len() > 0 {
+        let mut commitment_data: Array<felt252> = ArrayTrait::new();
+        for k in initial_keys.span() {
+            commitment_data.append(*k);
+        };
+        for v in initial_values.span() {
+            commitment_data.append(*v);
+        };
+        InitialProof {
+            keys: initial_keys.span(),
+            values: initial_values.span(),
+            commitment: poseidon_hash_span(commitment_data.span()),
+            fork_state_root: 0x1,
+        }
+    } else {
+        InitialProof {
+            keys: [].span(),
+            values: [].span(),
+            commitment: 0,
+            fork_state_root: 0,
+        }
+    };
+
     let settlement = IShardingSettlementDispatcher { contract_address: world_address };
     snforge_std::start_cheat_caller_address(world_address, caller);
     settlement
@@ -137,6 +176,7 @@ pub fn settle_with_caller(
             slots,
             [].span(),
             [].span(),
+            initial_proof,
         );
     snforge_std::stop_cheat_caller_address(world_address);
 }

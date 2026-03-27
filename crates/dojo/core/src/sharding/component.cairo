@@ -44,12 +44,14 @@ pub trait IContractComponent<TContractState> {
 
     /// Settle changed slots with StorageCommitment verification.
     /// Each `SlotEntry` bundles key/value, ownership metadata, and verification proof.
+    /// `initial_proof` carries SP1-proven fork-block values for Add CRDT delta verification.
     fn settle(
         ref self: TContractState,
         shard_id: felt252,
         global_state_root: felt252,
         end_block_number: u64,
         slots: Span<SlotEntry>,
+        initial_proof: super::request::InitialProof,
     );
 
     /// Configure StorageCommitment verifier contract. One-shot.
@@ -80,10 +82,12 @@ pub mod sharding_component {
     use starknet::syscalls::{storage_read_syscall, storage_write_syscall};
     use starknet::{ContractAddress, get_caller_address, get_contract_address, get_execution_info};
     use core::poseidon::poseidon_hash_span;
+    use core::dict::Felt252Dict;
+    use core::nullable::{Nullable, NullableTrait, match_nullable, FromNullableResult};
     use dojo::sharding::interface::{
         IStorageCommitmentVerifierDispatcher, IStorageCommitmentVerifierDispatcherTrait,
     };
-    use dojo::sharding::request::{SlotEntry, SlotVerification};
+    use dojo::sharding::request::{InitialProof, SlotEntry, SlotVerification};
     use dojo::sharding::slot::compute_dynamic_member_lock_slot;
     use dojo::storage::database::DOJO_STORAGE;
     use super::{IShardingProxyDispatcher, IShardingProxyDispatcherTrait};
@@ -270,6 +274,7 @@ pub mod sharding_component {
             global_state_root: felt252,
             end_block_number: u64,
             slots: Span<SlotEntry>,
+            initial_proof: InitialProof,
         ) {
             assert(shard_id != 0, 'Shard: invalid shard id');
 
@@ -295,7 +300,7 @@ pub mod sharding_component {
             let verifier = IStorageCommitmentVerifierDispatcher {
                 contract_address: registry_addr,
             };
-            let (verified, _proven_game_contract, proven_shard_id) = verifier
+            let (verified, _proven_game_contract, _proven_shard_id) = verifier
                 .verify(
                     raw_storage_commitment,
                     get_contract_address(),
@@ -303,9 +308,51 @@ pub mod sharding_component {
                     end_block_number,
                 );
             assert(verified, Errors::COMMITMENT_NOT_VERIFIED);
-            assert(proven_shard_id == shard_id, 'Shard: proven shard_id mismatch');
 
-            self.apply_settle(shard_id, slots);
+            // S1: Verify initial storage proof and build proven initial values lookup.
+            let mut proven_initials: Felt252Dict<Nullable<felt252>> = Default::default();
+            if initial_proof.commitment != 0 {
+                assert(
+                    initial_proof.keys.len() == initial_proof.values.len(),
+                    'Initial keys/values mismatch',
+                );
+                assert(initial_proof.fork_state_root != 0, 'Fork state root required');
+
+                // Recompute initial commitment: H(key0, key1, ..., val0, val1, ...)
+                let mut initial_commitment_data: Array<felt252> = ArrayTrait::new();
+                for k in initial_proof.keys {
+                    initial_commitment_data.append(*k);
+                };
+                for v in initial_proof.values {
+                    initial_commitment_data.append(*v);
+                };
+                let raw_initial_commitment = poseidon_hash_span(
+                    initial_commitment_data.span(),
+                );
+
+                let fork_block_number = self.shard_fork_block_number.read(shard_id);
+                let (initial_verified, _, _) = verifier
+                    .verify(
+                        raw_initial_commitment,
+                        get_contract_address(),
+                        initial_proof.fork_state_root,
+                        fork_block_number,
+                    );
+                assert(initial_verified, 'Initial commitment not verified');
+
+                // Build Felt252Dict for O(1) lookup in write_slot_with_crdt.
+                let mut i: u32 = 0;
+                while i < initial_proof.keys.len() {
+                    proven_initials
+                        .insert(
+                            *initial_proof.keys[i],
+                            NullableTrait::new(*initial_proof.values[i]),
+                        );
+                    i += 1;
+                };
+            }
+
+            self.apply_settle(shard_id, slots, ref proven_initials);
         }
 
         fn set_storage_commitment_registry(
@@ -414,7 +461,8 @@ pub mod sharding_component {
             // Verify shard is active (commitment registered).
             self.verify_shard_active(shard_id);
 
-            self.apply_settle(shard_id, slots);
+            let mut empty_initials: Felt252Dict<Nullable<felt252>> = Default::default();
+            self.apply_settle(shard_id, slots, ref empty_initials);
         }
     }
 
@@ -527,11 +575,12 @@ pub mod sharding_component {
             ref self: ComponentState<TContractState>,
             shard_id: felt252,
             slots: Span<SlotEntry>,
+            ref proven_initials: Felt252Dict<Nullable<felt252>>,
         ) {
             for entry in slots {
                 let entry = *entry;
                 Self::verify_slot_ownership(entry, shard_id, @self);
-                self.write_slot_with_crdt(entry);
+                self.write_slot_with_crdt(entry, ref proven_initials);
             };
 
             // Note: StoreUpdateRecord events are emitted by the world contract
@@ -598,11 +647,12 @@ pub mod sharding_component {
 
         /// Resolve CRDT policy and write the slot value accordingly.
         ///
-        /// - Add: `new = current + (shard_value - initial_value)`
+        /// - Add: `new = current + (shard_value - initial_value)`, initial_value verified against proven dict
         /// - Set/Lock/SetLock: direct overwrite with shard_value
         fn write_slot_with_crdt(
             ref self: ComponentState<TContractState>,
             entry: SlotEntry,
+            ref proven_initials: Felt252Dict<Nullable<felt252>>,
         ) {
             let field_crdt = self.field_crdt_override.read(
                 (entry.model_selector, entry.member_selector),
@@ -613,6 +663,21 @@ pub mod sharding_component {
 
             let storage_address: StorageAddress = entry.key.try_into().unwrap();
             if is_add {
+                // S1: Verify initial_value against SP1-proven fork-block value.
+                // Null = key not in proven set → REJECT (operator must prove ALL changed Add slots).
+                // NotNull(val) = SP1 proved this value at fork block → assert match.
+                match match_nullable(proven_initials.get(entry.key)) {
+                    FromNullableResult::Null => {
+                        panic!("Add: initial_value not proven for key");
+                    },
+                    FromNullableResult::NotNull(proven_val) => {
+                        assert(
+                            entry.initial_value == proven_val.unbox(),
+                            'Add: initial_value mismatch',
+                        );
+                    },
+                };
+
                 let current_value = storage_read_syscall(0, storage_address).unwrap_syscall();
                 let current_u256: u256 = current_value.into();
                 let shard_u256: u256 = entry.value.into();

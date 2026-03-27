@@ -68,6 +68,21 @@ pub struct DeterministicProof {
     pub packed_offset: u32,
 }
 
+/// SP1-proven initial storage values at fork block.
+/// Bundles all data needed for on-chain verification of Add CRDT initial_values.
+/// When `commitment == 0`, no initial proof is provided (no Add slots changed).
+#[derive(Drop, Serde, Copy)]
+pub struct InitialProof {
+    /// SP1-proven storage keys at fork block.
+    pub keys: Span<felt252>,
+    /// SP1-proven storage values at fork block (same order as keys).
+    pub values: Span<felt252>,
+    /// Commitment hash: Poseidon(keys || values). Verified via StorageCommitment.
+    pub commitment: felt252,
+    /// TEE-attested state root at fork block.
+    pub fork_state_root: felt252,
+}
+
 #[derive(Drop, Serde, Copy, Debug, PartialEq)]
 pub struct ShardField {
     pub selector: felt252,

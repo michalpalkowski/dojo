@@ -1,7 +1,8 @@
 use dojo::model::{ModelStorage, ModelStorageTest};
 use dojo::sharding::compute_dojo_field_slot;
 use dojo::sharding::slot::compute_dojo_packed_slot;
-use dojo::sharding::request::{SlotEntry, SlotVerification, DeterministicProof};
+use core::poseidon::poseidon_hash_span;
+use dojo::sharding::request::{InitialProof, SlotEntry, SlotVerification, DeterministicProof};
 use dojo::utils::entity_id_from_keys;
 use dojo::world::{IShardingSettlementDispatcher, IShardingSettlementDispatcherTrait, IWorldDispatcherTrait};
 use starknet::ContractAddress;
@@ -308,6 +309,128 @@ fn test_settle_add_overflow_rejected() {
             make_field_slot(slot_a, 1, model_selector, entity_id, sel_a, 0),
         ].span(),
     );
+}
+
+// ── S1: initial_value proof enforcement ─────────────────────────────────
+
+/// Operator tries to skip initial proof by passing commitment=0.
+/// The Add slot should be rejected because its initial_value is unproven.
+#[test]
+#[should_panic(expected: "Add: initial_value not proven for key")]
+fn test_settle_add_rejects_missing_initial_proof() {
+    let (mut world, world_address, entity_id, slot_a, _slot_b, model_selector) = setup_foo_shard();
+    let (sel_a, _sel_b) = foo_field_selectors();
+    world
+        .dispatcher
+        .register_shard_policy(
+            model_selector,
+            dojo::sharding::request::CRDVariant::Set,
+            [dojo::sharding::request::ShardField {
+                selector: sel_a,
+                crdt: dojo::sharding::request::CRDVariant::Add,
+                max_elements: 0,
+            }]
+                .span(),
+        );
+    world.dispatcher.request_sharding([entity_id].span(), [].span());
+
+    // Call settle directly with empty initial proof (commitment=0) — bypass attempt.
+    let settlement = IShardingSettlementDispatcher { contract_address: world_address };
+    snforge_std::start_cheat_caller_address(world_address, snforge_std::test_address());
+    settlement
+        .settle(
+            1,
+            0x1,
+            1,
+            [make_field_slot(slot_a, 150, model_selector, entity_id, sel_a, 100)].span(),
+            [].span(),
+            [].span(),
+            InitialProof { keys: [].span(), values: [].span(), commitment: 0, fork_state_root: 0 },
+        );
+}
+
+/// Operator provides initial proof but lies about the initial_value in SlotEntry.
+/// The proven value is 100 but the operator claims 50 → should reject with mismatch.
+#[test]
+#[should_panic(expected: ('Add: initial_value mismatch',))]
+fn test_settle_add_rejects_falsified_initial_value() {
+    let (mut world, world_address, entity_id, slot_a, _slot_b, model_selector) = setup_foo_shard();
+    let (sel_a, _sel_b) = foo_field_selectors();
+    world
+        .dispatcher
+        .register_shard_policy(
+            model_selector,
+            dojo::sharding::request::CRDVariant::Set,
+            [dojo::sharding::request::ShardField {
+                selector: sel_a,
+                crdt: dojo::sharding::request::CRDVariant::Add,
+                max_elements: 0,
+            }]
+                .span(),
+        );
+    world.dispatcher.request_sharding([entity_id].span(), [].span());
+
+    // Proven initial is 100 (in the proof), but SlotEntry claims initial_value=50.
+    // The helper auto-builds the proof from ALL slots, so we call settle directly
+    // with a hand-crafted mismatch.
+    let initial_keys = [slot_a].span();
+    let initial_values_proven: Array<felt252> = array![100]; // SP1 proved 100
+    let mut commitment_data: Array<felt252> = array![slot_a, 100];
+    let commitment = poseidon_hash_span(commitment_data.span());
+
+    let settlement = IShardingSettlementDispatcher { contract_address: world_address };
+    snforge_std::start_cheat_caller_address(world_address, snforge_std::test_address());
+    settlement
+        .settle(
+            1,
+            0x1,
+            1,
+            // SlotEntry claims initial_value=50, but proof says 100
+            [make_field_slot(slot_a, 150, model_selector, entity_id, sel_a, 50)].span(),
+            [].span(),
+            [].span(),
+            InitialProof {
+                keys: initial_keys,
+                values: initial_values_proven.span(),
+                commitment,
+                fork_state_root: 0x1,
+            },
+        );
+}
+
+/// Zero is a valid initial value — should work when properly proven.
+#[test]
+fn test_settle_add_accepts_proven_zero_initial_value() {
+    let (mut world, world_address, entity_id, slot_a, slot_b, model_selector) = setup_foo_shard();
+    let (sel_a, sel_b) = foo_field_selectors();
+    world
+        .dispatcher
+        .register_shard_policy(
+            model_selector,
+            dojo::sharding::request::CRDVariant::Set,
+            [dojo::sharding::request::ShardField {
+                selector: sel_a,
+                crdt: dojo::sharding::request::CRDVariant::Add,
+                max_elements: 0,
+            }]
+                .span(),
+        );
+    world.dispatcher.request_sharding([entity_id].span(), [].span());
+
+    // initial_value=0, shard_value=42 → delta=42, current(100)+42=142.
+    // Zero initial must be PROVEN (in the dict), not just assumed.
+    settle_as_owner(
+        world_address,
+        1,
+        [
+            make_field_slot(slot_a, 42, model_selector, entity_id, sel_a, 0),
+            make_field_slot(slot_b, 999, model_selector, entity_id, sel_b, 0),
+        ]
+            .span(),
+    );
+
+    let foo: Foo = world.read_model(0xb0b_felt252);
+    assert(foo.a == 142, 'Expected 100 + 42 = 142');
 }
 
 // ── Cancel ──────────────────────────────────────────────────────────────
