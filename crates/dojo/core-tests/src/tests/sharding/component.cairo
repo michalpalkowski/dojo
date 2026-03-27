@@ -5,12 +5,13 @@ use core::poseidon::poseidon_hash_span;
 use dojo::sharding::request::{InitialProof, SlotEntry, SlotVerification, DeterministicProof};
 use dojo::utils::entity_id_from_keys;
 use dojo::world::{IShardingSettlementDispatcher, IShardingSettlementDispatcherTrait, IWorldDispatcherTrait};
+use snforge_std::{EventSpyTrait, EventsFilterTrait, spy_events};
 use starknet::ContractAddress;
 
 use crate::tests::helpers::{Foo, PackedPair, deploy_world_and_foo, deploy_world_with_packed_pair};
 use crate::tests::sharding::helpers::{
     foo_field_selectors, make_field_slot, register_mock_storage_commitment_verifier, setup_foo_shard,
-    settle_as_owner, settle_with_caller,
+    register_mock_sharding_proxy, settle_as_owner, settle_with_caller,
 };
 
 /// `felt252` max value (`FIELD_PRIME - 1`).
@@ -21,23 +22,109 @@ const FELT_MAX: felt252 = 0x8000000000000110000000000000000000000000000000000000
 #[test]
 fn test_request_shard_locks_entities() {
     let (world, _, entity_id, _, _, _) = setup_foo_shard();
-    world.dispatcher.request_sharding([entity_id].span(), [].span());
+    world.dispatcher.request_sharding([entity_id].span(), [].span(), [].span());
 }
 
 #[test]
 #[should_panic(expected: ('Shard: entity already sharded',))]
 fn test_request_shard_rejects_already_locked_entity() {
     let (world, _, entity_id, _, _, _) = setup_foo_shard();
-    world.dispatcher.request_sharding([entity_id].span(), [].span());
+    world.dispatcher.request_sharding([entity_id].span(), [].span(), [].span());
     // Second request for same entity should fail.
-    world.dispatcher.request_sharding([entity_id].span(), [].span());
+    world.dispatcher.request_sharding([entity_id].span(), [].span(), [].span());
 }
 
 #[test]
 #[should_panic(expected: ('Shard: no entities',))]
 fn test_request_shard_rejects_empty_entities() {
     let (world, _, _, _, _, _) = setup_foo_shard();
-    world.dispatcher.request_sharding([].span(), [].span());
+    world.dispatcher.request_sharding([].span(), [].span(), [].span());
+}
+
+#[test]
+fn test_request_shard_events_include_shared_entities_and_keys() {
+    let (world, world_address, entity_id, _, _, _) = setup_foo_shard();
+    let shared_entity: felt252 = 0xabc;
+    let key_exclusive: felt252 = 0xb0b;
+    let key_shared: felt252 = 0xabc;
+
+    let mut spy = spy_events();
+    world
+        .dispatcher
+        .request_sharding(
+            [entity_id].span(),
+            [shared_entity].span(),
+            [1, key_exclusive, 1, key_shared].span(),
+        );
+
+    let events = spy.get_events().emitted_by(world_address);
+    let mut found_requested = false;
+    let mut found_chunk = false;
+
+    let mut i: u32 = 0;
+    while i < events.events.len() {
+        let (_, event) = events.events.at(i);
+        let event_name = *event.keys.at(0);
+
+        if event_name == selector!("ShardRequested") {
+            found_requested = true;
+            assert(event.keys.at(1) == @1, 'requested shard_id');
+            assert(event.data.at(0) == @2, 'requested entities len');
+            assert(event.data.at(1) == @entity_id, 'requested exclusive first');
+            assert(event.data.at(2) == @shared_entity, 'requested shared second');
+            assert(event.data.at(3) == @1, 'requested chunk count');
+        }
+
+        if event_name == selector!("ShardEntityKeysChunk") {
+            found_chunk = true;
+            assert(event.keys.at(1) == @1, 'chunk shard_id');
+            assert(event.keys.at(2) == @0, 'chunk index');
+            assert(event.data.at(0) == @4, 'chunk flat len');
+            assert(event.data.at(1) == @1, 'chunk n_keys ex');
+            assert(event.data.at(2) == @key_exclusive, 'chunk key ex');
+            assert(event.data.at(3) == @1, 'chunk n_keys shared');
+            assert(event.data.at(4) == @key_shared, 'chunk key shared');
+        }
+
+        i += 1;
+    };
+
+    assert(found_requested, 'ShardRequested missing');
+    assert(found_chunk, 'ShardEntityKeysChunk missing');
+}
+
+#[test]
+fn test_request_shard_proxy_forwarding_includes_shared_entities_and_keys() {
+    let (world, world_address, entity_id, _, _, _) = setup_foo_shard();
+    let proxy_address = register_mock_sharding_proxy(world_address);
+
+    let shared_entity: felt252 = 0xabc;
+    let key_exclusive: felt252 = 0xb0b;
+    let key_shared: felt252 = 0xabc;
+
+    let mut spy = spy_events();
+    world
+        .dispatcher
+        .request_sharding(
+            [entity_id].span(),
+            [shared_entity].span(),
+            [1, key_exclusive, 1, key_shared].span(),
+        );
+
+    let events = spy.get_events().emitted_by(proxy_address);
+    assert(events.events.len() == 1, 'expected single proxy event');
+
+    let (_, event) = events.events.at(0);
+    assert(event.keys.at(0) == @selector!("ProxyNotified"), 'wrong proxy event');
+    assert(event.keys.at(1) == @1, 'proxy shard_id');
+    assert(event.data.at(0) == @2, 'proxy entities len');
+    assert(event.data.at(1) == @entity_id, 'proxy exclusive first');
+    assert(event.data.at(2) == @shared_entity, 'proxy shared second');
+    assert(event.data.at(3) == @4, 'proxy keys len');
+    assert(event.data.at(4) == @1, 'proxy n_keys ex');
+    assert(event.data.at(5) == @key_exclusive, 'proxy key ex');
+    assert(event.data.at(6) == @1, 'proxy n_keys shared');
+    assert(event.data.at(7) == @key_shared, 'proxy key shared');
 }
 
 // ── Entity Lock Enforcement (write path) ────────────────────────────────
@@ -46,7 +133,7 @@ fn test_request_shard_rejects_empty_entities() {
 #[should_panic(expected: ('Shard: entity locked',))]
 fn test_write_model_blocked_while_entity_sharded() {
     let (mut world, _, entity_id, _, _, _) = setup_foo_shard();
-    world.dispatcher.request_sharding([entity_id].span(), [].span());
+    world.dispatcher.request_sharding([entity_id].span(), [].span(), [].span());
 
     // write_model_test goes through set_entity_internal which checks entity lock.
     let bob: ContractAddress = 0xb0b.try_into().unwrap();
@@ -58,7 +145,7 @@ fn test_write_model_blocked_while_entity_sharded() {
 fn test_delete_model_blocked_while_entity_sharded() {
     let (mut world, _, entity_id, _, _, _) =
         setup_foo_shard();
-    world.dispatcher.request_sharding([entity_id].span(), [].span());
+    world.dispatcher.request_sharding([entity_id].span(), [].span(), [].span());
 
     // delete_entity_test goes through delete_entity_internal which checks entity lock.
     let bob: ContractAddress = 0xb0b.try_into().unwrap();
@@ -68,7 +155,7 @@ fn test_delete_model_blocked_while_entity_sharded() {
 #[test]
 fn test_write_model_allowed_after_settlement_unlocks() {
     let (mut world, world_address, entity_id, slot_a, slot_b, model_selector) = setup_foo_shard();
-    world.dispatcher.request_sharding([entity_id].span(), [].span());
+    world.dispatcher.request_sharding([entity_id].span(), [].span(), [].span());
 
     let (sel_a, sel_b) = foo_field_selectors();
     settle_as_owner(
@@ -89,7 +176,7 @@ fn test_write_model_allowed_after_settlement_unlocks() {
 #[test]
 fn test_write_model_allowed_after_cancel_unlocks() {
     let (mut world, world_address, entity_id, _, _, _) = setup_foo_shard();
-    world.dispatcher.request_sharding([entity_id].span(), [].span());
+    world.dispatcher.request_sharding([entity_id].span(), [].span(), [].span());
 
     let settlement = IShardingSettlementDispatcher { contract_address: world_address };
     snforge_std::start_cheat_caller_address(world_address, snforge_std::test_address());
@@ -108,7 +195,7 @@ fn test_write_model_allowed_after_cancel_unlocks() {
 #[test]
 fn test_settle_set_writes_values() {
     let (mut world, world_address, entity_id, slot_a, slot_b, model_selector) = setup_foo_shard();
-    world.dispatcher.request_sharding([entity_id].span(), [].span());
+    world.dispatcher.request_sharding([entity_id].span(), [].span(), [].span());
 
     let (sel_a, sel_b) = foo_field_selectors();
     settle_as_owner(
@@ -128,7 +215,7 @@ fn test_settle_set_writes_values() {
 #[test]
 fn test_settle_partial_changes() {
     let (mut world, world_address, entity_id, _slot_a, slot_b, model_selector) = setup_foo_shard();
-    world.dispatcher.request_sharding([entity_id].span(), [].span());
+    world.dispatcher.request_sharding([entity_id].span(), [].span(), [].span());
 
     let (_sel_a, sel_b) = foo_field_selectors();
     // Only change slot_b.
@@ -166,7 +253,7 @@ fn test_settle_add_crdt_computes_delta() {
                 .span(),
         );
 
-    world.dispatcher.request_sharding([entity_id].span(), [].span());
+    world.dispatcher.request_sharding([entity_id].span(), [].span(), [].span());
 
     // Settle with Add: shard produced 150, initial was 100 -> delta = 50.
     settle_as_owner(
@@ -202,7 +289,7 @@ fn test_settle_mixed_add_and_set() {
                 .span(),
         );
 
-    world.dispatcher.request_sharding([entity_id].span(), [].span());
+    world.dispatcher.request_sharding([entity_id].span(), [].span(), [].span());
 
     settle_as_owner(
         world_address, 1,
@@ -225,7 +312,7 @@ fn test_settle_mixed_add_and_set() {
 #[should_panic(expected: ('Shard: unauthorized caller',))]
 fn test_settle_rejects_unauthorized_caller() {
     let (world, world_address, entity_id, slot_a, slot_b, model_selector) = setup_foo_shard();
-    world.dispatcher.request_sharding([entity_id].span(), [].span());
+    world.dispatcher.request_sharding([entity_id].span(), [].span(), [].span());
 
     let (sel_a, sel_b) = foo_field_selectors();
 
@@ -260,7 +347,7 @@ fn test_settle_add_underflow_rejected() {
                 .span(),
         );
 
-    world.dispatcher.request_sharding([entity_id].span(), [].span());
+    world.dispatcher.request_sharding([entity_id].span(), [].span(), [].span());
 
     // Shard value (90) < initial (100) -> underflow.
     settle_as_owner(
@@ -300,7 +387,7 @@ fn test_settle_add_overflow_rejected() {
                 .span(),
         );
 
-    world.dispatcher.request_sharding([entity_id].span(), [].span());
+    world.dispatcher.request_sharding([entity_id].span(), [].span(), [].span());
 
     // delta = 1 - 0 = 1, current(FELT_MAX) + delta(1) overflows.
     settle_as_owner(
@@ -332,7 +419,7 @@ fn test_settle_add_rejects_missing_initial_proof() {
             }]
                 .span(),
         );
-    world.dispatcher.request_sharding([entity_id].span(), [].span());
+    world.dispatcher.request_sharding([entity_id].span(), [].span(), [].span());
 
     // Call settle directly with empty initial proof (commitment=0) — bypass attempt.
     let settlement = IShardingSettlementDispatcher { contract_address: world_address };
@@ -368,7 +455,7 @@ fn test_settle_add_rejects_falsified_initial_value() {
             }]
                 .span(),
         );
-    world.dispatcher.request_sharding([entity_id].span(), [].span());
+    world.dispatcher.request_sharding([entity_id].span(), [].span(), [].span());
 
     // Proven initial is 100 (in the proof), but SlotEntry claims initial_value=50.
     // The helper auto-builds the proof from ALL slots, so we call settle directly
@@ -415,7 +502,7 @@ fn test_settle_add_accepts_proven_zero_initial_value() {
             }]
                 .span(),
         );
-    world.dispatcher.request_sharding([entity_id].span(), [].span());
+    world.dispatcher.request_sharding([entity_id].span(), [].span(), [].span());
 
     // initial_value=0, shard_value=42 → delta=42, current(100)+42=142.
     // Zero initial must be PROVEN (in the dict), not just assumed.
@@ -438,7 +525,7 @@ fn test_settle_add_accepts_proven_zero_initial_value() {
 #[test]
 fn test_cancel_shard_unlocks_entities() {
     let (mut world, world_address, entity_id, _, _, _) = setup_foo_shard();
-    world.dispatcher.request_sharding([entity_id].span(), [].span());
+    world.dispatcher.request_sharding([entity_id].span(), [].span(), [].span());
 
     let settlement = IShardingSettlementDispatcher { contract_address: world_address };
     snforge_std::start_cheat_caller_address(world_address, snforge_std::test_address());
@@ -446,7 +533,7 @@ fn test_cancel_shard_unlocks_entities() {
     snforge_std::stop_cheat_caller_address(world_address);
 
     // Entity should be unlocked — can request sharding again.
-    world.dispatcher.request_sharding([entity_id].span(), [].span());
+    world.dispatcher.request_sharding([entity_id].span(), [].span(), [].span());
 
     let bob: ContractAddress = 0xb0b.try_into().unwrap();
     let result: Foo = world.read_model(bob);
@@ -458,7 +545,7 @@ fn test_cancel_shard_unlocks_entities() {
 #[should_panic(expected: ('Shard: unauthorized caller',))]
 fn test_cancel_shard_rejects_unauthorized_caller() {
     let (world, world_address, entity_id, _, _, _) = setup_foo_shard();
-    world.dispatcher.request_sharding([entity_id].span(), [].span());
+    world.dispatcher.request_sharding([entity_id].span(), [].span(), [].span());
 
     // Call cancel as non-owner.
     let not_owner: ContractAddress = 0xdead.try_into().unwrap();
@@ -472,7 +559,7 @@ fn test_cancel_shard_rejects_unauthorized_caller() {
 #[test]
 fn test_settle_unlocks_entities_for_resharding() {
     let (mut world, world_address, entity_id, slot_a, slot_b, model_selector) = setup_foo_shard();
-    world.dispatcher.request_sharding([entity_id].span(), [].span());
+    world.dispatcher.request_sharding([entity_id].span(), [].span(), [].span());
 
     let (sel_a, sel_b) = foo_field_selectors();
     settle_as_owner(
@@ -484,7 +571,7 @@ fn test_settle_unlocks_entities_for_resharding() {
     );
 
     // After settlement, entity should be unlocked — can request again.
-    world.dispatcher.request_sharding([entity_id].span(), [].span());
+    world.dispatcher.request_sharding([entity_id].span(), [].span(), [].span());
 }
 
 #[test]
@@ -493,7 +580,7 @@ fn test_sequential_shards_increment_shard_id() {
     let (sel_a, sel_b) = foo_field_selectors();
 
     // Shard 1.
-    world.dispatcher.request_sharding([entity_id].span(), [].span());
+    world.dispatcher.request_sharding([entity_id].span(), [].span(), [].span());
     settle_as_owner(
         world_address, 1,
         [
@@ -503,7 +590,7 @@ fn test_sequential_shards_increment_shard_id() {
     );
 
     // Shard 2 — entity now unlocked, new shard_id = 2.
-    world.dispatcher.request_sharding([entity_id].span(), [].span());
+    world.dispatcher.request_sharding([entity_id].span(), [].span(), [].span());
     settle_as_owner(
         world_address, 2,
         [
@@ -614,7 +701,7 @@ fn test_register_shard_policy_rejects_zero_model() {
 #[should_panic(expected: ('Shard: slot ownership mismatch',))]
 fn test_settle_rejects_wrong_model_selector() {
     let (world, world_address, entity_id, slot_a, slot_b, model_selector) = setup_foo_shard();
-    world.dispatcher.request_sharding([entity_id].span(), [].span());
+    world.dispatcher.request_sharding([entity_id].span(), [].span(), [].span());
 
     let (sel_a, sel_b) = foo_field_selectors();
 
@@ -646,7 +733,7 @@ fn test_settle_rejects_wrong_model_selector() {
 #[should_panic(expected: ('Shard: entity not in shard',))]
 fn test_settle_rejects_unlocked_entity() {
     let (world, world_address, entity_id, _slot_a, _slot_b, model_selector) = setup_foo_shard();
-    world.dispatcher.request_sharding([entity_id].span(), [].span());
+    world.dispatcher.request_sharding([entity_id].span(), [].span(), [].span());
 
     // Compute a slot for a DIFFERENT entity that is NOT locked.
     let other_entity: felt252 = 0x999;
@@ -664,7 +751,7 @@ fn test_settle_rejects_unlocked_entity() {
 #[should_panic(expected: ('Shard: slot ownership mismatch',))]
 fn test_settle_rejects_zero_comp_key_for_deterministic_slot() {
     let (world, world_address, entity_id, slot_a, _slot_b, model_selector) = setup_foo_shard();
-    world.dispatcher.request_sharding([entity_id].span(), [].span());
+    world.dispatcher.request_sharding([entity_id].span(), [].span(), [].span());
 
     let (sel_a, _sel_b) = foo_field_selectors();
     // Pass empty key_derivation_chain — derives entity_id, not combine_key(entity_id, sel_a),
@@ -706,7 +793,7 @@ fn test_settle_rejects_packed_offset_bypass_for_unlocked_entity() {
 
     let bob_eid = entity_id_from_keys(@bob);
     let alice_eid = entity_id_from_keys(@alice);
-    world.dispatcher.request_sharding([bob_eid].span(), [].span());
+    world.dispatcher.request_sharding([bob_eid].span(), [].span(), [].span());
 
     let forged_key = compute_dojo_packed_slot(model_selector, alice_eid) + 1;
     settle_as_owner(
@@ -737,7 +824,7 @@ fn test_settle_rejects_packed_offset_bypass_for_unlocked_entity() {
 #[should_panic(expected: ('Shard: member_sel mismatch',))]
 fn test_settle_rejects_empty_chain_with_nonzero_member_selector() {
     let (world, world_address, entity_id, _, _, model_selector) = setup_foo_shard();
-    world.dispatcher.request_sharding([entity_id].span(), [].span());
+    world.dispatcher.request_sharding([entity_id].span(), [].span(), [].span());
 
     let (sel_a, _sel_b) = foo_field_selectors();
     let packed_slot = compute_dojo_packed_slot(model_selector, entity_id);
@@ -767,7 +854,7 @@ fn test_settle_rejects_empty_chain_with_nonzero_member_selector() {
 #[should_panic(expected: ('Shard: member_sel mismatch',))]
 fn test_settle_rejects_member_selector_not_matching_chain() {
     let (world, world_address, entity_id, slot_a, _, model_selector) = setup_foo_shard();
-    world.dispatcher.request_sharding([entity_id].span(), [].span());
+    world.dispatcher.request_sharding([entity_id].span(), [].span(), [].span());
 
     let (sel_a, sel_b) = foo_field_selectors();
     settle_as_owner(
@@ -798,7 +885,7 @@ fn test_settle_rejects_member_selector_not_matching_chain() {
 #[should_panic(expected: ('Shard: slot ownership mismatch',))]
 fn test_settle_rejects_dynamic_lock_with_wrong_entity() {
     let (world, world_address, entity_id, _, _, model_selector) = setup_foo_shard();
-    world.dispatcher.request_sharding([entity_id].span(), [].span());
+    world.dispatcher.request_sharding([entity_id].span(), [].span(), [].span());
 
     let (sel_a, _sel_b) = foo_field_selectors();
     let wrong_entity: felt252 = 0xBAD;
@@ -828,7 +915,7 @@ fn test_settle_rejects_dynamic_lock_with_wrong_entity() {
 #[test]
 fn test_cancel_shard_by_creator_succeeds() {
     let (mut world, world_address, entity_id, _, _, _) = setup_foo_shard();
-    world.dispatcher.request_sharding([entity_id].span(), [].span());
+    world.dispatcher.request_sharding([entity_id].span(), [].span(), [].span());
 
     let settlement = IShardingSettlementDispatcher { contract_address: world_address };
     snforge_std::start_cheat_caller_address(world_address, snforge_std::test_address());
@@ -845,7 +932,7 @@ fn test_cancel_shard_by_creator_succeeds() {
 #[should_panic(expected: ('Shard: active shards exist',))]
 fn test_register_policy_rejected_while_shard_active() {
     let (world, world_address, entity_id, _, _, model_selector) = setup_foo_shard();
-    world.dispatcher.request_sharding([entity_id].span(), [].span());
+    world.dispatcher.request_sharding([entity_id].span(), [].span(), [].span());
 
     snforge_std::start_cheat_caller_address(world_address, snforge_std::test_address());
     let world_disp = dojo::world::IWorldDispatcher { contract_address: world_address };
@@ -862,7 +949,7 @@ fn test_register_policy_rejected_while_shard_active() {
 #[should_panic(expected: ('Shard: not found',))]
 fn test_settle_same_shard_twice_rejected() {
     let (world, world_address, entity_id, slot_a, slot_b, model_selector) = setup_foo_shard();
-    world.dispatcher.request_sharding([entity_id].span(), [].span());
+    world.dispatcher.request_sharding([entity_id].span(), [].span(), [].span());
 
     let (sel_a, sel_b) = foo_field_selectors();
     settle_as_owner(

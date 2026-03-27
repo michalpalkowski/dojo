@@ -36,6 +36,62 @@ pub mod mock_storage_commitment_verifier {
     }
 }
 
+/// Minimal sharding proxy for tests.
+/// Captures forwarded request payload in an emitted event.
+#[starknet::contract]
+pub mod mock_sharding_proxy {
+    #[starknet::interface]
+    pub trait IProxyAbi<T> {
+        fn notify_shard_requested(
+            ref self: T,
+            shard_id: felt252,
+            entities: Span<felt252>,
+            entity_keys_flat: Span<felt252>,
+        );
+        fn end_shard(ref self: T, shard_id: felt252);
+    }
+
+    #[event]
+    #[derive(Drop, starknet::Event)]
+    pub enum Event {
+        ProxyNotified: ProxyNotified,
+        ProxyEnded: ProxyEnded,
+    }
+
+    #[derive(Drop, starknet::Event)]
+    pub struct ProxyNotified {
+        #[key]
+        pub shard_id: felt252,
+        pub entities: Span<felt252>,
+        pub entity_keys_flat: Span<felt252>,
+    }
+
+    #[derive(Drop, starknet::Event)]
+    pub struct ProxyEnded {
+        #[key]
+        pub shard_id: felt252,
+    }
+
+    #[storage]
+    struct Storage {}
+
+    #[abi(embed_v0)]
+    impl MockProxy of IProxyAbi<ContractState> {
+        fn notify_shard_requested(
+            ref self: ContractState,
+            shard_id: felt252,
+            entities: Span<felt252>,
+            entity_keys_flat: Span<felt252>,
+        ) {
+            self.emit(ProxyNotified { shard_id, entities, entity_keys_flat });
+        }
+
+        fn end_shard(ref self: ContractState, shard_id: felt252) {
+            self.emit(ProxyEnded { shard_id });
+        }
+    }
+}
+
 // ── Field selector helpers ──────────────────────────────────────────
 
 pub fn foo_field_selectors() -> (felt252, felt252) {
@@ -58,6 +114,16 @@ pub fn register_mock_storage_commitment_verifier(
     snforge_std::start_cheat_caller_address(world_address, snforge_std::test_address());
     settlement.set_storage_commitment_registry(mock_verifier);
     snforge_std::stop_cheat_caller_address(world_address);
+}
+
+/// Deploy mock sharding proxy and register it on world.
+pub fn register_mock_sharding_proxy(world_address: ContractAddress) -> ContractAddress {
+    let proxy = declare_and_deploy("mock_sharding_proxy");
+    let settlement = IShardingSettlementDispatcher { contract_address: world_address };
+    snforge_std::start_cheat_caller_address(world_address, snforge_std::test_address());
+    settlement.set_sharding_proxy(proxy);
+    snforge_std::stop_cheat_caller_address(world_address);
+    proxy
 }
 
 /// Deploy world + Foo + mock verifier, write initial data, compute slots.

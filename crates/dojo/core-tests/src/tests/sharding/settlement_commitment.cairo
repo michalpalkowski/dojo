@@ -24,7 +24,7 @@ fn test_settle_panics_without_commitment_registry() {
     let slot_a = compute_dojo_field_slot(model_selector, entity_id, sel_a);
     let slot_b = compute_dojo_field_slot(model_selector, entity_id, sel_b);
 
-    world.dispatcher.request_sharding([entity_id].span(), [].span());
+    world.dispatcher.request_sharding([entity_id].span(), [].span(), [].span());
 
     settle_as_owner(
         world_address,

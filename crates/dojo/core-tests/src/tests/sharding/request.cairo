@@ -70,7 +70,7 @@ fn test_multi_entity_shard_settles_both() {
     let alice_eid = entity_id_from_keys(@alice);
 
     // Lock both entities in one shard.
-    world.dispatcher.request_sharding([bob_eid, alice_eid].span(), [].span());
+    world.dispatcher.request_sharding([bob_eid, alice_eid].span(), [].span(), [].span());
 
     let bob_slot_a = compute_dojo_field_slot(model_selector, bob_eid, sel_a);
     let bob_slot_b = compute_dojo_field_slot(model_selector, bob_eid, sel_b);
@@ -110,7 +110,7 @@ fn test_multi_entity_cancel_unlocks_all() {
     let bob_eid = entity_id_from_keys(@bob);
     let alice_eid = entity_id_from_keys(@alice);
 
-    world.dispatcher.request_sharding([bob_eid, alice_eid].span(), [].span());
+    world.dispatcher.request_sharding([bob_eid, alice_eid].span(), [].span(), [].span());
 
     let settlement = IShardingSettlementDispatcher { contract_address: world_address };
     snforge_std::start_cheat_caller_address(world_address, snforge_std::test_address());
@@ -118,7 +118,7 @@ fn test_multi_entity_cancel_unlocks_all() {
     snforge_std::stop_cheat_caller_address(world_address);
 
     // Both entities should be unlocked — can shard again.
-    world.dispatcher.request_sharding([bob_eid, alice_eid].span(), [].span());
+    world.dispatcher.request_sharding([bob_eid, alice_eid].span(), [].span(), [].span());
 
     // Values unchanged.
     let bob_result: Foo = world.read_model(bob);
@@ -145,7 +145,7 @@ fn test_reshard_after_settlement_uses_new_values() {
     let slot_b = compute_dojo_field_slot(model_selector, entity_id, sel_b);
 
     // Shard 1: Set a=500, b=300.
-    world.dispatcher.request_sharding([entity_id].span(), [].span());
+    world.dispatcher.request_sharding([entity_id].span(), [].span(), [].span());
     settle_as_owner(
         world_address, 1,
         [
@@ -155,7 +155,7 @@ fn test_reshard_after_settlement_uses_new_values() {
     );
 
     // Shard 2: Add CRDT on slot_a (initial=500 from shard 1 result).
-    world.dispatcher.request_sharding([entity_id].span(), [].span());
+    world.dispatcher.request_sharding([entity_id].span(), [].span(), [].span());
     // Shard sees initial=500, produces 600 → delta=100.
     settle_as_owner(
         world_address, 2,
@@ -184,7 +184,7 @@ fn test_settle_with_no_changes() {
 
     let entity_id = entity_id_from_keys(@bob);
 
-    world.dispatcher.request_sharding([entity_id].span(), [].span());
+    world.dispatcher.request_sharding([entity_id].span(), [].span(), [].span());
 
     // Empty slots — nothing changed on shard.
     settle_as_owner(world_address, 1, [].span());
@@ -207,7 +207,7 @@ fn test_cancel_after_request_unlocks_entity() {
 
     let entity_id = entity_id_from_keys(@bob);
 
-    world.dispatcher.request_sharding([entity_id].span(), [].span());
+    world.dispatcher.request_sharding([entity_id].span(), [].span(), [].span());
 
     let settlement = IShardingSettlementDispatcher { contract_address: world_address };
     snforge_std::start_cheat_caller_address(world_address, snforge_std::test_address());
@@ -220,5 +220,5 @@ fn test_cancel_after_request_unlocks_entity() {
     assert(result.b == 200, 'cancel: b unchanged');
 
     // Entity unlocked — can re-shard.
-    world.dispatcher.request_sharding([entity_id].span(), [].span());
+    world.dispatcher.request_sharding([entity_id].span(), [].span(), [].span());
 }
