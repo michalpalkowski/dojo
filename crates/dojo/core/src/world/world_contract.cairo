@@ -1159,10 +1159,11 @@ pub mod world {
         fn request_sharding(
             ref self: ContractState,
             entities: Span<felt252>,
+            shared_entities: Span<felt252>,
             entity_keys_flat: Span<felt252>,
         ) -> felt252 {
             self.assert_caller_is_shard_writer();
-            self.sharding.request_shard(entities, entity_keys_flat)
+            self.sharding.request_shard(entities, shared_entities, entity_keys_flat)
         }
 
         fn end_shard(ref self: ContractState, shard_id: felt252) {

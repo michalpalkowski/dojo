@@ -353,8 +353,9 @@ pub trait IWorld<T> {
     ///
     /// # Arguments
     ///
-    /// * `entities` - Entity IDs to lock for sharding.
-    fn request_sharding(ref self: T, entities: Span<felt252>, entity_keys_flat: Span<felt252>) -> felt252;
+    /// * `entities` - Entity IDs for exclusive lock (SetLock/Lock). Blocks mainnet writes.
+    /// * `shared_entities` - Entity IDs for concurrent lock (Set/Add). Mainnet writes allowed.
+    fn request_sharding(ref self: T, entities: Span<felt252>, shared_entities: Span<felt252>, entity_keys_flat: Span<felt252>) -> felt252;
 
     /// Ends the shard session and emits `ShardFinished`.
     /// Caller must be the world owner.

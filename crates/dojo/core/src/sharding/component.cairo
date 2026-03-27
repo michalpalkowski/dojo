@@ -12,13 +12,19 @@ pub trait IShardingProxy<T> {
 pub trait IContractComponent<TContractState> {
     /// Lock entities and allocate shard. Returns shard_id.
     ///
-    /// `entities` must contain **Dojo entity_ids** (= `Poseidon(serialized_keys)`),
+    /// Entity IDs must be **Dojo entity_ids** (= `Poseidon(serialized_keys)`),
     /// NOT raw model keys. The world contract's write-protection computes
     /// `entity_id_from_serialized_keys(keys)` before checking `entity_lock`,
     /// so entity_lock must store hashed entity_ids to match.
+    ///
+    /// `entities` — exclusive lock (SetLock/Lock). Blocks mainnet writes. One shard at a time.
+    /// `shared_entities` — concurrent lock (Set LWW/Add). Mainnet writes allowed. Multiple shards OK.
+    ///
+    /// Mutual exclusion: an entity cannot be in both exclusive and shared mode simultaneously.
     fn request_shard(
         ref self: TContractState,
         entities: Span<felt252>,
+        shared_entities: Span<felt252>,
         entity_keys_flat: Span<felt252>,
     ) -> felt252;
 
@@ -94,11 +100,20 @@ pub mod sharding_component {
 
     #[storage]
     pub struct Storage {
-        /// Entity-level lock: entity_id → shard_id (0 = unlocked).
+        /// Exclusive entity lock: entity_id → shard_id (0 = unlocked).
+        /// Used by SetLock and Lock CRDTs. Blocks mainnet writes via is_entity_locked().
         entity_lock: Map<felt252, felt252>,
-        /// Shard entity tracking for unlock: (shard_id, index) → entity_id.
+        /// Shard exclusive entity tracking for unlock: (shard_id, index) → entity_id.
         shard_entity_count: Map<felt252, u32>,
         shard_entities: Map<(felt252, u32), felt252>,
+        /// Shared (concurrent) lock: entity_id → count of active shards with shared access.
+        /// Used by Set (LWW) and Add CRDTs. Does NOT block mainnet writes.
+        entity_shared_count: Map<felt252, u32>,
+        /// Shared shard membership: (entity_id, shard_id) → true if shard has shared access.
+        entity_shared_shard: Map<(felt252, felt252), bool>,
+        /// Shard shared entity tracking for unlock: (shard_id, index) → entity_id.
+        shard_shared_entities: Map<(felt252, u32), felt252>,
+        shard_shared_entity_count: Map<felt252, u32>,
         /// Request-time block number bound to the shard session.
         shard_fork_block_number: Map<felt252, u64>,
         /// Internal shard ID counter.
@@ -107,7 +122,7 @@ pub mod sharding_component {
         storage_commitment_registry: ContractAddress,
         /// Address of the sharding proxy contract (event bus). Set once by owner.
         sharding_proxy: ContractAddress,
-        /// Default CRDT variant for a model: model_selector → encoded CRDVariant (0=unset, 1=Set, 2=Add, 3=Lock, 4=SetLock).
+        /// Default CRDT variant for a model: model_selector → encoded CRDVariant (0=unset→SetLock, 1=Set, 2=Add, 3=Lock, 4=SetLock).
         model_default_crdt: Map<felt252, felt252>,
         /// Per-field CRDT override: (model_selector, field_selector) → encoded CRDVariant (0=use default).
         field_crdt_override: Map<(felt252, felt252), felt252>,
@@ -144,6 +159,7 @@ pub mod sharding_component {
     pub struct ShardRequested {
         #[key]
         pub shard_id: felt252,
+        /// All entities in request order: exclusive first, then shared.
         pub entities: Span<felt252>,
         /// Number of `ShardEntityKeysChunk` events that follow (0 if no keys).
         pub entity_key_chunks: u32,
@@ -183,7 +199,18 @@ pub mod sharding_component {
         } else if encoded == 4 {
             super::CRDVariant::SetLock
         } else {
-            super::CRDVariant::Set // default for unset (0)
+            super::CRDVariant::SetLock // default for unset (0) — safe exclusive overwrite
+        }
+    }
+
+    /// Returns true if the CRDT variant is concurrent (Set LWW or Add).
+    /// Concurrent CRDTs use shared locks, not exclusive entity_lock.
+    fn is_concurrent_crdt(crdt: super::CRDVariant) -> bool {
+        match crdt {
+            super::CRDVariant::Set => true,
+            super::CRDVariant::Add => true,
+            super::CRDVariant::Lock => false,
+            super::CRDVariant::SetLock => false,
         }
     }
 
@@ -204,6 +231,10 @@ pub mod sharding_component {
         pub const MEMBER_SELECTOR_MISMATCH: felt252 = 'Shard: member_sel mismatch';
         pub const ENTITY_NOT_IN_SHARD: felt252 = 'Shard: entity not in shard';
         pub const ENTITY_KEYS_MALFORMED: felt252 = 'Shard: entity_keys malformed';
+        pub const ENTITY_HAS_SHARED_LOCKS: felt252 = 'Shard: entity has shared locks';
+        pub const ENTITY_HAS_EXCLUSIVE_LOCK: felt252 = 'Shard: entity exclusive locked';
+        pub const SHARED_NEEDS_CONCURRENT: felt252 = 'Shard: shared needs Set or Add';
+        pub const LOCK_ENTITY_NO_SETTLE: felt252 = 'Shard: Lock entity no settle';
     }
 
     #[embeddable_as(ContractComponentImpl)]
@@ -213,12 +244,14 @@ pub mod sharding_component {
         fn request_shard(
             ref self: ComponentState<TContractState>,
             entities: Span<felt252>,
+            shared_entities: Span<felt252>,
             entity_keys_flat: Span<felt252>,
         ) -> felt252 {
-            assert(entities.len() != 0, Errors::NO_ENTITIES);
+            assert(entities.len() + shared_entities.len() != 0, Errors::NO_ENTITIES);
 
             // Validate entity_keys_flat format: [n_keys_0, key0..., n_keys_1, key1...]
             // Must contain exactly one length-prefixed key group per entity.
+            let total_entity_count = entities.len() + shared_entities.len();
             if entity_keys_flat.len() != 0 {
                 let mut offset: u32 = 0;
                 let mut parsed_count: u32 = 0;
@@ -229,7 +262,7 @@ pub mod sharding_component {
                     parsed_count += 1;
                 };
                 assert(offset == entity_keys_flat.len(), Errors::ENTITY_KEYS_MALFORMED);
-                assert(parsed_count == entities.len(), Errors::ENTITY_KEYS_MALFORMED);
+                assert(parsed_count == total_entity_count, Errors::ENTITY_KEYS_MALFORMED);
             }
 
             let shard_id = self.next_shard_id.read() + 1;
@@ -243,26 +276,61 @@ pub mod sharding_component {
             self.active_shard_list.write(active_idx, shard_id);
             self.active_shard_count.write(active_idx + 1);
 
-            // Single pass: validate unlocked + lock + record entity.
+            // Entities list for events/proxy:
+            // request order is [exclusive..., shared...], matching entity_keys_flat groups.
+            let mut request_entities: Array<felt252> = ArrayTrait::new();
+
+            // ── Fail fast: reject overlap between exclusive and shared lists ──
+            // An entity cannot be in both lists in the same request.
+            for eid in shared_entities {
+                for xid in entities {
+                    assert(*eid != *xid, 'Shard: entity in both lists');
+                };
+            };
+
+            // ── Exclusive entities (SetLock/Lock) ──
+            // Single pass: validate unlocked + no shared locks + lock + record.
             let entity_count: u32 = entities.len();
             self.shard_entity_count.write(shard_id, entity_count);
             let mut i: u32 = 0;
             for entity_id in entities {
                 let entity_id = *entity_id;
                 assert(self.entity_lock.read(entity_id) == 0, Errors::ENTITY_ALREADY_SHARDED);
+                assert(self.entity_shared_count.read(entity_id) == 0, Errors::ENTITY_HAS_SHARED_LOCKS);
                 self.entity_lock.write(entity_id, shard_id);
                 self.shard_entities.write((shard_id, i), entity_id);
+                request_entities.append(entity_id);
                 i += 1;
             };
 
+            // ── Shared entities (Set LWW / Add) ──
+            // Reference-counted: multiple shards can hold shared access.
+            // Mutual exclusion: cannot be exclusive-locked.
+            let shared_count: u32 = shared_entities.len();
+            self.shard_shared_entity_count.write(shard_id, shared_count);
+            let mut j: u32 = 0;
+            for entity_id in shared_entities {
+                let entity_id = *entity_id;
+                assert(self.entity_lock.read(entity_id) == 0, Errors::ENTITY_HAS_EXCLUSIVE_LOCK);
+                self.entity_shared_count.write(entity_id, self.entity_shared_count.read(entity_id) + 1);
+                self.entity_shared_shard.write((entity_id, shard_id), true);
+                self.shard_shared_entities.write((shard_id, j), entity_id);
+                request_entities.append(entity_id);
+                j += 1;
+            };
+
             let num_chunks = self.emit_chunked_entity_keys(shard_id, entity_keys_flat);
-            self.emit(ShardRequested { shard_id, entities, entity_key_chunks: num_chunks });
+            self.emit(
+                ShardRequested {
+                    shard_id, entities: request_entities.span(), entity_key_chunks: num_chunks,
+                },
+            );
 
             // Notify the sharding proxy (event bus) so the operator discovers this shard.
             let proxy_addr = self.sharding_proxy.read();
             if proxy_addr != core::num::traits::Zero::zero() {
                 let proxy = IShardingProxyDispatcher { contract_address: proxy_addr };
-                proxy.notify_shard_requested(shard_id, entities, entity_keys_flat);
+                proxy.notify_shard_requested(shard_id, request_entities.span(), entity_keys_flat);
             }
 
             shard_id
@@ -372,13 +440,13 @@ pub mod sharding_component {
         }
 
         fn cancel_shard(ref self: ComponentState<TContractState>, shard_id: felt252) {
-            assert(self.shard_entity_count.read(shard_id) != 0, Errors::SHARD_NOT_FOUND);
+            self.verify_shard_active(shard_id);
             self.unlock_entities(shard_id);
             self.clear_shard_state(shard_id);
         }
 
         fn end_shard(ref self: ComponentState<TContractState>, shard_id: felt252) {
-            assert(self.shard_entity_count.read(shard_id) != 0, Errors::SHARD_NOT_FOUND);
+            self.verify_shard_active(shard_id);
 
             self.emit(ShardFinished { shard_id });
 
@@ -535,12 +603,17 @@ pub mod sharding_component {
             entities
         }
 
-        /// Verify shard is active (commitment was registered in request_shard).
+        /// Verify shard is active (was created in request_shard).
         fn verify_shard_active(
             self: @ComponentState<TContractState>,
             shard_id: felt252,
         ) {
-            assert(self.shard_entity_count.read(shard_id) != 0, Errors::SHARD_NOT_FOUND);
+            // A shard is active if it has exclusive OR shared entities.
+            assert(
+                self.shard_entity_count.read(shard_id) != 0
+                    || self.shard_shared_entity_count.read(shard_id) != 0,
+                Errors::SHARD_NOT_FOUND,
+            );
         }
 
         /// Settlement security model — three independent guarantees:
@@ -591,11 +664,14 @@ pub mod sharding_component {
             self.clear_shard_state(shard_id);
         }
 
-        /// Verify that the slot belongs to a locked entity in this shard.
+        /// Verify that the slot belongs to an entity owned by this shard.
         ///
         /// Checks two properties:
         /// 1. The storage key is derived from entity_id (key derivation or dynamic lock).
-        /// 2. The entity is locked by the given shard_id.
+        /// 2. The entity is owned by the given shard_id (exclusive OR shared lock).
+        ///
+        /// For shared entities, additionally enforces that the slot's CRDT is concurrent
+        /// (Set or Add) — exclusive CRDTs (SetLock/Lock) are not allowed on shared entities.
         ///
         /// For Deterministic slots, also binds member_selector to key_derivation_chain[0]
         /// to prevent CRDT policy faking (e.g. claiming Add for a Set field).
@@ -639,30 +715,53 @@ pub mod sharding_component {
                     assert(expected_key == entry.key, Errors::SLOT_OWNERSHIP_MISMATCH);
                 },
             }
+
+            // Check entity ownership: exclusive lock OR shared lock.
+            let exclusive_shard = self.entity_lock.read(entry.entity_id);
+            if exclusive_shard == shard_id {
+                return; // Exclusive lock — any CRDT allowed (Set, Add, SetLock, Lock handled in write).
+            }
+
+            // Check shared lock membership.
             assert(
-                self.entity_lock.read(entry.entity_id) == shard_id,
+                self.entity_shared_shard.read((entry.entity_id, shard_id)),
                 Errors::ENTITY_NOT_IN_SHARD,
             );
+            // Shared entity: enforce concurrent CRDT only (Set or Add).
+            let effective_crdt = Self::resolve_effective_crdt(entry, self);
+            assert(is_concurrent_crdt(effective_crdt), Errors::SHARED_NEEDS_CONCURRENT);
         }
 
-        /// Resolve CRDT policy and write the slot value accordingly.
-        ///
-        /// - Add: `new = current + (shard_value - initial_value)`, initial_value verified against proven dict
-        /// - Set/Lock/SetLock: direct overwrite with shard_value
-        fn write_slot_with_crdt(
-            ref self: ComponentState<TContractState>,
+        /// Resolve the effective CRDT for a slot entry (field override > model default).
+        fn resolve_effective_crdt(
             entry: SlotEntry,
-            ref proven_initials: Felt252Dict<Nullable<felt252>>,
-        ) {
+            self: @ComponentState<TContractState>,
+        ) -> super::CRDVariant {
             let field_crdt = self.field_crdt_override.read(
                 (entry.model_selector, entry.member_selector),
             );
             let default_crdt = self.model_default_crdt.read(entry.model_selector);
             let effective_encoded = if field_crdt != 0 { field_crdt } else { default_crdt };
-            let is_add = decode_crdt(effective_encoded) == super::CRDVariant::Add;
+            decode_crdt(effective_encoded)
+        }
+
+        /// Resolve CRDT policy and write the slot value accordingly.
+        ///
+        /// - Lock: REJECT — Lock entities are frozen, no settlement slots allowed.
+        /// - Add: `new = current + (shard_value - initial_value)`, initial_value verified against proven dict
+        /// - Set/SetLock: direct overwrite with shard_value
+        fn write_slot_with_crdt(
+            ref self: ComponentState<TContractState>,
+            entry: SlotEntry,
+            ref proven_initials: Felt252Dict<Nullable<felt252>>,
+        ) {
+            let effective_crdt = Self::resolve_effective_crdt(entry, @self);
+
+            // Lock = freeze: entity must not be modified. Reject any settlement slot.
+            assert(effective_crdt != super::CRDVariant::Lock, Errors::LOCK_ENTITY_NO_SETTLE);
 
             let storage_address: StorageAddress = entry.key.try_into().unwrap();
-            if is_add {
+            if effective_crdt == super::CRDVariant::Add {
                 // S1: Verify initial_value against SP1-proven fork-block value.
                 // Null = key not in proven set → REJECT (operator must prove ALL changed Add slots).
                 // NotNull(val) = SP1 proved this value at fork block → assert match.
@@ -688,6 +787,7 @@ pub mod sharding_component {
                 let new_value: felt252 = sum.try_into().expect(Errors::ARITHMETIC_OVERFLOW);
                 storage_write_syscall(0, storage_address, new_value).unwrap_syscall();
             } else {
+                // Set (LWW) and SetLock: direct overwrite.
                 storage_write_syscall(0, storage_address, entry.value).unwrap_syscall();
             }
         }
@@ -727,6 +827,7 @@ pub mod sharding_component {
         }
 
         fn unlock_entities(ref self: ComponentState<TContractState>, shard_id: felt252) {
+            // Unlock exclusive entities.
             let count = self.shard_entity_count.read(shard_id);
             let mut i: u32 = 0;
             while i < count {
@@ -734,9 +835,20 @@ pub mod sharding_component {
                 self.entity_lock.write(entity_id, 0);
                 i += 1;
             };
+            // Unlock shared entities (decrement ref count, clear membership).
+            let shared_count = self.shard_shared_entity_count.read(shard_id);
+            let mut j: u32 = 0;
+            while j < shared_count {
+                let entity_id = self.shard_shared_entities.read((shard_id, j));
+                self.entity_shared_shard.write((entity_id, shard_id), false);
+                let prev = self.entity_shared_count.read(entity_id);
+                self.entity_shared_count.write(entity_id, prev - 1);
+                j += 1;
+            };
         }
 
         fn clear_shard_state(ref self: ComponentState<TContractState>, shard_id: felt252) {
+            // Clear exclusive entity tracking.
             let entity_count = self.shard_entity_count.read(shard_id);
             let mut i: u32 = 0;
             while i < entity_count {
@@ -744,6 +856,14 @@ pub mod sharding_component {
                 i += 1;
             };
             self.shard_entity_count.write(shard_id, 0);
+            // Clear shared entity tracking.
+            let shared_count = self.shard_shared_entity_count.read(shard_id);
+            let mut j: u32 = 0;
+            while j < shared_count {
+                self.shard_shared_entities.write((shard_id, j), 0);
+                j += 1;
+            };
+            self.shard_shared_entity_count.write(shard_id, 0);
             self.shard_fork_block_number.write(shard_id, 0);
             self.shard_creator.write(shard_id, core::num::traits::Zero::zero());
 
