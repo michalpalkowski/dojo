@@ -28,14 +28,14 @@ pub mod sharding_systems {
             let mut world = self.world(@"ns");
             let ns_hash = dojo::utils::bytearray_hash(@"ns");
 
-            // ── Entity-locked models → Set (direct overwrite) ──
+            // ── Entity-locked models → SetLock (exclusive overwrite) ──
 
             // Moves: player state during gameplay session
             register_policy(
                 ref world,
                 ns_hash,
                 Model::<Moves>::selector(ns_hash),
-                CRDVariant::Set,
+                CRDVariant::SetLock,
                 [].span(),
             );
 
@@ -44,7 +44,7 @@ pub mod sharding_systems {
                 ref world,
                 ns_hash,
                 Model::<Position>::selector(ns_hash),
-                CRDVariant::Set,
+                CRDVariant::SetLock,
                 [].span(),
             );
 
@@ -53,7 +53,7 @@ pub mod sharding_systems {
                 ref world,
                 ns_hash,
                 Model::<MockToken>::selector(ns_hash),
-                CRDVariant::Set,
+                CRDVariant::SetLock,
                 [].span(),
             );
 
@@ -62,7 +62,7 @@ pub mod sharding_systems {
                 ref world,
                 ns_hash,
                 Model::<PlayerConfig>::selector(ns_hash),
-                CRDVariant::Set,
+                CRDVariant::SetLock,
                 [
                     ShardField {
                         selector: selector!("items"),
@@ -88,7 +88,7 @@ pub mod sharding_systems {
 
             world
                 .dispatcher
-                .request_sharding(dojo_entities.span(), entity_keys_flat.span());
+                .request_sharding(dojo_entities.span(), [].span(), entity_keys_flat.span());
         }
 
         fn end_shard(ref self: ContractState, shard_id: felt252) {
@@ -247,6 +247,30 @@ mod tests {
         let mock_config = IMockVerifierConfigDispatcher { contract_address: mock_verifier };
         mock_config.set_shard_id(shard_id);
 
+        // Build InitialProof from all settlement slots.
+        // This keeps Add semantics correct even when initial_value == 0.
+        // The mock verifier accepts any commitment, so we only need a consistent keys/values dict.
+        let mut init_keys: Array<felt252> = ArrayTrait::new();
+        let mut init_values: Array<felt252> = ArrayTrait::new();
+        for entry in slots {
+            init_keys.append(*entry.key);
+            init_values.append(*entry.initial_value);
+        };
+        let has_initials = init_keys.len() > 0;
+        let initial_commitment = if has_initials {
+            // Compute commitment so the on-chain check passes (mock verifier accepts any).
+            let mut data: Array<felt252> = ArrayTrait::new();
+            for k in init_keys.span() {
+                data.append(*k);
+            };
+            for v in init_values.span() {
+                data.append(*v);
+            };
+            core::poseidon::poseidon_hash_span(data.span())
+        } else {
+            0
+        };
+
         let settlement = IShardingSettlementDispatcher { contract_address: world_address };
         snforge_std::start_cheat_caller_address(world_address, snforge_std::test_address());
         settlement
@@ -257,6 +281,12 @@ mod tests {
                 slots,
                 [].span(), // entity_model_selectors (for Torii events, empty OK in test)
                 [].span(), // entity_keys_flat
+                dojo::sharding::request::InitialProof {
+                    keys: init_keys.span(),
+                    values: init_values.span(),
+                    commitment: initial_commitment,
+                    fork_state_root: if has_initials { 0x2 } else { 0 },
+                },
             );
         snforge_std::stop_cheat_caller_address(world_address);
     }
@@ -579,7 +609,7 @@ mod tests {
             .dispatcher
             .register_shard_policy(
                 moves_selector,
-                CRDVariant::Set,
+                CRDVariant::SetLock,
                 [ShardField { selector: sel_remaining, crdt: CRDVariant::Add, max_elements: 0 }]
                     .span(),
             );
@@ -631,7 +661,7 @@ mod tests {
             .dispatcher
             .register_shard_policy(
                 moves_selector,
-                CRDVariant::Set,
+                CRDVariant::SetLock,
                 [ShardField { selector: sel_remaining, crdt: CRDVariant::Add, max_elements: 0 }]
                     .span(),
             );
@@ -683,7 +713,7 @@ mod tests {
             .dispatcher
             .register_shard_policy(
                 moves_selector,
-                CRDVariant::Set,
+                CRDVariant::SetLock,
                 [ShardField { selector: sel_remaining, crdt: CRDVariant::Add, max_elements: 0 }]
                     .span(),
             );
@@ -939,7 +969,7 @@ mod tests {
             .dispatcher
             .register_shard_policy(
                 moves_selector,
-                CRDVariant::Set,
+                CRDVariant::SetLock,
                 [ShardField { selector: sel_remaining, crdt: CRDVariant::Add, max_elements: 0 }]
                     .span(),
             );
