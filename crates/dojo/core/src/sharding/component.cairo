@@ -349,33 +349,36 @@ pub mod sharding_component {
             // Verify shard is active (commitment registered).
             self.verify_shard_active(shard_id);
 
-            // StorageCommitment verification is mandatory for settle().
-            // Use settle_dev() (#[cfg(feature: 'dev')]) for testing without proofs.
+            // StorageCommitment verification is mandatory when slots changed.
+            // With 0 slots (empty shard), skip — SP1 didn't produce a storage commitment.
             let registry_addr = self.storage_commitment_registry.read();
             assert(registry_addr != core::num::traits::Zero::zero(), Errors::REGISTRY_NOT_SET);
             assert(end_block_number != 0, Errors::END_BLOCK_NOT_PROVEN);
 
-            // Build commitment hash: H(key0, key1, ..., val0, val1, ...)
-            let mut commitment_data: Array<felt252> = ArrayTrait::new();
-            for entry in slots {
-                commitment_data.append(*entry.key);
-            };
-            for entry in slots {
-                commitment_data.append(*entry.value);
-            };
-            let raw_storage_commitment = poseidon_hash_span(commitment_data.span());
-
             let verifier = IStorageCommitmentVerifierDispatcher {
                 contract_address: registry_addr,
             };
-            let (verified, _proven_game_contract, _proven_shard_id) = verifier
-                .verify(
-                    raw_storage_commitment,
-                    get_contract_address(),
-                    global_state_root,
-                    end_block_number,
-                );
-            assert(verified, Errors::COMMITMENT_NOT_VERIFIED);
+
+            if slots.len() > 0 {
+                // Build commitment hash: H(key0, key1, ..., val0, val1, ...)
+                let mut commitment_data: Array<felt252> = ArrayTrait::new();
+                for entry in slots {
+                    commitment_data.append(*entry.key);
+                };
+                for entry in slots {
+                    commitment_data.append(*entry.value);
+                };
+                let raw_storage_commitment = poseidon_hash_span(commitment_data.span());
+
+                let (verified, _proven_game_contract, _proven_shard_id) = verifier
+                    .verify(
+                        raw_storage_commitment,
+                        get_contract_address(),
+                        global_state_root,
+                        end_block_number,
+                    );
+                assert(verified, Errors::COMMITMENT_NOT_VERIFIED);
+            }
 
             // S1: Verify initial storage proof and build proven initial values lookup.
             let mut proven_initials: Felt252Dict<Nullable<felt252>> = Default::default();
