@@ -1155,7 +1155,36 @@ pub mod world {
         fn resource(self: @ContractState, selector: felt252) -> Resource {
             self.resources.read(selector)
         }
+    }
 
+    #[abi(embed_v0)]
+    impl UpgradeableWorld of IUpgradeableWorld<ContractState> {
+        fn upgrade(ref self: ContractState, new_class_hash: ClassHash) {
+            assert(new_class_hash.is_non_zero(), 'invalid class_hash');
+
+            if !self.is_caller_world_owner() {
+                panic_with_byte_array(@errors::not_owner_upgrade(get_caller_address(), WORLD));
+            }
+
+            replace_class_syscall(new_class_hash).unwrap();
+
+            self.emit(WorldUpgraded { class_hash: new_class_hash });
+        }
+    }
+
+    // Instantiate the component impls (not ABI-exposed) so self.sharding.xxx() works.
+    impl ShardingComponentImpl = sharding_cpt::ContractComponentImpl<ContractState>;
+
+    // ── Sharding ABI (feature-gated) ────────────────────────────────────
+    //
+    // The impls below are only exposed when the `sharding` feature is
+    // enabled.  Non-sharding worlds never compile these entry points.
+
+    /// Sharding settlement methods: settle, cancel.
+    /// All require world owner (operator calls directly).
+    #[cfg(feature: 'sharding')]
+    #[abi(embed_v0)]
+    impl ShardingSettlementImpl of dojo::world::world_sharding::IShardingSettlement<ContractState> {
         fn request_sharding(
             ref self: ContractState,
             entities: Span<felt252>,
@@ -1187,36 +1216,7 @@ pub mod world {
         ) -> (felt252, Span<dojo::sharding::request::ShardField>) {
             self.sharding.get_shard_policy(model_selector)
         }
-    }
 
-    #[abi(embed_v0)]
-    impl UpgradeableWorld of IUpgradeableWorld<ContractState> {
-        fn upgrade(ref self: ContractState, new_class_hash: ClassHash) {
-            assert(new_class_hash.is_non_zero(), 'invalid class_hash');
-
-            if !self.is_caller_world_owner() {
-                panic_with_byte_array(@errors::not_owner_upgrade(get_caller_address(), WORLD));
-            }
-
-            replace_class_syscall(new_class_hash).unwrap();
-
-            self.emit(WorldUpgraded { class_hash: new_class_hash });
-        }
-    }
-
-    // Instantiate the component impls (not ABI-exposed) so self.sharding.xxx() works.
-    impl ShardingComponentImpl = sharding_cpt::ContractComponentImpl<ContractState>;
-
-    // ── Sharding ABI (feature-gated) ────────────────────────────────────
-    //
-    // The impls below are only exposed when the `sharding` feature is
-    // enabled.  Non-sharding worlds never compile these entry points.
-
-    /// Sharding settlement methods: settle, cancel.
-    /// All require world owner (operator calls directly).
-    #[cfg(feature: 'sharding')]
-    #[abi(embed_v0)]
-    impl ShardingSettlementImpl of dojo::world::world_sharding::IShardingSettlement<ContractState> {
         fn settle(
             ref self: ContractState,
             shard_id: felt252,

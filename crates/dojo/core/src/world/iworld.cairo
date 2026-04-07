@@ -345,34 +345,6 @@ pub trait IWorld<T> {
     /// * `resource` - The selector of the resource.
     /// * `contract` - The address of the contract to revoke writer permission from.
     fn revoke_writer(ref self: T, resource: felt252, contract: ContractAddress);
-
-    /// Requests sharding for the given entities.
-    ///
-    /// Locks the specified entities and allocates a shard ID.
-    /// Caller must be the world owner.
-    ///
-    /// # Arguments
-    ///
-    /// * `entities` - Entity IDs for exclusive lock (SetLock/Lock). Blocks mainnet writes.
-    /// * `shared_entities` - Entity IDs for concurrent lock (Set/Add). Mainnet writes allowed.
-    fn request_sharding(ref self: T, entities: Span<felt252>, shared_entities: Span<felt252>, entity_keys_flat: Span<felt252>) -> felt252;
-
-    /// Ends the shard session and emits `ShardFinished`.
-    /// Caller must be the world owner.
-    fn end_shard(ref self: T, shard_id: felt252);
-
-    /// Register CRDT policy for a model. Called once per model at deploy time.
-    fn register_shard_policy(
-        ref self: T,
-        model_selector: felt252,
-        default_crdt: dojo::sharding::request::CRDVariant,
-        field_overrides: Span<dojo::sharding::request::ShardField>,
-    );
-
-    /// Read the registered CRDT policy for a model.
-    fn get_shard_policy(
-        self: @T, model_selector: felt252,
-    ) -> (felt252, Span<dojo::sharding::request::ShardField>);
 }
 
 #[starknet::interface]
