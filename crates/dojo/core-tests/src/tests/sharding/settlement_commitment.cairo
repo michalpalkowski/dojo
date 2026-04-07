@@ -4,11 +4,11 @@
 use dojo::model::ModelStorageTest;
 use dojo::sharding::compute_dojo_field_slot;
 use dojo::utils::entity_id_from_keys;
-use dojo::world::IWorldDispatcherTrait;
+use dojo::world::{IShardingSettlementDispatcherTrait};
 use starknet::ContractAddress;
 
 use crate::tests::helpers::{Foo, deploy_world_and_foo};
-use crate::tests::sharding::helpers::{foo_field_selectors, make_field_slot, settle_as_owner};
+use crate::tests::sharding::helpers::{foo_field_selectors, make_field_slot, settle_as_owner, sharding_disp};
 
 #[test]
 #[should_panic(expected: ('Shard: registry not configured',))]
@@ -24,7 +24,7 @@ fn test_settle_panics_without_commitment_registry() {
     let slot_a = compute_dojo_field_slot(model_selector, entity_id, sel_a);
     let slot_b = compute_dojo_field_slot(model_selector, entity_id, sel_b);
 
-    world.dispatcher.request_sharding([entity_id].span(), [].span(), [].span());
+    sharding_disp(world.dispatcher.contract_address).request_sharding([entity_id].span(), [].span(), [].span());
 
     settle_as_owner(
         world_address,

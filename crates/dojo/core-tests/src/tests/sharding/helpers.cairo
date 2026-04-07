@@ -103,6 +103,13 @@ pub fn foo_field_selectors() -> (felt252, felt252) {
     }
 }
 
+/// Build an IShardingSettlementDispatcher for the given world address.
+pub fn sharding_disp(
+    world_address: ContractAddress,
+) -> IShardingSettlementDispatcher {
+    IShardingSettlementDispatcher { contract_address: world_address }
+}
+
 // ── Setup helpers ─────────────────────────────────────────────────
 
 /// Deploy mock verifier and register it on the world (world owner caller).
