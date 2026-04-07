@@ -100,15 +100,23 @@ pub mod utils {
 }
 
 pub mod sharding {
+    pub mod noop;
+
+    #[cfg(feature: 'sharding')]
     pub mod slot;
+    #[cfg(feature: 'sharding')]
     pub use slot::{compute_dojo_field_slot, compute_dynamic_member_lock_slot};
 
+    #[cfg(feature: 'sharding')]
     pub mod interface;
+    #[cfg(feature: 'sharding')]
     pub use interface::{
         IStorageCommitmentVerifier, IStorageCommitmentVerifierDispatcher,
         IStorageCommitmentVerifierDispatcherTrait,
     };
+    #[cfg(feature: 'sharding')]
     pub mod component;
+    #[cfg(feature: 'sharding')]
     pub mod request;
 }
 
@@ -126,6 +134,7 @@ pub mod world {
     #[cfg(target: "test")]
     pub use iworld::{IWorldTest, IWorldTestDispatcher, IWorldTestDispatcherTrait};
 
+    #[cfg(feature: 'sharding')]
     pub mod world_sharding;
     #[cfg(feature: 'sharding')]
     pub use world_sharding::{

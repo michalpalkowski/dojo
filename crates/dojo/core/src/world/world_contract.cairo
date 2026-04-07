@@ -52,9 +52,14 @@ pub mod world {
     };
     use starknet::{ClassHash, ContractAddress, SyscallResultTrait, get_caller_address, get_tx_info};
     use super::Permission;
-    // ── Sharding imports ────────────────────────────────────────────────
+    // ── Sharding: real component when feature enabled, noop stub otherwise ──
+    #[cfg(feature: 'sharding')]
     use dojo::sharding::component::sharding_component as sharding_cpt;
+    #[cfg(feature: 'sharding')]
     use sharding_cpt::InternalTrait as ShardingInternalTrait;
+
+    #[cfg(not(feature: 'sharding'))]
+    use dojo::sharding::noop::sharding_noop as sharding_cpt;
 
     component!(path: sharding_cpt, storage: sharding, event: ShardingEvent);
 
@@ -1172,16 +1177,13 @@ pub mod world {
         }
     }
 
-    // Instantiate the component impls (not ABI-exposed) so self.sharding.xxx() works.
-    impl ShardingComponentImpl = sharding_cpt::ContractComponentImpl<ContractState>;
-
-    // ── Sharding ABI (feature-gated) ────────────────────────────────────
+    // ── Sharding (feature-gated) ──────────────────────────────────────
     //
-    // The impls below are only exposed when the `sharding` feature is
-    // enabled.  Non-sharding worlds never compile these entry points.
+    // Everything below is compiled only when `features = ["sharding"]`.
+    // Without the feature, the world contract is identical to vanilla Dojo.
 
-    /// Sharding settlement methods: settle, cancel.
-    /// All require world owner (operator calls directly).
+    #[cfg(feature: 'sharding')]
+    impl ShardingComponentImpl = sharding_cpt::ContractComponentImpl<ContractState>;
     #[cfg(feature: 'sharding')]
     #[abi(embed_v0)]
     impl ShardingSettlementImpl of dojo::world::world_sharding::IShardingSettlement<ContractState> {
@@ -1336,13 +1338,23 @@ pub mod world {
             self.is_owner(WORLD, get_caller_address())
         }
 
+        /// Checks if the entity is locked by an active shard.
+        /// Compiles to a no-op when sharding is disabled.
+        #[cfg(feature: 'sharding')]
+        fn check_entity_lock(self: @ContractState, entity_id: felt252) {
+            assert(!self.sharding.is_entity_locked(entity_id), 'Shard: entity locked');
+        }
+
+        #[cfg(not(feature: 'sharding'))]
+        fn check_entity_lock(self: @ContractState, _entity_id: felt252) {}
+
         /// Asserts the caller is authorized to trigger sharding operations
-        /// (request_sharding, end_shard).
+        /// (request_sharding, end_shard, register_shard_policy).
         ///
         /// Allowed callers:
-        /// - World owner (operator) — can always shard.
-        /// - WORLD writer — game system contracts granted `grant_writer(WORLD, addr)`
-        ///   during migration, so any authorized game system can trigger sharding.
+        /// - World owner (operator).
+        /// - WORLD writer — game contracts granted `grant_writer(WORLD, addr)`.
+        #[cfg(feature: 'sharding')]
         fn assert_caller_is_shard_writer(self: @ContractState) {
             let caller = get_caller_address();
             if self.is_writer(WORLD, caller) {
@@ -1575,18 +1587,14 @@ pub mod world {
             match index {
                 ModelIndex::Keys(keys) => {
                     let entity_id = entity_id_from_serialized_keys(keys);
-                    assert(
-                        !self.sharding.is_entity_locked(entity_id), 'Shard: entity locked',
-                    );
+                    self.check_entity_lock(entity_id);
                     storage::entity_model::write_model_entity(
                         model_selector, entity_id, values, layout,
                     );
                     self.emit(StoreSetRecord { selector: model_selector, keys, values, entity_id });
                 },
                 ModelIndex::Id(entity_id) => {
-                    assert(
-                        !self.sharding.is_entity_locked(entity_id), 'Shard: entity locked',
-                    );
+                    self.check_entity_lock(entity_id);
                     storage::entity_model::write_model_entity(
                         model_selector, entity_id, values, layout,
                     );
@@ -1595,9 +1603,7 @@ pub mod world {
                 ModelIndex::MemberId((
                     entity_id, member_selector,
                 )) => {
-                    assert(
-                        !self.sharding.is_entity_locked(entity_id), 'Shard: entity locked',
-                    );
+                    self.check_entity_lock(entity_id);
                     storage::entity_model::write_model_member(
                         model_selector, entity_id, member_selector, values, layout,
                     );
@@ -1617,16 +1623,12 @@ pub mod world {
             match index {
                 ModelIndex::Keys(keys) => {
                     let entity_id = entity_id_from_serialized_keys(keys);
-                    assert(
-                        !self.sharding.is_entity_locked(entity_id), 'Shard: entity locked',
-                    );
+                    self.check_entity_lock(entity_id);
                     storage::entity_model::delete_model_entity(model_selector, entity_id, layout);
                     self.emit(StoreDelRecord { selector: model_selector, entity_id });
                 },
                 ModelIndex::Id(entity_id) => {
-                    assert(
-                        !self.sharding.is_entity_locked(entity_id), 'Shard: entity locked',
-                    );
+                    self.check_entity_lock(entity_id);
                     storage::entity_model::delete_model_entity(model_selector, entity_id, layout);
                     self.emit(StoreDelRecord { selector: model_selector, entity_id });
                 },
@@ -1672,6 +1674,7 @@ pub mod world {
 
         /// After settlement writes raw storage values, emit StoreSetRecord
         /// for each entity so Torii indexes with correct entity keys.
+        #[cfg(feature: 'sharding')]
         ///
         /// `entity_model_selectors` — one model_selector per unique entity.
         /// `entity_keys_flat` — concatenated keys: [n_keys_0, key_0_0, ..., n_keys_1, key_1_0, ...]
