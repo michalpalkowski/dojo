@@ -1,7 +1,7 @@
 use core::array::{ArrayTrait, SpanTrait};
 use super::storage;
 
-const DOJO_STORAGE: felt252 = 'dojo_storage';
+pub const DOJO_STORAGE: felt252 = 'dojo_storage';
 
 pub const MAX_ARRAY_LENGTH: u256 = 4_294_967_295;
 

@@ -19,7 +19,7 @@ impl PermissionDisplay of Display<Permission> {
 
 #[starknet::contract]
 pub mod world {
-    use core::array::ArrayTrait;
+    use core::array::{ArrayTrait, SpanTrait};
     use core::box::BoxTrait;
     use core::num::traits::Zero;
     use core::panic_with_felt252;
@@ -37,7 +37,8 @@ pub mod world {
     use dojo::model::{Model, ModelIndex, ResourceMetadata, metadata};
     use dojo::storage;
     use dojo::utils::{
-        bytearray_hash, default_address, default_class_hash, entity_id_from_serialized_keys,
+        bytearray_hash, default_address, default_class_hash,
+        entity_id_from_serialized_keys,
         selector_from_namespace_and_name,
     };
     use dojo::world::{IUpgradeableWorld, IWorld, Resource, ResourceIsNoneTrait, errors};
@@ -51,10 +52,21 @@ pub mod world {
     };
     use starknet::{ClassHash, ContractAddress, SyscallResultTrait, get_caller_address, get_tx_info};
     use super::Permission;
+    // ── Sharding: real component when feature enabled, noop stub otherwise ──
+    #[cfg(feature: 'sharding')]
+    use dojo::sharding::component::sharding_component as sharding_cpt;
+    #[cfg(feature: 'sharding')]
+    use sharding_cpt::InternalTrait as ShardingInternalTrait;
+
+    #[cfg(not(feature: 'sharding'))]
+    use dojo::sharding::noop::sharding_noop as sharding_cpt;
+
+    component!(path: sharding_cpt, storage: sharding, event: ShardingEvent);
 
     pub const WORLD: felt252 = 0;
     pub const DOJO_INIT_SELECTOR: felt252 = selector!("dojo_init");
     pub const WORLD_VERSION: felt252 = '1.8.0';
+
 
     #[event]
     #[derive(Drop, starknet::Event)]
@@ -80,6 +92,8 @@ pub mod world {
         StoreDelRecord: StoreDelRecord,
         WriterUpdated: WriterUpdated,
         OwnerUpdated: OwnerUpdated,
+        #[flat]
+        ShardingEvent: sharding_cpt::Event,
     }
 
     #[derive(Drop, starknet::Event)]
@@ -284,6 +298,8 @@ pub mod world {
         writers: Map<(felt252, ContractAddress), bool>,
         owner_count: Map<felt252, u64>,
         initialized_contracts: Map<felt252, bool>,
+        #[substorage(v0)]
+        sharding: sharding_cpt::Storage,
     }
 
     /// Constructor for the world contract.
@@ -1161,6 +1177,135 @@ pub mod world {
         }
     }
 
+    // ── Sharding (feature-gated) ──────────────────────────────────────
+    //
+    // Everything below is compiled only when `features = ["sharding"]`.
+    // Without the feature, the world contract is identical to vanilla Dojo.
+
+    #[cfg(feature: 'sharding')]
+    impl ShardingComponentImpl = sharding_cpt::ContractComponentImpl<ContractState>;
+    #[cfg(feature: 'sharding')]
+    #[abi(embed_v0)]
+    impl ShardingSettlementImpl of dojo::world::world_sharding::IShardingSettlement<ContractState> {
+        fn request_sharding(
+            ref self: ContractState,
+            entities: Span<felt252>,
+            shared_entities: Span<felt252>,
+            entity_keys_flat: Span<felt252>,
+        ) -> felt252 {
+            self.assert_caller_is_shard_writer();
+            self.sharding.request_shard(entities, shared_entities, entity_keys_flat)
+        }
+
+        fn end_shard(ref self: ContractState, shard_id: felt252) {
+            self.assert_caller_is_shard_writer();
+            self.sharding.end_shard(shard_id);
+        }
+
+        fn register_shard_policy(
+            ref self: ContractState,
+            model_selector: felt252,
+            default_crdt: dojo::sharding::request::CRDVariant,
+            field_overrides: Span<dojo::sharding::request::ShardField>,
+        ) {
+            self.assert_caller_is_shard_writer();
+            self.sharding.register_shard_policy(model_selector, default_crdt, field_overrides);
+        }
+
+        fn get_shard_policy(
+            self: @ContractState,
+            model_selector: felt252,
+        ) -> (felt252, Span<dojo::sharding::request::ShardField>) {
+            self.sharding.get_shard_policy(model_selector)
+        }
+
+        fn settle(
+            ref self: ContractState,
+            shard_id: felt252,
+            global_state_root: felt252,
+            end_block_number: u64,
+            slots: Span<dojo::sharding::request::SlotEntry>,
+            entity_model_selectors: Span<felt252>,
+            entity_keys_flat: Span<felt252>,
+            initial_proof: dojo::sharding::request::InitialProof,
+        ) {
+            assert(self.is_caller_world_owner(), sharding_cpt::Errors::UNAUTHORIZED_CALLER);
+            self
+                .sharding
+                .settle(shard_id, global_state_root, end_block_number, slots, initial_proof);
+
+            // Emit StoreSetRecord per entity so Torii indexes with correct keys.
+            self.emit_settlement_updates(entity_model_selectors, entity_keys_flat);
+        }
+
+        fn cancel_shard(ref self: ContractState, shard_id: felt252) {
+            // Only the shard creator or world owner may cancel.
+            let caller = starknet::get_caller_address();
+            let creator = self.sharding.get_shard_creator(shard_id);
+            assert(
+                caller == creator || self.is_caller_world_owner(),
+                sharding_cpt::Errors::UNAUTHORIZED_CALLER,
+            );
+            self.sharding.cancel_shard(shard_id);
+        }
+
+        fn set_storage_commitment_registry(
+            ref self: ContractState, registry: starknet::ContractAddress,
+        ) {
+            assert(self.is_caller_world_owner(), sharding_cpt::Errors::UNAUTHORIZED_CALLER);
+            self.sharding.set_storage_commitment_registry(registry);
+        }
+
+        fn get_shard_attestation_fork_block_number(
+            self: @ContractState, shard_id: felt252,
+        ) -> u64 {
+            self.sharding.shard_attestation_fork_block_number(shard_id)
+        }
+
+        fn get_sharding_proxy(self: @ContractState) -> starknet::ContractAddress {
+            self.sharding.get_sharding_proxy()
+        }
+
+        fn set_sharding_proxy(ref self: ContractState, proxy: starknet::ContractAddress) {
+            assert(self.is_caller_world_owner(), sharding_cpt::Errors::UNAUTHORIZED_CALLER);
+            self.sharding.set_sharding_proxy(proxy);
+        }
+
+        fn enable_shard_fork_mode(ref self: ContractState) {
+            assert(self.is_caller_world_owner(), sharding_cpt::Errors::UNAUTHORIZED_CALLER);
+            self.sharding.enable_shard_fork_mode();
+        }
+
+        fn get_entity_shard(self: @ContractState, entity_id: felt252) -> felt252 {
+            self.sharding.entity_shard_id(entity_id)
+        }
+
+        fn get_active_shards(self: @ContractState) -> Array<felt252> {
+            self.sharding.get_active_shards()
+        }
+    }
+
+    #[cfg(feature: 'dev')]
+    #[abi(embed_v0)]
+    impl ShardingSettlementDevImpl of dojo::world::world_sharding::IShardingSettlementDev<ContractState> {
+        fn settle_dev(
+            ref self: ContractState,
+            shard_id: felt252,
+            end_block_number: u64,
+            slots: Span<dojo::sharding::request::SlotEntry>,
+            entity_model_selectors: Span<felt252>,
+            entity_keys_flat: Span<felt252>,
+        ) {
+            assert(self.is_caller_world_owner(), sharding_cpt::Errors::UNAUTHORIZED_CALLER);
+            self.sharding.settle_dev(shard_id, end_block_number, slots);
+
+            // Emit StoreSetRecord per entity so Torii indexes with correct keys.
+            self.emit_settlement_updates(entity_model_selectors, entity_keys_flat);
+        }
+    }
+
+    // ── Core internal helpers ────────────────────────────────────────────
+
     #[generate_trait]
     impl SelfImpl of SelfTrait {
         /// Update the ownership status of a resource owner.
@@ -1191,6 +1336,34 @@ pub mod world {
         /// Indicates if the caller is the owner of the world.
         fn is_caller_world_owner(self: @ContractState) -> bool {
             self.is_owner(WORLD, get_caller_address())
+        }
+
+        /// Checks if the entity is locked by an active shard.
+        /// Compiles to a no-op when sharding is disabled.
+        #[cfg(feature: 'sharding')]
+        fn check_entity_lock(self: @ContractState, entity_id: felt252) {
+            assert(!self.sharding.is_entity_locked(entity_id), 'Shard: entity locked');
+        }
+
+        #[cfg(not(feature: 'sharding'))]
+        fn check_entity_lock(self: @ContractState, _entity_id: felt252) {}
+
+        /// Asserts the caller is authorized to trigger sharding operations
+        /// (request_sharding, end_shard, register_shard_policy).
+        ///
+        /// Allowed callers:
+        /// - World owner (operator).
+        /// - WORLD writer — game contracts granted `grant_writer(WORLD, addr)`.
+        #[cfg(feature: 'sharding')]
+        fn assert_caller_is_shard_writer(self: @ContractState) {
+            let caller = get_caller_address();
+            if self.is_writer(WORLD, caller) {
+                return;
+            }
+            if self.is_owner(WORLD, caller) {
+                return;
+            }
+            panic_with_felt252(sharding_cpt::Errors::UNAUTHORIZED_CALLER);
         }
 
         /// Asserts the caller has the required permissions for a resource, following the
@@ -1395,6 +1568,7 @@ pub mod world {
             }
         }
 
+
         /// Sets the model value for a model record/entity/member.
         ///
         /// # Arguments
@@ -1413,12 +1587,14 @@ pub mod world {
             match index {
                 ModelIndex::Keys(keys) => {
                     let entity_id = entity_id_from_serialized_keys(keys);
+                    self.check_entity_lock(entity_id);
                     storage::entity_model::write_model_entity(
                         model_selector, entity_id, values, layout,
                     );
                     self.emit(StoreSetRecord { selector: model_selector, keys, values, entity_id });
                 },
                 ModelIndex::Id(entity_id) => {
+                    self.check_entity_lock(entity_id);
                     storage::entity_model::write_model_entity(
                         model_selector, entity_id, values, layout,
                     );
@@ -1427,6 +1603,7 @@ pub mod world {
                 ModelIndex::MemberId((
                     entity_id, member_selector,
                 )) => {
+                    self.check_entity_lock(entity_id);
                     storage::entity_model::write_model_member(
                         model_selector, entity_id, member_selector, values, layout,
                     );
@@ -1440,23 +1617,18 @@ pub mod world {
             }
         }
 
-        /// Deletes an entity for the given model, setting all the values to 0 in the given layout.
-        ///
-        /// # Arguments
-        ///
-        /// * `model_selector` - The selector of the model to be deleted.
-        /// * `index` - The index of the record/entity to delete.
-        /// * `layout` - The memory layout of the model.
         fn delete_entity_internal(
             ref self: ContractState, model_selector: felt252, index: ModelIndex, layout: Layout,
         ) {
             match index {
                 ModelIndex::Keys(keys) => {
                     let entity_id = entity_id_from_serialized_keys(keys);
+                    self.check_entity_lock(entity_id);
                     storage::entity_model::delete_model_entity(model_selector, entity_id, layout);
                     self.emit(StoreDelRecord { selector: model_selector, entity_id });
                 },
                 ModelIndex::Id(entity_id) => {
+                    self.check_entity_lock(entity_id);
                     storage::entity_model::delete_model_entity(model_selector, entity_id, layout);
                     self.emit(StoreDelRecord { selector: model_selector, entity_id });
                 },
@@ -1499,5 +1671,64 @@ pub mod world {
 
             (name, hash)
         }
+
+        /// After settlement writes raw storage values, emit StoreSetRecord
+        /// for each entity so Torii indexes with correct entity keys.
+        #[cfg(feature: 'sharding')]
+        ///
+        /// `entity_model_selectors` — one model_selector per unique entity.
+        /// `entity_keys_flat` — concatenated keys: [n_keys_0, key_0_0, ..., n_keys_1, key_1_0, ...]
+        fn emit_settlement_updates(
+            ref self: ContractState,
+            entity_model_selectors: Span<felt252>,
+            entity_keys_flat: Span<felt252>,
+        ) {
+            let mut offset: u32 = 0;
+            let mut i: u32 = 0;
+            while i < entity_model_selectors.len() {
+                let model_sel = *entity_model_selectors[i];
+
+                // Parse length-prefixed keys for this entity.
+                let n_keys: u32 = (*entity_keys_flat[offset]).try_into().unwrap();
+                offset += 1;
+                let mut keys: Array<felt252> = ArrayTrait::new();
+                let mut j: u32 = 0;
+                while j < n_keys {
+                    keys.append(*entity_keys_flat[offset + j]);
+                    j += 1;
+                };
+                offset += n_keys;
+
+                let keys_span = keys.span();
+                let entity_id = entity_id_from_serialized_keys(keys_span);
+
+                // Get model contract address from resources registry.
+                if let Resource::Model((
+                    model_address, _,
+                )) = self.resources.read(model_sel) {
+                    // Read model layout from the model contract.
+                    let layout = IStoredResourceDispatcher {
+                        contract_address: model_address,
+                    }
+                        .layout();
+
+                    // Read entity values in layout order (correctly ordered for Serde).
+                    let values = self
+                        .get_entity_internal(
+                            model_sel, ModelIndex::Id(entity_id), layout,
+                        );
+
+                    self
+                        .emit(
+                            StoreSetRecord {
+                                selector: model_sel, entity_id, keys: keys_span, values,
+                            },
+                        );
+                }
+
+                i += 1;
+            };
+        }
+
     }
 }

@@ -55,10 +55,11 @@ impl WorldLocal {
         let autodetect_blake2s_class_hash = profile_config
             .env
             .as_ref()
-            .map(|env| {
-                env.rpc_url.as_ref().unwrap().contains("sepolia")
-                    || env.rpc_url.as_ref().unwrap().contains("testnet")
-                    || env.rpc_url.as_ref().unwrap().contains("mainnet")
+            .and_then(|env| env.rpc_url.as_deref())
+            .map(|rpc_url| {
+                rpc_url.contains("sepolia")
+                    || rpc_url.contains("testnet")
+                    || rpc_url.contains("mainnet")
             })
             .unwrap_or(false);
 

@@ -99,6 +99,28 @@ pub mod utils {
     pub use serde::{deserialize_unwrap, serialize_inline};
 }
 
+pub mod sharding {
+    pub mod noop;
+
+    #[cfg(feature: 'sharding')]
+    pub mod slot;
+    #[cfg(feature: 'sharding')]
+    pub use slot::{compute_dojo_field_slot, compute_dynamic_member_lock_slot};
+
+    #[cfg(feature: 'sharding')]
+    pub mod interface;
+    #[cfg(feature: 'sharding')]
+    pub use interface::{
+        IShardingGame, IShardingGameDispatcher, IShardingGameDispatcherTrait,
+        IStorageCommitmentVerifier, IStorageCommitmentVerifierDispatcher,
+        IStorageCommitmentVerifierDispatcherTrait,
+    };
+    #[cfg(feature: 'sharding')]
+    pub mod component;
+    #[cfg(feature: 'sharding')]
+    pub mod request;
+}
+
 pub mod world {
     pub(crate) mod errors;
 
@@ -112,6 +134,18 @@ pub mod world {
     };
     #[cfg(target: "test")]
     pub use iworld::{IWorldTest, IWorldTestDispatcher, IWorldTestDispatcherTrait};
+
+    #[cfg(feature: 'sharding')]
+    pub mod world_sharding;
+    #[cfg(feature: 'sharding')]
+    pub use world_sharding::{
+        IShardingSettlement, IShardingSettlementDispatcher, IShardingSettlementDispatcherTrait,
+    };
+    #[cfg(feature: 'dev')]
+    pub use world_sharding::{
+        IShardingSettlementDev, IShardingSettlementDevDispatcher,
+        IShardingSettlementDevDispatcherTrait,
+    };
 
     mod world_contract;
     pub use world_contract::world;

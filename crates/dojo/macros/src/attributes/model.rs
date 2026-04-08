@@ -4,6 +4,7 @@ use cairo_lang_macro::{quote, Diagnostic, ProcMacroResult, TokenStream};
 use cairo_lang_parser::utils::SimpleParserDatabase;
 use cairo_lang_syntax::node::helpers::QueryAttrs;
 use cairo_lang_syntax::node::{ast, TypedSyntaxNode};
+use starknet::core::utils::get_selector_from_name;
 
 use crate::constants::{
     DOJO_INTROSPECT_DERIVE, DOJO_LEGACY_STORAGE_DERIVE, DOJO_PACKED_DERIVE, DOJO_STORE_DERIVE,
@@ -34,6 +35,7 @@ pub struct DojoModel {
     deserialized_values: Vec<String>,
     deserialized_modelvalue: String,
     deserialize_body: String,
+    field_selector_constants: String,
 }
 
 impl DojoModel {
@@ -57,6 +59,7 @@ impl DojoModel {
             deserialized_values: vec![],
             deserialized_modelvalue: String::default(),
             deserialize_body: String::default(),
+            field_selector_constants: String::default(),
         }
     }
     pub fn process(token_stream: TokenStream) -> ProcMacroResult {
@@ -273,6 +276,22 @@ impl DojoModel {
             )
         };
 
+        // Generate field selector constants for sharding ergonomics.
+        // Each non-key field gets a `pub const FIELD_NAME: felt252 = <selector>;` entry
+        // in a `{ModelType}_fields` module, allowing compile-time safe field references.
+        {
+            let field_consts: Vec<String> = values
+                .iter()
+                .map(|v| {
+                    let selector = get_selector_from_name(&v.name).unwrap();
+                    let name_upper = v.name.to_uppercase();
+                    format!("    pub const {name_upper}: felt252 = {selector};")
+                })
+                .collect();
+
+            model.field_selector_constants = field_consts.join("\n");
+        }
+
         model.model_value_derives = model.model_derives.clone();
 
         // If DojoStore derive attribute is not set for the non-legacy ModelValue, add it since it
@@ -321,6 +340,7 @@ impl DojoModel {
             model_deserialize_path,
             model_deserialize_prefix,
             deserialize_body,
+            field_selector_constants,
         ) = (
             &self.model_type,
             format!("#[derive({})]", self.model_value_derives.join(", ")),
@@ -335,6 +355,7 @@ impl DojoModel {
             &self.model_deserialize_path,
             &self.model_deserialize_prefix,
             &self.deserialize_body,
+            &self.field_selector_constants,
         );
 
         let content = format!(
@@ -478,6 +499,15 @@ pub mod m_{model_type} {{
             let _hash = {unique_hash};
         }}
     }}
+}}
+
+/// Field selector constants for `{model_type}`.
+///
+/// Each constant is the `sn_keccak` hash of the field name, matching the selectors
+/// used in `Layout::Struct` field layouts. Use with `IntoShardField` for ergonomic
+/// sharding field selection, e.g. `{model_type}_fields::FIELD_NAME.as_set_lock()`.
+pub mod {model_type}_fields {{
+{field_selector_constants}
 }}"
         );
 

@@ -62,7 +62,7 @@ fn test_find_model_layout_fails_when_not_exists() {
 }
 
 #[test]
-#[should_panic(expected: ('Unexpected model layout',))]
-fn test_find_model_layout_fails_when_bad_model_layout() {
-    let _ = find_model_field_layout(Layout::Fixed([].span()), 'one');
+fn test_find_model_layout_returns_none_for_non_struct_layout() {
+    let res = find_model_field_layout(Layout::Fixed([].span()), 'one');
+    assert(res.is_none(), 'should be None for Fixed');
 }
