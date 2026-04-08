@@ -1,17 +1,8 @@
-#[starknet::interface]
-pub trait IShardingSystems<T> {
-    fn register_policies(ref self: T);
-    fn request_shard(
-        ref self: T, player_ids: Span<felt252>, shared_player_ids: Span<felt252>,
-    );
-    fn end_shard(ref self: T, shard_id: felt252);
-}
-
 #[dojo::contract]
 pub mod sharding_systems {
     use dojo::model::Model;
     use dojo::sharding::request::{CRDVariant, ShardField};
-    use dojo::utils::entity_id_from_serialized_keys;
+    use dojo::sharding::IShardingGame;
     use dojo::world::WorldStorage;
     use dojo::world::world_sharding::{
         IShardingSettlementDispatcher, IShardingSettlementDispatcherTrait,
@@ -33,14 +24,12 @@ pub mod sharding_systems {
     }
 
     #[abi(embed_v0)]
-    impl ShardingSystemsImpl of super::IShardingSystems<ContractState> {
+    impl ShardingGameImpl of IShardingGame<ContractState> {
         fn register_policies(ref self: ContractState) {
             let mut world = self.world(@"ns");
             let ns_hash = dojo::utils::bytearray_hash(@"ns");
 
             // ── Exclusive player state → SetLock ──
-            // Player's move counter and position are fully owned by the shard.
-            // Mainnet writes are blocked while sharded.
 
             register_policy(
                 ref world,
@@ -58,7 +47,7 @@ pub mod sharding_systems {
                 [].span(),
             );
 
-            // PlayerConfig: exclusive lock, `items` is a dynamic array → SetLock with max_elements
+            // PlayerConfig: exclusive lock, `items` is a dynamic array
             register_policy(
                 ref world,
                 ns_hash,
@@ -75,8 +64,6 @@ pub mod sharding_systems {
             );
 
             // ── Shared global state → Add (concurrent shard access) ──
-            // MockToken balance: rewards earned on shard get added to mainnet balance.
-            // Multiple shards can modify concurrently — deltas are merged atomically.
 
             register_policy(
                 ref world,
@@ -89,34 +76,13 @@ pub mod sharding_systems {
 
         fn request_shard(
             ref self: ContractState,
-            player_ids: Span<felt252>,
-            shared_player_ids: Span<felt252>,
-        ) {
+            entities: Span<felt252>,
+            shared_entities: Span<felt252>,
+            entity_keys_flat: Span<felt252>,
+        ) -> felt252 {
             let world = self.world(@"ns");
-            let mut dojo_entities: Array<felt252> = ArrayTrait::new();
-            let mut dojo_shared_entities: Array<felt252> = ArrayTrait::new();
-            let mut entity_keys_flat: Array<felt252> = ArrayTrait::new();
-
-            for id in player_ids {
-                dojo_entities
-                    .append(entity_id_from_serialized_keys([*id].span()));
-                entity_keys_flat.append(1);
-                entity_keys_flat.append(*id);
-            };
-
-            for id in shared_player_ids {
-                dojo_shared_entities
-                    .append(entity_id_from_serialized_keys([*id].span()));
-                entity_keys_flat.append(1);
-                entity_keys_flat.append(*id);
-            };
-
             sharding_disp(@world)
-                .request_sharding(
-                    dojo_entities.span(),
-                    dojo_shared_entities.span(),
-                    entity_keys_flat.span(),
-                );
+                .request_sharding(entities, shared_entities, entity_keys_flat)
         }
 
         fn end_shard(ref self: ContractState, shard_id: felt252) {
@@ -143,8 +109,9 @@ mod tests {
         ContractDef, ContractDefTrait, NamespaceDef, TestResource, WorldStorageTestTrait,
         declare_and_deploy, set_caller_address, spawn_test_world,
     };
+    use dojo::sharding::{IShardingGameDispatcher, IShardingGameDispatcherTrait};
+    use dojo::utils::entity_id_from_serialized_keys;
     use starknet::ContractAddress;
-    use super::{IShardingSystemsDispatcher, IShardingSystemsDispatcherTrait};
 
     // ── Mock StorageCommitment Verifier (always approves) ──────────────
 
@@ -208,6 +175,11 @@ mod tests {
         world
     }
 
+    fn sharding_game(world: @dojo::world::WorldStorage) -> IShardingGameDispatcher {
+        let (addr, _) = world.dns(@"sharding_systems").unwrap();
+        IShardingGameDispatcher { contract_address: addr }
+    }
+
     fn register_mock_verifier(world_address: ContractAddress) {
         let mock_verifier = declare_and_deploy("mock_storage_commitment_verifier");
         let settlement = IShardingSettlementDispatcher { contract_address: world_address };
@@ -232,6 +204,28 @@ mod tests {
         } else {
             panic!("expected struct layout for MockToken")
         }
+    }
+
+    /// Test helper: wraps raw player felt252s into the 3-arg request_shard format.
+    fn request_shard_for(
+        game: IShardingGameDispatcher,
+        exclusive_ids: Span<felt252>,
+        shared_ids: Span<felt252>,
+    ) {
+        let mut entities: Array<felt252> = ArrayTrait::new();
+        let mut shared_entities: Array<felt252> = ArrayTrait::new();
+        let mut keys_flat: Array<felt252> = ArrayTrait::new();
+        for id in exclusive_ids {
+            entities.append(entity_id_from_serialized_keys([*id].span()));
+            keys_flat.append(1);
+            keys_flat.append(*id);
+        };
+        for id in shared_ids {
+            shared_entities.append(entity_id_from_serialized_keys([*id].span()));
+            keys_flat.append(1);
+            keys_flat.append(*id);
+        };
+        game.request_shard(entities.span(), shared_entities.span(), keys_flat.span());
     }
 
     fn empty_initial_proof() -> InitialProof {
@@ -298,13 +292,12 @@ mod tests {
         let mut world = setup_world();
         let caller = dojo_snf_test::get_default_caller_address();
 
-        let (sharding_addr, _) = world.dns(@"sharding_systems").unwrap();
-        let sharding = IShardingSystemsDispatcher { contract_address: sharding_addr };
+        let game = sharding_game(@world);
         let (actions_addr, _) = world.dns(@"actions").unwrap();
         let actions = IActionsDispatcher { contract_address: actions_addr };
 
         set_caller_address(caller);
-        sharding.register_policies();
+        game.register_policies();
         actions.spawn();
 
         let position: Position = world.read_model(caller);
@@ -313,8 +306,8 @@ mod tests {
         assert(moves.remaining == 99, 'initial moves');
 
         let player_felt: felt252 = caller.into();
-        sharding.request_shard([player_felt].span(), [].span());
-        sharding.end_shard(1);
+        request_shard_for(game,[player_felt].span(), [].span());
+        game.end_shard(1);
     }
 
     #[test]
@@ -323,13 +316,12 @@ mod tests {
         let world = setup_world();
         let caller = dojo_snf_test::get_default_caller_address();
 
-        let (sharding_addr, _) = world.dns(@"sharding_systems").unwrap();
-        let sharding = IShardingSystemsDispatcher { contract_address: sharding_addr };
+        let game = sharding_game(@world);
         let (actions_addr, _) = world.dns(@"actions").unwrap();
         let actions = IActionsDispatcher { contract_address: actions_addr };
 
         set_caller_address(caller);
-        sharding.register_policies();
+        game.register_policies();
         actions.spawn();
 
         let settlement = IShardingSettlementDispatcher {
@@ -340,7 +332,7 @@ mod tests {
         assert(active.len() == 0, 'no shards initially');
 
         let player_felt: felt252 = caller.into();
-        sharding.request_shard([player_felt].span(), [].span());
+        request_shard_for(game,[player_felt].span(), [].span());
         let active = settlement.get_active_shards();
         assert(active.len() == 1, 'one shard active');
     }
@@ -356,17 +348,16 @@ mod tests {
         let mut world = setup_world();
         let caller = dojo_snf_test::get_default_caller_address();
 
-        let (sharding_addr, _) = world.dns(@"sharding_systems").unwrap();
-        let sharding = IShardingSystemsDispatcher { contract_address: sharding_addr };
+        let game = sharding_game(@world);
         let (actions_addr, _) = world.dns(@"actions").unwrap();
         let actions = IActionsDispatcher { contract_address: actions_addr };
 
         set_caller_address(caller);
-        sharding.register_policies();
+        game.register_policies();
         actions.spawn();
 
         let player_felt: felt252 = caller.into();
-        sharding.request_shard([player_felt].span(), [].span());
+        request_shard_for(game,[player_felt].span(), [].span());
 
         // move() writes to both Moves and Position — should panic
         actions.move(Direction::Right);
@@ -379,17 +370,16 @@ mod tests {
         let mut world = setup_world();
         let caller = dojo_snf_test::get_default_caller_address();
 
-        let (sharding_addr, _) = world.dns(@"sharding_systems").unwrap();
-        let sharding = IShardingSystemsDispatcher { contract_address: sharding_addr };
+        let game = sharding_game(@world);
         let (actions_addr, _) = world.dns(@"actions").unwrap();
         let actions = IActionsDispatcher { contract_address: actions_addr };
 
         set_caller_address(caller);
-        sharding.register_policies();
+        game.register_policies();
         actions.spawn();
 
         let player_felt: felt252 = caller.into();
-        sharding.request_shard([player_felt].span(), [].span());
+        request_shard_for(game,[player_felt].span(), [].span());
 
         // Direct model write should also be blocked
         world.write_model_test(@Moves { player: caller, remaining: 50, last_direction: Direction::None });
@@ -402,14 +392,13 @@ mod tests {
         let alice = dojo_snf_test::get_default_caller_address();
         let bob: ContractAddress = 0xb0b.try_into().unwrap();
 
-        let (sharding_addr, _) = world.dns(@"sharding_systems").unwrap();
-        let sharding = IShardingSystemsDispatcher { contract_address: sharding_addr };
+        let game = sharding_game(@world);
         let (actions_addr, _) = world.dns(@"actions").unwrap();
         let actions = IActionsDispatcher { contract_address: actions_addr };
 
         // Spawn Alice and write initial state for Bob
         set_caller_address(alice);
-        sharding.register_policies();
+        game.register_policies();
         actions.spawn();
         world.write_model_test(
             @Moves { player: bob, remaining: 50, last_direction: Direction::None },
@@ -417,7 +406,7 @@ mod tests {
 
         // Shard only Alice
         let alice_felt: felt252 = alice.into();
-        sharding.request_shard([alice_felt].span(), [].span());
+        request_shard_for(game,[alice_felt].span(), [].span());
 
         // Bob's entities are NOT locked — write should succeed
         world.write_model_test(
@@ -438,13 +427,12 @@ mod tests {
         let caller = dojo_snf_test::get_default_caller_address();
         let token_account: ContractAddress = 0xacc.try_into().unwrap();
 
-        let (sharding_addr, _) = world.dns(@"sharding_systems").unwrap();
-        let sharding = IShardingSystemsDispatcher { contract_address: sharding_addr };
+        let game = sharding_game(@world);
         let (actions_addr, _) = world.dns(@"actions").unwrap();
         let actions = IActionsDispatcher { contract_address: actions_addr };
 
         set_caller_address(caller);
-        sharding.register_policies();
+        game.register_policies();
         actions.spawn();
 
         // Initialize token balance
@@ -453,7 +441,7 @@ mod tests {
         // Shard player exclusively, token entity as shared
         let player_felt: felt252 = caller.into();
         let token_felt: felt252 = token_account.into();
-        sharding.request_shard([player_felt].span(), [token_felt].span());
+        request_shard_for(game,[player_felt].span(), [token_felt].span());
 
         // Shared entity (MockToken) should still be writable on mainnet
         world.write_model_test(@MockToken { account: token_account, amount: 150 });
@@ -473,13 +461,12 @@ mod tests {
         let caller = dojo_snf_test::get_default_caller_address();
         register_mock_verifier(world_address);
 
-        let (sharding_addr, _) = world.dns(@"sharding_systems").unwrap();
-        let sharding = IShardingSystemsDispatcher { contract_address: sharding_addr };
+        let game = sharding_game(@world);
         let (actions_addr, _) = world.dns(@"actions").unwrap();
         let actions = IActionsDispatcher { contract_address: actions_addr };
 
         set_caller_address(caller);
-        sharding.register_policies();
+        game.register_policies();
         actions.spawn();
 
         // Record initial state
@@ -488,7 +475,7 @@ mod tests {
 
         // Request shard (locks entity)
         let player_felt: felt252 = caller.into();
-        sharding.request_shard([player_felt].span(), [].span());
+        request_shard_for(game,[player_felt].span(), [].span());
 
         // --- Simulate shard gameplay result ---
         // On the shard Katana, the player used 10 moves. Remaining: 89.
@@ -531,13 +518,12 @@ mod tests {
         let caller = dojo_snf_test::get_default_caller_address();
         register_mock_verifier(world_address);
 
-        let (sharding_addr, _) = world.dns(@"sharding_systems").unwrap();
-        let sharding = IShardingSystemsDispatcher { contract_address: sharding_addr };
+        let game = sharding_game(@world);
         let (actions_addr, _) = world.dns(@"actions").unwrap();
         let actions = IActionsDispatcher { contract_address: actions_addr };
 
         set_caller_address(caller);
-        sharding.register_policies();
+        game.register_policies();
         actions.spawn();
         // Move right first so last_direction = Right
         actions.move(Direction::Right);
@@ -545,7 +531,7 @@ mod tests {
         assert(pre.remaining == 98, 'pre: 98 moves');
 
         let player_felt: felt252 = caller.into();
-        sharding.request_shard([player_felt].span(), [].span());
+        request_shard_for(game,[player_felt].span(), [].span());
 
         let ns_hash = dojo::utils::bytearray_hash(@"ns");
         let moves_selector = Model::<Moves>::selector(ns_hash);
@@ -578,17 +564,16 @@ mod tests {
         let world_address = world.dispatcher.contract_address;
         let caller = dojo_snf_test::get_default_caller_address();
 
-        let (sharding_addr, _) = world.dns(@"sharding_systems").unwrap();
-        let sharding = IShardingSystemsDispatcher { contract_address: sharding_addr };
+        let game = sharding_game(@world);
         let (actions_addr, _) = world.dns(@"actions").unwrap();
         let actions = IActionsDispatcher { contract_address: actions_addr };
 
         set_caller_address(caller);
-        sharding.register_policies();
+        game.register_policies();
         actions.spawn();
 
         let player_felt: felt252 = caller.into();
-        sharding.request_shard([player_felt].span(), [].span());
+        request_shard_for(game,[player_felt].span(), [].span());
 
         // Cancel instead of settle
         let settlement = IShardingSettlementDispatcher { contract_address: world_address };
@@ -620,13 +605,12 @@ mod tests {
         let token_account: ContractAddress = 0xacc.try_into().unwrap();
         register_mock_verifier(world_address);
 
-        let (sharding_addr, _) = world.dns(@"sharding_systems").unwrap();
-        let sharding = IShardingSystemsDispatcher { contract_address: sharding_addr };
+        let game = sharding_game(@world);
         let (actions_addr, _) = world.dns(@"actions").unwrap();
         let actions = IActionsDispatcher { contract_address: actions_addr };
 
         set_caller_address(caller);
-        sharding.register_policies();
+        game.register_policies();
         actions.spawn();
 
         // Initialize token balance: 100
@@ -635,7 +619,7 @@ mod tests {
         // Shard player exclusively, token entity as shared (Add CRDT)
         let player_felt: felt252 = caller.into();
         let token_felt: felt252 = token_account.into();
-        sharding.request_shard([player_felt].span(), [token_felt].span());
+        request_shard_for(game,[player_felt].span(), [token_felt].span());
 
         // Simulate mainnet activity while shard is active:
         // someone adds 50 tokens on mainnet (shared entity allows writes)
@@ -693,19 +677,18 @@ mod tests {
         let world = setup_world();
         let caller = dojo_snf_test::get_default_caller_address();
 
-        let (sharding_addr, _) = world.dns(@"sharding_systems").unwrap();
-        let sharding = IShardingSystemsDispatcher { contract_address: sharding_addr };
+        let game = sharding_game(@world);
         let (actions_addr, _) = world.dns(@"actions").unwrap();
         let actions = IActionsDispatcher { contract_address: actions_addr };
 
         set_caller_address(caller);
-        sharding.register_policies();
+        game.register_policies();
         actions.spawn();
 
         let player_felt: felt252 = caller.into();
-        sharding.request_shard([player_felt].span(), [].span());
+        request_shard_for(game,[player_felt].span(), [].span());
         // Second shard for same entity -> panic
-        sharding.request_shard([player_felt].span(), [].span());
+        request_shard_for(game,[player_felt].span(), [].span());
     }
 
     #[test]
@@ -715,13 +698,12 @@ mod tests {
         let world = setup_world();
         let caller = dojo_snf_test::get_default_caller_address();
 
-        let (sharding_addr, _) = world.dns(@"sharding_systems").unwrap();
-        let sharding = IShardingSystemsDispatcher { contract_address: sharding_addr };
+        let game = sharding_game(@world);
 
         set_caller_address(caller);
-        sharding.register_policies();
+        game.register_policies();
         // Empty entity list -> panic
-        sharding.request_shard([].span(), [].span());
+        request_shard_for(game,[].span(), [].span());
     }
 
     #[test]
@@ -733,17 +715,16 @@ mod tests {
         let caller = dojo_snf_test::get_default_caller_address();
         register_mock_verifier(world_address);
 
-        let (sharding_addr, _) = world.dns(@"sharding_systems").unwrap();
-        let sharding = IShardingSystemsDispatcher { contract_address: sharding_addr };
+        let game = sharding_game(@world);
         let (actions_addr, _) = world.dns(@"actions").unwrap();
         let actions = IActionsDispatcher { contract_address: actions_addr };
 
         set_caller_address(caller);
-        sharding.register_policies();
+        game.register_policies();
         actions.spawn();
 
         let player_felt: felt252 = caller.into();
-        sharding.request_shard([player_felt].span(), [].span());
+        request_shard_for(game,[player_felt].span(), [].span());
 
         let ns_hash = dojo::utils::bytearray_hash(@"ns");
         let moves_selector = Model::<Moves>::selector(ns_hash);
@@ -774,20 +755,19 @@ mod tests {
         let eve: ContractAddress = 0xe0e.try_into().unwrap();
         register_mock_verifier(world_address);
 
-        let (sharding_addr, _) = world.dns(@"sharding_systems").unwrap();
-        let sharding = IShardingSystemsDispatcher { contract_address: sharding_addr };
+        let game = sharding_game(@world);
         let (actions_addr, _) = world.dns(@"actions").unwrap();
         let actions = IActionsDispatcher { contract_address: actions_addr };
 
         set_caller_address(caller);
-        sharding.register_policies();
+        game.register_policies();
         actions.spawn();
         // Write some data for Eve (not sharded)
         world.write_model_test(@Moves { player: eve, remaining: 10, last_direction: Direction::None });
 
         // Shard only the caller
         let player_felt: felt252 = caller.into();
-        sharding.request_shard([player_felt].span(), [].span());
+        request_shard_for(game,[player_felt].span(), [].span());
 
         // Try to settle a slot belonging to Eve's entity — not in shard
         let ns_hash = dojo::utils::bytearray_hash(@"ns");
@@ -820,13 +800,12 @@ mod tests {
         let alice = dojo_snf_test::get_default_caller_address();
         register_mock_verifier(world_address);
 
-        let (sharding_addr, _) = world.dns(@"sharding_systems").unwrap();
-        let sharding = IShardingSystemsDispatcher { contract_address: sharding_addr };
+        let game = sharding_game(@world);
         let (actions_addr, _) = world.dns(@"actions").unwrap();
         let actions = IActionsDispatcher { contract_address: actions_addr };
 
         set_caller_address(alice);
-        sharding.register_policies();
+        game.register_policies();
         actions.spawn();
 
         // Initialize token balance
@@ -836,7 +815,7 @@ mod tests {
         // Alice's entity is exclusively locked for all models (Moves, Position).
         // Alice's token entity is also exclusively locked (single-player shard).
         let alice_felt: felt252 = alice.into();
-        sharding.request_shard([alice_felt].span(), [].span());
+        request_shard_for(game,[alice_felt].span(), [].span());
 
         // Verify: all writes blocked on mainnet
         let settlement = IShardingSettlementDispatcher { contract_address: world_address };
@@ -886,13 +865,12 @@ mod tests {
         let treasury: ContractAddress = 0x7ea5.try_into().unwrap();
         register_mock_verifier(world_address);
 
-        let (sharding_addr, _) = world.dns(@"sharding_systems").unwrap();
-        let sharding = IShardingSystemsDispatcher { contract_address: sharding_addr };
+        let game = sharding_game(@world);
         let (actions_addr, _) = world.dns(@"actions").unwrap();
         let actions = IActionsDispatcher { contract_address: actions_addr };
 
         set_caller_address(alice);
-        sharding.register_policies();
+        game.register_policies();
         actions.spawn();
 
         // Global treasury token balance (shared across shards)
@@ -903,7 +881,7 @@ mod tests {
         // This allows other shards or mainnet to also modify the treasury concurrently.
         let alice_felt: felt252 = alice.into();
         let treasury_felt: felt252 = treasury.into();
-        sharding.request_shard(
+        request_shard_for(game,
             [alice_felt].span(),          // exclusive: player movement
             [treasury_felt].span(),       // shared: global treasury
         );
@@ -970,13 +948,12 @@ mod tests {
         let pool: ContractAddress = 0x9001.try_into().unwrap();
         register_mock_verifier(world_address);
 
-        let (sharding_addr, _) = world.dns(@"sharding_systems").unwrap();
-        let sharding = IShardingSystemsDispatcher { contract_address: sharding_addr };
+        let game = sharding_game(@world);
         let (actions_addr, _) = world.dns(@"actions").unwrap();
         let actions = IActionsDispatcher { contract_address: actions_addr };
 
         set_caller_address(alice);
-        sharding.register_policies();
+        game.register_policies();
         actions.spawn();
 
         // Bob's state
@@ -990,11 +967,11 @@ mod tests {
         // Shard 1: Alice (exclusive) + reward pool (shared)
         let alice_felt: felt252 = alice.into();
         let pool_felt: felt252 = pool.into();
-        sharding.request_shard([alice_felt].span(), [pool_felt].span());
+        request_shard_for(game,[alice_felt].span(), [pool_felt].span());
 
         // Shard 2: Bob (exclusive) + same reward pool (shared)
         let bob_felt: felt252 = bob.into();
-        sharding.request_shard([bob_felt].span(), [pool_felt].span());
+        request_shard_for(game,[bob_felt].span(), [pool_felt].span());
 
         let settlement = IShardingSettlementDispatcher { contract_address: world_address };
         let active = settlement.get_active_shards();

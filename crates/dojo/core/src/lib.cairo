@@ -111,6 +111,7 @@ pub mod sharding {
     pub mod interface;
     #[cfg(feature: 'sharding')]
     pub use interface::{
+        IShardingGame, IShardingGameDispatcher, IShardingGameDispatcherTrait,
         IStorageCommitmentVerifier, IStorageCommitmentVerifierDispatcher,
         IStorageCommitmentVerifierDispatcherTrait,
     };
