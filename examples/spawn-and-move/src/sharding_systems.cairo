@@ -1,7 +1,9 @@
 #[starknet::interface]
 pub trait IShardingSystems<T> {
     fn register_policies(ref self: T);
-    fn request_shard(ref self: T, player_ids: Span<felt252>);
+    fn request_shard(
+        ref self: T, player_ids: Span<felt252>, shared_player_ids: Span<felt252>,
+    );
     fn end_shard(ref self: T, shard_id: felt252);
 }
 
@@ -9,8 +11,16 @@ pub trait IShardingSystems<T> {
 pub mod sharding_systems {
     use dojo::model::Model;
     use dojo::sharding::request::{CRDVariant, ShardField};
-    use dojo::world::{IWorldDispatcherTrait, WorldStorage};
+    use dojo::utils::entity_id_from_serialized_keys;
+    use dojo::world::WorldStorage;
+    use dojo::world::world_sharding::{
+        IShardingSettlementDispatcher, IShardingSettlementDispatcherTrait,
+    };
     use dojo_examples::models::{MockToken, Moves, PlayerConfig, Position};
+
+    fn sharding_disp(world: @WorldStorage) -> IShardingSettlementDispatcher {
+        IShardingSettlementDispatcher { contract_address: *world.dispatcher.contract_address }
+    }
 
     fn register_policy(
         ref world: WorldStorage,
@@ -19,7 +29,7 @@ pub mod sharding_systems {
         default_crdt: CRDVariant,
         field_overrides: Span<ShardField>,
     ) {
-        world.dispatcher.register_shard_policy(model_selector, default_crdt, field_overrides);
+        sharding_disp(@world).register_shard_policy(model_selector, default_crdt, field_overrides);
     }
 
     #[abi(embed_v0)]
@@ -28,9 +38,10 @@ pub mod sharding_systems {
             let mut world = self.world(@"ns");
             let ns_hash = dojo::utils::bytearray_hash(@"ns");
 
-            // ── Entity-locked models → SetLock (exclusive overwrite) ──
+            // ── Exclusive player state → SetLock ──
+            // Player's move counter and position are fully owned by the shard.
+            // Mainnet writes are blocked while sharded.
 
-            // Moves: player state during gameplay session
             register_policy(
                 ref world,
                 ns_hash,
@@ -39,7 +50,6 @@ pub mod sharding_systems {
                 [].span(),
             );
 
-            // Position: player coordinates, packed struct
             register_policy(
                 ref world,
                 ns_hash,
@@ -48,16 +58,7 @@ pub mod sharding_systems {
                 [].span(),
             );
 
-            // MockToken: per-account balance
-            register_policy(
-                ref world,
-                ns_hash,
-                Model::<MockToken>::selector(ns_hash),
-                CRDVariant::SetLock,
-                [].span(),
-            );
-
-            // PlayerConfig: entity-locked, but `items` is a dynamic array
+            // PlayerConfig: exclusive lock, `items` is a dynamic array → SetLock with max_elements
             register_policy(
                 ref world,
                 ns_hash,
@@ -72,28 +73,55 @@ pub mod sharding_systems {
                 ]
                     .span(),
             );
+
+            // ── Shared global state → Add (concurrent shard access) ──
+            // MockToken balance: rewards earned on shard get added to mainnet balance.
+            // Multiple shards can modify concurrently — deltas are merged atomically.
+
+            register_policy(
+                ref world,
+                ns_hash,
+                Model::<MockToken>::selector(ns_hash),
+                CRDVariant::Add,
+                [].span(),
+            );
         }
 
-        fn request_shard(ref self: ContractState, player_ids: Span<felt252>) {
+        fn request_shard(
+            ref self: ContractState,
+            player_ids: Span<felt252>,
+            shared_player_ids: Span<felt252>,
+        ) {
             let world = self.world(@"ns");
             let mut dojo_entities: Array<felt252> = ArrayTrait::new();
+            let mut dojo_shared_entities: Array<felt252> = ArrayTrait::new();
             let mut entity_keys_flat: Array<felt252> = ArrayTrait::new();
 
             for id in player_ids {
                 dojo_entities
-                    .append(dojo::utils::entity_id_from_serialized_keys([*id].span()));
-                entity_keys_flat.append(1); // 1 key per entity
+                    .append(entity_id_from_serialized_keys([*id].span()));
+                entity_keys_flat.append(1);
                 entity_keys_flat.append(*id);
             };
 
-            world
-                .dispatcher
-                .request_sharding(dojo_entities.span(), [].span(), entity_keys_flat.span());
+            for id in shared_player_ids {
+                dojo_shared_entities
+                    .append(entity_id_from_serialized_keys([*id].span()));
+                entity_keys_flat.append(1);
+                entity_keys_flat.append(*id);
+            };
+
+            sharding_disp(@world)
+                .request_sharding(
+                    dojo_entities.span(),
+                    dojo_shared_entities.span(),
+                    entity_keys_flat.span(),
+                );
         }
 
         fn end_shard(ref self: ContractState, shard_id: felt252) {
             let world = self.world(@"ns");
-            world.dispatcher.end_shard(shard_id);
+            sharding_disp(@world).end_shard(shard_id);
         }
     }
 }
@@ -102,15 +130,15 @@ pub mod sharding_systems {
 mod tests {
     use dojo::model::{Model, ModelStorage, ModelStorageTest};
     use dojo::sharding::compute_dojo_field_slot;
-    use dojo::sharding::slot::{compute_dojo_packed_slot, compute_dynamic_member_lock_slot};
-    use dojo::sharding::request::{CRDVariant, ShardField, SlotEntry, SlotVerification, DeterministicProof};
+    use dojo::sharding::request::{
+        InitialProof, SlotEntry, SlotVerification, DeterministicProof,
+    };
     use dojo::utils::entity_id_from_keys;
     use dojo::world::{
-        IShardingSettlementDispatcher, IShardingSettlementDispatcherTrait,
-        IWorldDispatcherTrait, WorldStorageTrait,
+        IShardingSettlementDispatcher, IShardingSettlementDispatcherTrait, WorldStorageTrait,
     };
     use dojo_examples::actions::{IActionsDispatcher, IActionsDispatcherTrait};
-    use dojo_examples::models::{Direction, Moves, PlayerConfig, PlayerItem, Position, Vec2};
+    use dojo_examples::models::{Direction, MockToken, Moves, Position};
     use dojo_snf_test::{
         ContractDef, ContractDefTrait, NamespaceDef, TestResource, WorldStorageTestTrait,
         declare_and_deploy, set_caller_address, spawn_test_world,
@@ -120,20 +148,12 @@ mod tests {
 
     // ── Mock StorageCommitment Verifier (always approves) ──────────────
 
-    #[starknet::interface]
-    trait IMockVerifierConfig<T> {
-        fn set_shard_id(ref self: T, shard_id: felt252);
-    }
-
     #[starknet::contract]
     mod mock_storage_commitment_verifier {
         use starknet::ContractAddress;
-        use starknet::storage::{StoragePointerReadAccess, StoragePointerWriteAccess};
 
         #[storage]
-        struct Storage {
-            expected_shard_id: felt252,
-        }
+        struct Storage {}
 
         #[abi(embed_v0)]
         impl MockVerifier of dojo::sharding::IStorageCommitmentVerifier<ContractState> {
@@ -144,14 +164,7 @@ mod tests {
                 global_state_root: felt252,
                 end_block_number: u64,
             ) -> (bool, felt252, felt252) {
-                (true, contract_address.into(), self.expected_shard_id.read())
-            }
-        }
-
-        #[abi(embed_v0)]
-        impl MockConfig of super::IMockVerifierConfig<ContractState> {
-            fn set_shard_id(ref self: ContractState, shard_id: felt252) {
-                self.expected_shard_id.write(shard_id);
+                (true, contract_address.into(), 0)
             }
         }
     }
@@ -195,13 +208,12 @@ mod tests {
         world
     }
 
-    fn register_mock_verifier(world_address: ContractAddress) -> ContractAddress {
+    fn register_mock_verifier(world_address: ContractAddress) {
         let mock_verifier = declare_and_deploy("mock_storage_commitment_verifier");
         let settlement = IShardingSettlementDispatcher { contract_address: world_address };
         snforge_std::start_cheat_caller_address(world_address, snforge_std::test_address());
         settlement.set_storage_commitment_registry(mock_verifier);
         snforge_std::stop_cheat_caller_address(world_address);
-        mock_verifier
     }
 
     fn moves_field_selectors() -> (felt252, felt252) {
@@ -210,6 +222,24 @@ mod tests {
             ((*fields[0]).selector, (*fields[1]).selector)
         } else {
             panic!("expected struct layout for Moves")
+        }
+    }
+
+    fn mock_token_field_selector() -> felt252 {
+        let layout = Model::<MockToken>::layout();
+        if let dojo::meta::Layout::Struct(fields) = layout {
+            (*fields[0]).selector
+        } else {
+            panic!("expected struct layout for MockToken")
+        }
+    }
+
+    fn empty_initial_proof() -> InitialProof {
+        InitialProof {
+            keys: [].span(),
+            values: [].span(),
+            commitment: 0,
+            fork_state_root: 0,
         }
     }
 
@@ -239,54 +269,21 @@ mod tests {
 
     fn settle_as_owner(
         world_address: ContractAddress,
-        mock_verifier: ContractAddress,
         shard_id: felt252,
         slots: Span<SlotEntry>,
+        initial_proof: InitialProof,
     ) {
-        // Configure mock verifier to return matching shard_id
-        let mock_config = IMockVerifierConfigDispatcher { contract_address: mock_verifier };
-        mock_config.set_shard_id(shard_id);
-
-        // Build InitialProof from all settlement slots.
-        // This keeps Add semantics correct even when initial_value == 0.
-        // The mock verifier accepts any commitment, so we only need a consistent keys/values dict.
-        let mut init_keys: Array<felt252> = ArrayTrait::new();
-        let mut init_values: Array<felt252> = ArrayTrait::new();
-        for entry in slots {
-            init_keys.append(*entry.key);
-            init_values.append(*entry.initial_value);
-        };
-        let has_initials = init_keys.len() > 0;
-        let initial_commitment = if has_initials {
-            // Compute commitment so the on-chain check passes (mock verifier accepts any).
-            let mut data: Array<felt252> = ArrayTrait::new();
-            for k in init_keys.span() {
-                data.append(*k);
-            };
-            for v in init_values.span() {
-                data.append(*v);
-            };
-            core::poseidon::poseidon_hash_span(data.span())
-        } else {
-            0
-        };
-
         let settlement = IShardingSettlementDispatcher { contract_address: world_address };
         snforge_std::start_cheat_caller_address(world_address, snforge_std::test_address());
         settlement
             .settle(
                 shard_id,
-                0x1, // global_state_root (mock verifier accepts any)
-                1, // end_block_number (must be non-zero)
+                0x1,
+                1,
                 slots,
-                [].span(), // entity_model_selectors (for Torii events, empty OK in test)
-                [].span(), // entity_keys_flat
-                dojo::sharding::request::InitialProof {
-                    keys: init_keys.span(),
-                    values: init_values.span(),
-                    commitment: initial_commitment,
-                    fork_state_root: if has_initials { 0x2 } else { 0 },
-                },
+                [].span(),
+                [].span(),
+                initial_proof,
             );
         snforge_std::stop_cheat_caller_address(world_address);
     }
@@ -316,7 +313,7 @@ mod tests {
         assert(moves.remaining == 99, 'initial moves');
 
         let player_felt: felt252 = caller.into();
-        sharding.request_shard([player_felt].span());
+        sharding.request_shard([player_felt].span(), [].span());
         sharding.end_shard(1);
     }
 
@@ -343,13 +340,13 @@ mod tests {
         assert(active.len() == 0, 'no shards initially');
 
         let player_felt: felt252 = caller.into();
-        sharding.request_shard([player_felt].span());
+        sharding.request_shard([player_felt].span(), [].span());
         let active = settlement.get_active_shards();
         assert(active.len() == 1, 'one shard active');
     }
 
     // ══════════════════════════════════════════════════════════════════
-    //  ENTITY LOCKING: all models for entity are blocked
+    //  ENTITY LOCKING: exclusive entities are blocked
     // ══════════════════════════════════════════════════════════════════
 
     #[test]
@@ -369,7 +366,7 @@ mod tests {
         actions.spawn();
 
         let player_felt: felt252 = caller.into();
-        sharding.request_shard([player_felt].span());
+        sharding.request_shard([player_felt].span(), [].span());
 
         // move() writes to both Moves and Position — should panic
         actions.move(Direction::Right);
@@ -392,7 +389,7 @@ mod tests {
         actions.spawn();
 
         let player_felt: felt252 = caller.into();
-        sharding.request_shard([player_felt].span());
+        sharding.request_shard([player_felt].span(), [].span());
 
         // Direct model write should also be blocked
         world.write_model_test(@Moves { player: caller, remaining: 50, last_direction: Direction::None });
@@ -420,7 +417,7 @@ mod tests {
 
         // Shard only Alice
         let alice_felt: felt252 = alice.into();
-        sharding.request_shard([alice_felt].span());
+        sharding.request_shard([alice_felt].span(), [].span());
 
         // Bob's entities are NOT locked — write should succeed
         world.write_model_test(
@@ -431,7 +428,41 @@ mod tests {
     }
 
     // ══════════════════════════════════════════════════════════════════
-    //  FULL SETTLEMENT: shard → lock → settle → unlock + verify values
+    //  SHARED ENTITIES: mainnet writes allowed for Add CRDT
+    // ══════════════════════════════════════════════════════════════════
+
+    #[test]
+
+    fn test_shared_entity_allows_mainnet_write() {
+        let mut world = setup_world();
+        let caller = dojo_snf_test::get_default_caller_address();
+        let token_account: ContractAddress = 0xacc.try_into().unwrap();
+
+        let (sharding_addr, _) = world.dns(@"sharding_systems").unwrap();
+        let sharding = IShardingSystemsDispatcher { contract_address: sharding_addr };
+        let (actions_addr, _) = world.dns(@"actions").unwrap();
+        let actions = IActionsDispatcher { contract_address: actions_addr };
+
+        set_caller_address(caller);
+        sharding.register_policies();
+        actions.spawn();
+
+        // Initialize token balance
+        world.write_model_test(@MockToken { account: token_account, amount: 100 });
+
+        // Shard player exclusively, token entity as shared
+        let player_felt: felt252 = caller.into();
+        let token_felt: felt252 = token_account.into();
+        sharding.request_shard([player_felt].span(), [token_felt].span());
+
+        // Shared entity (MockToken) should still be writable on mainnet
+        world.write_model_test(@MockToken { account: token_account, amount: 150 });
+        let token: MockToken = world.read_model(token_account);
+        assert(token.amount == 150, 'shared write ok');
+    }
+
+    // ══════════════════════════════════════════════════════════════════
+    //  FULL SETTLEMENT: SetLock CRDT (exclusive overwrite)
     // ══════════════════════════════════════════════════════════════════
 
     #[test]
@@ -440,7 +471,7 @@ mod tests {
         let mut world = setup_world();
         let world_address = world.dispatcher.contract_address;
         let caller = dojo_snf_test::get_default_caller_address();
-        let mock_verifier = register_mock_verifier(world_address);
+        register_mock_verifier(world_address);
 
         let (sharding_addr, _) = world.dns(@"sharding_systems").unwrap();
         let sharding = IShardingSystemsDispatcher { contract_address: sharding_addr };
@@ -457,11 +488,11 @@ mod tests {
 
         // Request shard (locks entity)
         let player_felt: felt252 = caller.into();
-        sharding.request_shard([player_felt].span());
+        sharding.request_shard([player_felt].span(), [].span());
 
         // --- Simulate shard gameplay result ---
         // On the shard Katana, the player used 10 moves. Remaining: 89.
-        // Settlement carries this value back to mainnet via Set CRDT.
+        // Settlement carries this value back to mainnet via SetLock CRDT.
 
         let ns_hash = dojo::utils::bytearray_hash(@"ns");
         let moves_selector = Model::<Moves>::selector(ns_hash);
@@ -469,15 +500,15 @@ mod tests {
         let (sel_remaining, _sel_direction) = moves_field_selectors();
         let slot_remaining = compute_dojo_field_slot(moves_selector, entity_id, sel_remaining);
 
-        // Settle: write remaining=89 via Set CRDT
+        // Settle: write remaining=89 via SetLock CRDT
         settle_as_owner(
             world_address,
-            mock_verifier,
             1,
             [
                 make_field_slot(slot_remaining, 89, moves_selector, entity_id, sel_remaining, 0),
             ]
                 .span(),
+            empty_initial_proof(),
         );
 
         // Verify: entity unlocked and value updated
@@ -498,7 +529,7 @@ mod tests {
         let mut world = setup_world();
         let world_address = world.dispatcher.contract_address;
         let caller = dojo_snf_test::get_default_caller_address();
-        let mock_verifier = register_mock_verifier(world_address);
+        register_mock_verifier(world_address);
 
         let (sharding_addr, _) = world.dns(@"sharding_systems").unwrap();
         let sharding = IShardingSystemsDispatcher { contract_address: sharding_addr };
@@ -514,7 +545,7 @@ mod tests {
         assert(pre.remaining == 98, 'pre: 98 moves');
 
         let player_felt: felt252 = caller.into();
-        sharding.request_shard([player_felt].span());
+        sharding.request_shard([player_felt].span(), [].span());
 
         let ns_hash = dojo::utils::bytearray_hash(@"ns");
         let moves_selector = Model::<Moves>::selector(ns_hash);
@@ -525,12 +556,12 @@ mod tests {
         // Settle only `remaining` — `last_direction` untouched
         settle_as_owner(
             world_address,
-            mock_verifier,
             1,
             [
                 make_field_slot(slot_remaining, 50, moves_selector, entity_id, sel_remaining, 0),
             ]
                 .span(),
+            empty_initial_proof(),
         );
 
         let after: Moves = world.read_model(caller);
@@ -541,7 +572,8 @@ mod tests {
     }
 
     #[test]
-    fn test_entity_locked_before_cancel_then_unlocked_after() {
+
+    fn test_cancel_shard_unlocks_entity() {
         let mut world = setup_world();
         let world_address = world.dispatcher.contract_address;
         let caller = dojo_snf_test::get_default_caller_address();
@@ -556,22 +588,15 @@ mod tests {
         actions.spawn();
 
         let player_felt: felt252 = caller.into();
-        let entity_id = dojo::utils::entity_id_from_serialized_keys([player_felt].span());
-        sharding.request_shard([player_felt].span());
+        sharding.request_shard([player_felt].span(), [].span());
 
-        // Verify entity IS locked (shard_id = 1)
+        // Cancel instead of settle
         let settlement = IShardingSettlementDispatcher { contract_address: world_address };
-        assert(settlement.get_entity_shard(entity_id) == 1, 'locked: shard 1');
-
-        // Cancel
         snforge_std::start_cheat_caller_address(world_address, snforge_std::test_address());
         settlement.cancel_shard(1);
         snforge_std::stop_cheat_caller_address(world_address);
 
-        // Verify entity is UNLOCKED (shard_id = 0)
-        assert(settlement.get_entity_shard(entity_id) == 0, 'unlocked: shard 0');
-
-        // Original values preserved
+        // Entity should be unlocked — original values preserved
         let moves: Moves = world.read_model(caller);
         assert(moves.remaining == 99, 'cancel: original');
 
@@ -583,15 +608,17 @@ mod tests {
     }
 
     // ══════════════════════════════════════════════════════════════════
-    //  ADD CRDT: delta merge
+    //  ADD CRDT: shared MockToken balance accumulates deltas
     // ══════════════════════════════════════════════════════════════════
 
     #[test]
-    fn test_add_crdt_computes_delta() {
+
+    fn test_settlement_add_crdt_accumulates_delta() {
         let mut world = setup_world();
         let world_address = world.dispatcher.contract_address;
         let caller = dojo_snf_test::get_default_caller_address();
-        let mock_verifier = register_mock_verifier(world_address);
+        let token_account: ContractAddress = 0xacc.try_into().unwrap();
+        register_mock_verifier(world_address);
 
         let (sharding_addr, _) = world.dns(@"sharding_systems").unwrap();
         let sharding = IShardingSystemsDispatcher { contract_address: sharding_addr };
@@ -599,139 +626,60 @@ mod tests {
         let actions = IActionsDispatcher { contract_address: actions_addr };
 
         set_caller_address(caller);
-        actions.spawn(); // remaining = 99
+        sharding.register_policies();
+        actions.spawn();
 
-        // Override: register Moves.remaining as Add CRDT (instead of default Set)
-        let ns_hash = dojo::utils::bytearray_hash(@"ns");
-        let moves_selector = Model::<Moves>::selector(ns_hash);
-        let (sel_remaining, _) = moves_field_selectors();
-        world
-            .dispatcher
-            .register_shard_policy(
-                moves_selector,
-                CRDVariant::SetLock,
-                [ShardField { selector: sel_remaining, crdt: CRDVariant::Add, max_elements: 0 }]
-                    .span(),
-            );
+        // Initialize token balance: 100
+        world.write_model_test(@MockToken { account: token_account, amount: 100 });
 
+        // Shard player exclusively, token entity as shared (Add CRDT)
         let player_felt: felt252 = caller.into();
-        sharding.request_shard([player_felt].span());
+        let token_felt: felt252 = token_account.into();
+        sharding.request_shard([player_felt].span(), [token_felt].span());
 
-        let entity_id = entity_id_from_keys(@caller);
-        let slot_remaining = compute_dojo_field_slot(moves_selector, entity_id, sel_remaining);
+        // Simulate mainnet activity while shard is active:
+        // someone adds 50 tokens on mainnet (shared entity allows writes)
+        world.write_model_test(@MockToken { account: token_account, amount: 150 });
 
-        // Shard gameplay: remaining went from 99 to 109 (gained 10 moves)
-        // Delta = 109 - 99 = 10
-        // Expected on-chain: current(99) + delta(10) = 109
-        settle_as_owner(
-            world_address,
-            mock_verifier,
-            1,
-            [make_field_slot(slot_remaining, 109, moves_selector, entity_id, sel_remaining, 99)]
-                .span(),
-        );
-
-        let result: Moves = world.read_model(caller);
-        assert(result.remaining == 109, 'Add: 99+(109-99)=109');
-    }
-
-    #[test]
-    fn test_mixed_set_and_add_on_same_model() {
-        let mut world = setup_world();
-        let world_address = world.dispatcher.contract_address;
-        let caller = dojo_snf_test::get_default_caller_address();
-        let mock_verifier = register_mock_verifier(world_address);
-
-        let (sharding_addr, _) = world.dns(@"sharding_systems").unwrap();
-        let sharding = IShardingSystemsDispatcher { contract_address: sharding_addr };
-        let (actions_addr, _) = world.dns(@"actions").unwrap();
-        let actions = IActionsDispatcher { contract_address: actions_addr };
-
-        set_caller_address(caller);
-        actions.spawn(); // remaining=99
-        // Move right so direction=Right before sharding
-        actions.move(Direction::Right); // remaining=98
+        // --- Simulate shard gameplay result ---
+        // On the shard, the player earned 30 tokens.
+        // Shard forked with initial_value=100, shard final value=130.
+        // Add CRDT: delta = 130 - 100 = 30
+        // Mainnet result: current(150) + delta(30) = 180
 
         let ns_hash = dojo::utils::bytearray_hash(@"ns");
-        let moves_selector = Model::<Moves>::selector(ns_hash);
-        let (sel_remaining, _) = moves_field_selectors();
+        let token_selector = Model::<MockToken>::selector(ns_hash);
+        let token_entity_id = entity_id_from_keys(@token_account);
+        let sel_amount = mock_token_field_selector();
+        let slot_amount = compute_dojo_field_slot(token_selector, token_entity_id, sel_amount);
 
-        // Override: remaining=Add, rest stays Set (default)
-        world
-            .dispatcher
-            .register_shard_policy(
-                moves_selector,
-                CRDVariant::SetLock,
-                [ShardField { selector: sel_remaining, crdt: CRDVariant::Add, max_elements: 0 }]
-                    .span(),
-            );
+        let initial_proof = InitialProof {
+            keys: [slot_amount].span(),
+            values: [100].span(),
+            commitment: core::poseidon::poseidon_hash_span([slot_amount, 100].span()),
+            fork_state_root: 0x42,
+        };
 
-        let player_felt: felt252 = caller.into();
-        sharding.request_shard([player_felt].span());
-
-        let entity_id = entity_id_from_keys(@caller);
-        let slot_remaining = compute_dojo_field_slot(moves_selector, entity_id, sel_remaining);
-
-        // Settle only remaining via Add: 98→108, delta=10
-        // Direction field not settled → stays Right (unchanged)
         settle_as_owner(
             world_address,
-            mock_verifier,
             1,
             [
-                make_field_slot(slot_remaining, 108, moves_selector, entity_id, sel_remaining, 98),
+                make_field_slot(
+                    slot_amount,
+                    130,             // shard final value
+                    token_selector,
+                    token_entity_id,
+                    sel_amount,
+                    100,             // initial value at fork time
+                ),
             ]
                 .span(),
+            initial_proof,
         );
 
-        let result: Moves = world.read_model(caller);
-        assert(result.remaining == 108, 'Add: 98+(108-98)=108');
-        let right: felt252 = Direction::Right.into();
-        assert(result.last_direction.into() == right, 'direction unchanged');
-    }
-
-    #[test]
-    #[should_panic(expected: ('Shard: add delta underflow',))]
-    fn test_add_crdt_underflow_rejected() {
-        let mut world = setup_world();
-        let world_address = world.dispatcher.contract_address;
-        let caller = dojo_snf_test::get_default_caller_address();
-        let mock_verifier = register_mock_verifier(world_address);
-
-        let (sharding_addr, _) = world.dns(@"sharding_systems").unwrap();
-        let sharding = IShardingSystemsDispatcher { contract_address: sharding_addr };
-        let (actions_addr, _) = world.dns(@"actions").unwrap();
-        let actions = IActionsDispatcher { contract_address: actions_addr };
-
-        set_caller_address(caller);
-        actions.spawn(); // remaining = 99
-
-        let ns_hash = dojo::utils::bytearray_hash(@"ns");
-        let moves_selector = Model::<Moves>::selector(ns_hash);
-        let (sel_remaining, _) = moves_field_selectors();
-        world
-            .dispatcher
-            .register_shard_policy(
-                moves_selector,
-                CRDVariant::SetLock,
-                [ShardField { selector: sel_remaining, crdt: CRDVariant::Add, max_elements: 0 }]
-                    .span(),
-            );
-
-        let player_felt: felt252 = caller.into();
-        sharding.request_shard([player_felt].span());
-
-        let entity_id = entity_id_from_keys(@caller);
-        let slot_remaining = compute_dojo_field_slot(moves_selector, entity_id, sel_remaining);
-
-        // shard_value(50) < initial(99) → negative delta → underflow panic
-        settle_as_owner(
-            world_address,
-            mock_verifier,
-            1,
-            [make_field_slot(slot_remaining, 50, moves_selector, entity_id, sel_remaining, 99)]
-                .span(),
-        );
+        // Verify: 150 (mainnet current) + (130 - 100) (shard delta) = 180
+        let token: MockToken = world.read_model(token_account);
+        assert(token.amount == 180, 'add crdt: 150+30=180');
     }
 
     // ══════════════════════════════════════════════════════════════════
@@ -755,9 +703,9 @@ mod tests {
         actions.spawn();
 
         let player_felt: felt252 = caller.into();
-        sharding.request_shard([player_felt].span());
-        // Second shard for same entity → panic
-        sharding.request_shard([player_felt].span());
+        sharding.request_shard([player_felt].span(), [].span());
+        // Second shard for same entity -> panic
+        sharding.request_shard([player_felt].span(), [].span());
     }
 
     #[test]
@@ -772,8 +720,8 @@ mod tests {
 
         set_caller_address(caller);
         sharding.register_policies();
-        // Empty entity list → panic
-        sharding.request_shard([].span());
+        // Empty entity list -> panic
+        sharding.request_shard([].span(), [].span());
     }
 
     #[test]
@@ -783,7 +731,7 @@ mod tests {
         let mut world = setup_world();
         let world_address = world.dispatcher.contract_address;
         let caller = dojo_snf_test::get_default_caller_address();
-        let mock_verifier = register_mock_verifier(world_address);
+        register_mock_verifier(world_address);
 
         let (sharding_addr, _) = world.dns(@"sharding_systems").unwrap();
         let sharding = IShardingSystemsDispatcher { contract_address: sharding_addr };
@@ -795,7 +743,7 @@ mod tests {
         actions.spawn();
 
         let player_felt: felt252 = caller.into();
-        sharding.request_shard([player_felt].span());
+        sharding.request_shard([player_felt].span(), [].span());
 
         let ns_hash = dojo::utils::bytearray_hash(@"ns");
         let moves_selector = Model::<Moves>::selector(ns_hash);
@@ -807,12 +755,12 @@ mod tests {
 
         settle_as_owner(
             world_address,
-            mock_verifier,
             1,
             [
                 make_field_slot(fake_key, 50, moves_selector, entity_id, sel_remaining, 0),
             ]
                 .span(),
+            empty_initial_proof(),
         );
     }
 
@@ -824,7 +772,7 @@ mod tests {
         let world_address = world.dispatcher.contract_address;
         let caller = dojo_snf_test::get_default_caller_address();
         let eve: ContractAddress = 0xe0e.try_into().unwrap();
-        let mock_verifier = register_mock_verifier(world_address);
+        register_mock_verifier(world_address);
 
         let (sharding_addr, _) = world.dns(@"sharding_systems").unwrap();
         let sharding = IShardingSystemsDispatcher { contract_address: sharding_addr };
@@ -839,7 +787,7 @@ mod tests {
 
         // Shard only the caller
         let player_felt: felt252 = caller.into();
-        sharding.request_shard([player_felt].span());
+        sharding.request_shard([player_felt].span(), [].span());
 
         // Try to settle a slot belonging to Eve's entity — not in shard
         let ns_hash = dojo::utils::bytearray_hash(@"ns");
@@ -850,7 +798,6 @@ mod tests {
 
         settle_as_owner(
             world_address,
-            mock_verifier,
             1,
             [
                 make_field_slot(
@@ -858,505 +805,282 @@ mod tests {
                 ),
             ]
                 .span(),
+            empty_initial_proof(),
         );
     }
 
     // ══════════════════════════════════════════════════════════════════
-    //  CONCURRENT SHARDS: two separate shards coexist and settle
+    //  DEMO: Full-game shard — all player state goes to shard
     // ══════════════════════════════════════════════════════════════════
 
     #[test]
-    fn test_two_shards_coexist_and_settle_independently() {
+    fn test_demo_full_game_shard() {
         let mut world = setup_world();
         let world_address = world.dispatcher.contract_address;
         let alice = dojo_snf_test::get_default_caller_address();
-        let bob: ContractAddress = 0xb0b.try_into().unwrap();
-        let mock_verifier = register_mock_verifier(world_address);
+        register_mock_verifier(world_address);
 
         let (sharding_addr, _) = world.dns(@"sharding_systems").unwrap();
         let sharding = IShardingSystemsDispatcher { contract_address: sharding_addr };
         let (actions_addr, _) = world.dns(@"actions").unwrap();
         let actions = IActionsDispatcher { contract_address: actions_addr };
 
-        // Spawn Alice (remaining=99) and Bob (remaining=50)
         set_caller_address(alice);
         sharding.register_policies();
         actions.spawn();
-        world.write_model_test(
-            @Moves { player: bob, remaining: 50, last_direction: Direction::None },
+
+        // Initialize token balance
+        world.write_model_test(@MockToken { account: alice, amount: 1000 });
+
+        // ── SHARD ENTIRE GAME ──
+        // Alice's entity is exclusively locked for all models (Moves, Position).
+        // Alice's token entity is also exclusively locked (single-player shard).
+        let alice_felt: felt252 = alice.into();
+        sharding.request_shard([alice_felt].span(), [].span());
+
+        // Verify: all writes blocked on mainnet
+        let settlement = IShardingSettlementDispatcher { contract_address: world_address };
+        assert(settlement.get_entity_shard(
+            dojo::utils::entity_id_from_serialized_keys([alice_felt].span())
+        ) != 0, 'entity is sharded');
+
+        // ── SIMULATE SHARD GAMEPLAY ──
+        // On the shard Katana, the player moved 20 times (remaining: 99 -> 79).
+        // Settlement carries this value back to mainnet via SetLock CRDT.
+        let ns_hash = dojo::utils::bytearray_hash(@"ns");
+        let moves_selector = Model::<Moves>::selector(ns_hash);
+        let entity_id = entity_id_from_keys(@alice);
+
+        let (sel_remaining, _sel_direction) = moves_field_selectors();
+        let slot_remaining = compute_dojo_field_slot(moves_selector, entity_id, sel_remaining);
+
+        settle_as_owner(
+            world_address,
+            1,
+            [
+                make_field_slot(slot_remaining, 79, moves_selector, entity_id, sel_remaining, 0),
+            ]
+                .span(),
+            empty_initial_proof(),
         );
 
-        // Shard Alice → shard_id=1
+        // ── VERIFY SETTLEMENT ──
+        let moves: Moves = world.read_model(alice);
+        assert(moves.remaining == 79, 'full: 79 moves');
+
+        // Entity unlocked — game can continue on mainnet
+        actions.move(Direction::Right);
+        let after: Moves = world.read_model(alice);
+        assert(after.remaining == 78, 'full: can move again');
+    }
+
+    // ══════════════════════════════════════════════════════════════════
+    //  DEMO: Partial shard — only player movement, tokens shared
+    // ══════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_demo_partial_shard_with_shared_tokens() {
+        let mut world = setup_world();
+        let world_address = world.dispatcher.contract_address;
+        let alice = dojo_snf_test::get_default_caller_address();
+        let treasury: ContractAddress = 0x7ea5.try_into().unwrap();
+        register_mock_verifier(world_address);
+
+        let (sharding_addr, _) = world.dns(@"sharding_systems").unwrap();
+        let sharding = IShardingSystemsDispatcher { contract_address: sharding_addr };
+        let (actions_addr, _) = world.dns(@"actions").unwrap();
+        let actions = IActionsDispatcher { contract_address: actions_addr };
+
+        set_caller_address(alice);
+        sharding.register_policies();
+        actions.spawn();
+
+        // Global treasury token balance (shared across shards)
+        world.write_model_test(@MockToken { account: treasury, amount: 500 });
+
+        // ── PARTIAL SHARD ──
+        // Alice's movement is exclusive (locked), treasury is shared (Add CRDT).
+        // This allows other shards or mainnet to also modify the treasury concurrently.
         let alice_felt: felt252 = alice.into();
-        sharding.request_shard([alice_felt].span());
+        let treasury_felt: felt252 = treasury.into();
+        sharding.request_shard(
+            [alice_felt].span(),          // exclusive: player movement
+            [treasury_felt].span(),       // shared: global treasury
+        );
 
-        // Shard Bob → shard_id=2  (different entity, coexists with shard 1)
+        // ── MAINNET ACTIVITY WHILE SHARD RUNS ──
+        // Another system deposits 200 tokens into the treasury on mainnet.
+        // This is allowed because treasury is a shared entity.
+        world.write_model_test(@MockToken { account: treasury, amount: 700 });
+
+        // ── SHARD SETTLEMENT ──
+        // On the shard: Alice used 5 moves (remaining 94), and the shard
+        // awarded 100 tokens to the treasury (fork initial 500 -> shard final 600).
+        let ns_hash = dojo::utils::bytearray_hash(@"ns");
+        let moves_selector = Model::<Moves>::selector(ns_hash);
+        let token_selector = Model::<MockToken>::selector(ns_hash);
+        let alice_entity = entity_id_from_keys(@alice);
+        let treasury_entity = entity_id_from_keys(@treasury);
+
+        let (sel_remaining, _) = moves_field_selectors();
+        let slot_remaining = compute_dojo_field_slot(moves_selector, alice_entity, sel_remaining);
+
+        let sel_amount = mock_token_field_selector();
+        let slot_amount = compute_dojo_field_slot(token_selector, treasury_entity, sel_amount);
+
+        let initial_proof = InitialProof {
+            keys: [slot_amount].span(),
+            values: [500].span(),
+            commitment: core::poseidon::poseidon_hash_span([slot_amount, 500].span()),
+            fork_state_root: 0x42,
+        };
+
+        settle_as_owner(
+            world_address,
+            1,
+            [
+                // Alice's moves: SetLock overwrite
+                make_field_slot(slot_remaining, 94, moves_selector, alice_entity, sel_remaining, 0),
+                // Treasury tokens: Add CRDT delta (600 - 500 = +100)
+                make_field_slot(slot_amount, 600, token_selector, treasury_entity, sel_amount, 500),
+            ]
+                .span(),
+            initial_proof,
+        );
+
+        // ── VERIFY ──
+        let moves: Moves = world.read_model(alice);
+        assert(moves.remaining == 94, 'partial: 94 moves');
+
+        // Treasury: mainnet had 700 + shard delta (+100) = 800
+        let token: MockToken = world.read_model(treasury);
+        assert(token.amount == 800, 'partial: 700+100=800');
+    }
+
+    // ══════════════════════════════════════════════════════════════════
+    //  DEMO: Two concurrent shards sharing global state
+    // ══════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_demo_two_shards_concurrent_shared_token() {
+        let mut world = setup_world();
+        let world_address = world.dispatcher.contract_address;
+        let alice = dojo_snf_test::get_default_caller_address();
+        let bob: ContractAddress = 0xb0b.try_into().unwrap();
+        let pool: ContractAddress = 0x9001.try_into().unwrap();
+        register_mock_verifier(world_address);
+
+        let (sharding_addr, _) = world.dns(@"sharding_systems").unwrap();
+        let sharding = IShardingSystemsDispatcher { contract_address: sharding_addr };
+        let (actions_addr, _) = world.dns(@"actions").unwrap();
+        let actions = IActionsDispatcher { contract_address: actions_addr };
+
+        set_caller_address(alice);
+        sharding.register_policies();
+        actions.spawn();
+
+        // Bob's state
+        world.write_model_test(@Moves { player: bob, remaining: 99, last_direction: Direction::None });
+        world.write_model_test(@Position { player: bob, vec: dojo_examples::models::Vec2 { x: 10, y: 10 } });
+
+        // Shared reward pool
+        world.write_model_test(@MockToken { account: pool, amount: 1000 });
+
+        // ── TWO CONCURRENT SHARDS ──
+        // Shard 1: Alice (exclusive) + reward pool (shared)
+        let alice_felt: felt252 = alice.into();
+        let pool_felt: felt252 = pool.into();
+        sharding.request_shard([alice_felt].span(), [pool_felt].span());
+
+        // Shard 2: Bob (exclusive) + same reward pool (shared)
         let bob_felt: felt252 = bob.into();
-        sharding.request_shard([bob_felt].span());
+        sharding.request_shard([bob_felt].span(), [pool_felt].span());
 
-        // Both active
         let settlement = IShardingSettlementDispatcher { contract_address: world_address };
         let active = settlement.get_active_shards();
         assert(active.len() == 2, 'two shards active');
 
-        // Settle shard 2 (Bob) first — order doesn't matter
+        // ── SETTLE SHARD 1 (Alice) ──
+        // Alice used 10 moves, shard awarded 50 tokens to the pool
         let ns_hash = dojo::utils::bytearray_hash(@"ns");
         let moves_selector = Model::<Moves>::selector(ns_hash);
-        let bob_entity = entity_id_from_keys(@bob);
-        let (sel_remaining, _) = moves_field_selectors();
-        let bob_slot = compute_dojo_field_slot(moves_selector, bob_entity, sel_remaining);
-
-        settle_as_owner(
-            world_address,
-            mock_verifier,
-            2, // shard_id=2
-            [make_field_slot(bob_slot, 30, moves_selector, bob_entity, sel_remaining, 0)].span(),
-        );
-
-        // Bob settled, Alice still locked
-        let bob_result: Moves = world.read_model(bob);
-        assert(bob_result.remaining == 30, 'bob settled to 30');
-        assert(settlement.get_entity_shard(entity_id_from_keys(@alice)) == 1, 'alice still locked');
-        assert(settlement.get_entity_shard(bob_entity) == 0, 'bob unlocked');
-
-        // Now settle shard 1 (Alice)
+        let token_selector = Model::<MockToken>::selector(ns_hash);
         let alice_entity = entity_id_from_keys(@alice);
-        let alice_slot = compute_dojo_field_slot(moves_selector, alice_entity, sel_remaining);
+        let pool_entity = entity_id_from_keys(@pool);
+
+        let (sel_remaining, _) = moves_field_selectors();
+        let sel_amount = mock_token_field_selector();
+
+        let alice_slot_remaining = compute_dojo_field_slot(moves_selector, alice_entity, sel_remaining);
+        let pool_slot_amount = compute_dojo_field_slot(token_selector, pool_entity, sel_amount);
+
+        let initial_proof_1 = InitialProof {
+            keys: [pool_slot_amount].span(),
+            values: [1000].span(),
+            commitment: core::poseidon::poseidon_hash_span([pool_slot_amount, 1000].span()),
+            fork_state_root: 0x42,
+        };
 
         settle_as_owner(
             world_address,
-            mock_verifier,
-            1, // shard_id=1
-            [make_field_slot(alice_slot, 80, moves_selector, alice_entity, sel_remaining, 0)]
-                .span(),
-        );
-
-        let alice_result: Moves = world.read_model(alice);
-        assert(alice_result.remaining == 80, 'alice settled to 80');
-        assert(settlement.get_entity_shard(alice_entity) == 0, 'alice unlocked');
-
-        // Both unlocked — no active shards
-        let active = settlement.get_active_shards();
-        assert(active.len() == 0, 'no shards left');
-    }
-
-    /// BUG/LIMITATION: entity_lock is exclusive regardless of CRDT type.
-    /// Even with Add CRDT (designed for concurrent delta merge on global models),
-    /// the same entity cannot be in two shards simultaneously.
-    /// This means Add on a locked entity degrades to Set behavior:
-    ///   new = current + (shard - initial) = initial + (shard - initial) = shard
-    /// because no mainnet writes can happen while entity is locked.
-    /// TODO: verify_slot_ownership should exempt Add entities from entity_lock
-    /// to enable true concurrent global counter access across shards.
-    #[test]
-    #[should_panic(expected: ('Shard: entity already sharded',))]
-    fn test_add_entity_still_exclusively_locked() {
-        let mut world = setup_world();
-        let caller = dojo_snf_test::get_default_caller_address();
-
-        let (sharding_addr, _) = world.dns(@"sharding_systems").unwrap();
-        let sharding = IShardingSystemsDispatcher { contract_address: sharding_addr };
-        let (actions_addr, _) = world.dns(@"actions").unwrap();
-        let actions = IActionsDispatcher { contract_address: actions_addr };
-
-        set_caller_address(caller);
-        actions.spawn();
-
-        let ns_hash = dojo::utils::bytearray_hash(@"ns");
-        let moves_selector = Model::<Moves>::selector(ns_hash);
-        let (sel_remaining, _) = moves_field_selectors();
-        world
-            .dispatcher
-            .register_shard_policy(
-                moves_selector,
-                CRDVariant::SetLock,
-                [ShardField { selector: sel_remaining, crdt: CRDVariant::Add, max_elements: 0 }]
-                    .span(),
-            );
-
-        let player_felt: felt252 = caller.into();
-        sharding.request_shard([player_felt].span());
-        // Panics — entity_lock is exclusive even for Add CRDT entities.
-        sharding.request_shard([player_felt].span());
-    }
-
-    /// CRDT policies cannot be changed while any shard is active.
-    /// register_shard_policy asserts active_shard_count == 0.
-    #[test]
-    #[should_panic(expected: ('Shard: active shards exist',))]
-    fn test_cannot_change_crdt_policy_during_active_shard() {
-        let mut world = setup_world();
-        let caller = dojo_snf_test::get_default_caller_address();
-
-        let (sharding_addr, _) = world.dns(@"sharding_systems").unwrap();
-        let sharding = IShardingSystemsDispatcher { contract_address: sharding_addr };
-        let (actions_addr, _) = world.dns(@"actions").unwrap();
-        let actions = IActionsDispatcher { contract_address: actions_addr };
-
-        set_caller_address(caller);
-        sharding.register_policies(); // Set policies initially
-        actions.spawn();
-
-        let player_felt: felt252 = caller.into();
-        sharding.request_shard([player_felt].span()); // now active_shard_count > 0
-
-        // Try to change CRDT policy while shard is active → panics
-        let ns_hash = dojo::utils::bytearray_hash(@"ns");
-        let moves_selector = Model::<Moves>::selector(ns_hash);
-        world
-            .dispatcher
-            .register_shard_policy(moves_selector, CRDVariant::Add, [].span());
-    }
-
-    // ══════════════════════════════════════════════════════════════════
-    //  LAYOUT COVERAGE: packed models, dynamic arrays
-    // ══════════════════════════════════════════════════════════════════
-
-    /// Position uses IntrospectPacked → Fixed layout.
-    /// Slot = Poseidon(DOJO_STORAGE, model_selector, entity_id) + packed_offset.
-    /// Verification: empty key_derivation_chain, member_selector=0.
-    #[test]
-    fn test_packed_model_settlement() {
-        let mut world = setup_world();
-        let world_address = world.dispatcher.contract_address;
-        let caller = dojo_snf_test::get_default_caller_address();
-        let mock_verifier = register_mock_verifier(world_address);
-
-        let (sharding_addr, _) = world.dns(@"sharding_systems").unwrap();
-        let sharding = IShardingSystemsDispatcher { contract_address: sharding_addr };
-        let (actions_addr, _) = world.dns(@"actions").unwrap();
-        let actions = IActionsDispatcher { contract_address: actions_addr };
-
-        set_caller_address(caller);
-        sharding.register_policies();
-        actions.spawn(); // Position { vec: Vec2 { x: 10, y: 10 } }
-
-        let pre: Position = world.read_model(caller);
-        assert(pre.vec.x == 10 && pre.vec.y == 10, 'pre: (10,10)');
-
-        let player_felt: felt252 = caller.into();
-        sharding.request_shard([player_felt].span());
-
-        let ns_hash = dojo::utils::bytearray_hash(@"ns");
-        let position_selector = Model::<Position>::selector(ns_hash);
-        let entity_id = entity_id_from_keys(@caller);
-
-        // Packed slot: Poseidon(DOJO_STORAGE, model, entity_id) + 0
-        let packed_slot = compute_dojo_packed_slot(position_selector, entity_id);
-
-        // Vec2 { x: 20, y: 30 } packed as: x (low 32 bits) | y << 32 (high 32 bits)
-        // Dojo packs fields left-to-right into ascending bit positions.
-        let packed_value: felt252 = (20_u64 + 30_u64 * 0x100000000_u64).into();
-
-        // Packed models: empty key_derivation_chain, member_selector=0, packed_offset=0
-        let slot_entry = SlotEntry {
-            key: packed_slot,
-            value: packed_value,
-            model_selector: position_selector,
-            entity_id,
-            member_selector: 0,
-            initial_value: 0,
-            verification: SlotVerification::Deterministic(
-                DeterministicProof {
-                    key_derivation_chain: [].span(),
-                    packed_offset: 0,
-                },
-            ),
-        };
-
-        settle_as_owner(world_address, mock_verifier, 1, [slot_entry].span());
-
-        let post: Position = world.read_model(caller);
-        assert(post.vec.x == 20, 'packed: x=20');
-        assert(post.vec.y == 30, 'packed: y=30');
-    }
-
-    /// PlayerConfig.items is Array<PlayerItem> registered as SetLock with max_elements=10.
-    /// Dynamic arrays use SlotVerification::DynamicLock with domain 'dojo_dynamic_member_lock'.
-    #[test]
-    fn test_dynamic_array_lock_slot_settlement() {
-        let mut world = setup_world();
-        let world_address = world.dispatcher.contract_address;
-        let caller = dojo_snf_test::get_default_caller_address();
-        let mock_verifier = register_mock_verifier(world_address);
-
-        let (sharding_addr, _) = world.dns(@"sharding_systems").unwrap();
-        let sharding = IShardingSystemsDispatcher { contract_address: sharding_addr };
-
-        set_caller_address(caller);
-        sharding.register_policies(); // registers items with SetLock, max_elements=10
-
-        // Write initial PlayerConfig with items
-        world
-            .write_model_test(
-                @PlayerConfig {
-                    player: caller,
-                    name: "alice",
-                    items: array![PlayerItem { item_id: 1, quantity: 5, score: 10 }],
-                    favorite_item: Option::Some(1),
-                },
-            );
-
-        let player_felt: felt252 = caller.into();
-        sharding.request_shard([player_felt].span());
-
-        let ns_hash = dojo::utils::bytearray_hash(@"ns");
-        let config_selector = Model::<PlayerConfig>::selector(ns_hash);
-        let entity_id = entity_id_from_keys(@caller);
-        let items_selector = selector!("items");
-
-        // DynamicLock slot: Poseidon('dojo_dynamic_member_lock', model, entity, member)
-        let dynamic_slot = compute_dynamic_member_lock_slot(
-            config_selector, entity_id, items_selector,
-        );
-
-        // DynamicLock verification — writes value to the lock tracking slot
-        let slot_entry = SlotEntry {
-            key: dynamic_slot,
-            value: 42, // arbitrary value written to the dynamic lock slot
-            model_selector: config_selector,
-            entity_id,
-            member_selector: items_selector,
-            initial_value: 0,
-            verification: SlotVerification::DynamicLock,
-        };
-
-        // Settlement accepts DynamicLock slots for SetLock-registered fields
-        settle_as_owner(world_address, mock_verifier, 1, [slot_entry].span());
-
-        // Entity unlocked after settlement
-        let settlement = IShardingSettlementDispatcher { contract_address: world_address };
-        assert(settlement.get_entity_shard(entity_id) == 0, 'unlocked after settle');
-    }
-
-    /// Packed model with wrong packed_offset should fail slot ownership check.
-    #[test]
-    #[should_panic(expected: ('Shard: slot ownership mismatch',))]
-    fn test_packed_wrong_offset_rejected() {
-        let mut world = setup_world();
-        let world_address = world.dispatcher.contract_address;
-        let caller = dojo_snf_test::get_default_caller_address();
-        let mock_verifier = register_mock_verifier(world_address);
-
-        let (sharding_addr, _) = world.dns(@"sharding_systems").unwrap();
-        let sharding = IShardingSystemsDispatcher { contract_address: sharding_addr };
-        let (actions_addr, _) = world.dns(@"actions").unwrap();
-        let actions = IActionsDispatcher { contract_address: actions_addr };
-
-        set_caller_address(caller);
-        sharding.register_policies();
-        actions.spawn();
-
-        let player_felt: felt252 = caller.into();
-        sharding.request_shard([player_felt].span());
-
-        let ns_hash = dojo::utils::bytearray_hash(@"ns");
-        let position_selector = Model::<Position>::selector(ns_hash);
-        let entity_id = entity_id_from_keys(@caller);
-
-        // Correct base slot but WRONG packed_offset (99 instead of 0)
-        // The recomputed key won't match → slot ownership mismatch
-        let packed_slot = compute_dojo_packed_slot(position_selector, entity_id);
-        let slot_entry = SlotEntry {
-            key: packed_slot, // key was computed with offset=0
-            value: 0,
-            model_selector: position_selector,
-            entity_id,
-            member_selector: 0,
-            initial_value: 0,
-            verification: SlotVerification::Deterministic(
-                DeterministicProof {
-                    key_derivation_chain: [].span(),
-                    packed_offset: 99, // WRONG — expected_key = base + 99 ≠ base + 0
-                },
-            ),
-        };
-
-        settle_as_owner(world_address, mock_verifier, 1, [slot_entry].span());
-    }
-
-    // ══════════════════════════════════════════════════════════════════
-    //  EDGE CASES: multi-entity, empty settle, double settle, end_shard
-    // ══════════════════════════════════════════════════════════════════
-
-    /// Multiple entities locked in a single shard — the realistic "battle" scenario.
-    /// Both entities are locked, both must be settled to unlock.
-    #[test]
-    fn test_multi_entity_shard_locks_and_settles_all() {
-        let mut world = setup_world();
-        let world_address = world.dispatcher.contract_address;
-        let alice = dojo_snf_test::get_default_caller_address();
-        let bob: ContractAddress = 0xb0b.try_into().unwrap();
-        let mock_verifier = register_mock_verifier(world_address);
-
-        let (sharding_addr, _) = world.dns(@"sharding_systems").unwrap();
-        let sharding = IShardingSystemsDispatcher { contract_address: sharding_addr };
-        let (actions_addr, _) = world.dns(@"actions").unwrap();
-        let actions = IActionsDispatcher { contract_address: actions_addr };
-
-        set_caller_address(alice);
-        sharding.register_policies();
-        actions.spawn(); // Alice: remaining=99
-        world.write_model_test(
-            @Moves { player: bob, remaining: 50, last_direction: Direction::None },
-        );
-
-        // Lock BOTH entities in one shard
-        let alice_felt: felt252 = alice.into();
-        let bob_felt: felt252 = bob.into();
-        sharding.request_shard([alice_felt, bob_felt].span());
-
-        let settlement = IShardingSettlementDispatcher { contract_address: world_address };
-        let alice_eid = entity_id_from_keys(@alice);
-        let bob_eid = entity_id_from_keys(@bob);
-
-        // Both locked in shard 1
-        assert(settlement.get_entity_shard(alice_eid) == 1, 'alice locked');
-        assert(settlement.get_entity_shard(bob_eid) == 1, 'bob locked');
-
-        // Both writes blocked
-        // (can't use should_panic for two checks, so verify via get_entity_shard)
-
-        // Settle both entities
-        let ns_hash = dojo::utils::bytearray_hash(@"ns");
-        let moves_sel = Model::<Moves>::selector(ns_hash);
-        let (sel_remaining, _) = moves_field_selectors();
-        let alice_slot = compute_dojo_field_slot(moves_sel, alice_eid, sel_remaining);
-        let bob_slot = compute_dojo_field_slot(moves_sel, bob_eid, sel_remaining);
-
-        settle_as_owner(
-            world_address,
-            mock_verifier,
-            1,
+            1, // shard_id = 1
             [
-                make_field_slot(alice_slot, 80, moves_sel, alice_eid, sel_remaining, 0),
-                make_field_slot(bob_slot, 30, moves_sel, bob_eid, sel_remaining, 0),
+                make_field_slot(alice_slot_remaining, 89, moves_selector, alice_entity, sel_remaining, 0),
+                make_field_slot(pool_slot_amount, 1050, token_selector, pool_entity, sel_amount, 1000),
             ]
                 .span(),
+            initial_proof_1,
         );
 
-        // Both unlocked and values updated
-        assert(settlement.get_entity_shard(alice_eid) == 0, 'alice unlocked');
-        assert(settlement.get_entity_shard(bob_eid) == 0, 'bob unlocked');
+        // After shard 1: pool = 1000 + (1050 - 1000) = 1050
+        let pool_after_1: MockToken = world.read_model(pool);
+        assert(pool_after_1.amount == 1050, 'shard1: 1000+50=1050');
+
+        // ── SETTLE SHARD 2 (Bob) ──
+        // Bob used 15 moves, shard awarded 75 tokens to the pool
+        let bob_entity = entity_id_from_keys(@bob);
+        let bob_slot_remaining = compute_dojo_field_slot(moves_selector, bob_entity, sel_remaining);
+
+        let initial_proof_2 = InitialProof {
+            keys: [pool_slot_amount].span(),
+            values: [1000].span(),
+            commitment: core::poseidon::poseidon_hash_span([pool_slot_amount, 1000].span()),
+            fork_state_root: 0x42,
+        };
+
+        settle_as_owner(
+            world_address,
+            2, // shard_id = 2
+            [
+                make_field_slot(bob_slot_remaining, 84, moves_selector, bob_entity, sel_remaining, 0),
+                make_field_slot(pool_slot_amount, 1075, token_selector, pool_entity, sel_amount, 1000),
+            ]
+                .span(),
+            initial_proof_2,
+        );
+
+        // ── VERIFY FINAL STATE ──
+        // Alice: 89 moves remaining
         let alice_moves: Moves = world.read_model(alice);
+        assert(alice_moves.remaining == 89, 'alice: 89 moves');
+
+        // Bob: 84 moves remaining
         let bob_moves: Moves = world.read_model(bob);
-        assert(alice_moves.remaining == 80, 'alice settled 80');
-        assert(bob_moves.remaining == 30, 'bob settled 30');
-    }
+        assert(bob_moves.remaining == 84, 'bob: 84 moves');
 
-    /// Settlement with zero slots still unlocks entities.
-    /// Scenario: shard gameplay resulted in no state changes.
-    #[test]
-    fn test_empty_settlement_unlocks_entities() {
-        let mut world = setup_world();
-        let world_address = world.dispatcher.contract_address;
-        let caller = dojo_snf_test::get_default_caller_address();
-        let mock_verifier = register_mock_verifier(world_address);
+        // Pool: 1050 (after shard 1) + (1075 - 1000) (shard 2 delta) = 1125
+        // Both shards' token rewards accumulated correctly via Add CRDT!
+        let pool_final: MockToken = world.read_model(pool);
+        assert(pool_final.amount == 1125, 'pool: 1050+75=1125');
 
-        let (sharding_addr, _) = world.dns(@"sharding_systems").unwrap();
-        let sharding = IShardingSystemsDispatcher { contract_address: sharding_addr };
-        let (actions_addr, _) = world.dns(@"actions").unwrap();
-        let actions = IActionsDispatcher { contract_address: actions_addr };
+        // All shards done
+        let active = settlement.get_active_shards();
+        assert(active.len() == 0, 'all shards settled');
 
-        set_caller_address(caller);
-        sharding.register_policies();
-        actions.spawn();
-
-        let player_felt: felt252 = caller.into();
-        sharding.request_shard([player_felt].span());
-
-        // Settle with ZERO slots — no state changes
-        settle_as_owner(world_address, mock_verifier, 1, [].span());
-
-        // Entity should still be unlocked
-        let settlement = IShardingSettlementDispatcher { contract_address: world_address };
-        let entity_id = entity_id_from_keys(@caller);
-        assert(settlement.get_entity_shard(entity_id) == 0, 'unlocked after empty');
-
-        // Original values preserved
-        let moves: Moves = world.read_model(caller);
-        assert(moves.remaining == 99, 'values unchanged');
-    }
-
-    /// Double-settling the same shard should fail — shard state is cleared after first settle.
-    #[test]
-    #[should_panic(expected: ('Shard: not found',))]
-    fn test_double_settle_same_shard_rejected() {
-        let mut world = setup_world();
-        let world_address = world.dispatcher.contract_address;
-        let caller = dojo_snf_test::get_default_caller_address();
-        let mock_verifier = register_mock_verifier(world_address);
-
-        let (sharding_addr, _) = world.dns(@"sharding_systems").unwrap();
-        let sharding = IShardingSystemsDispatcher { contract_address: sharding_addr };
-        let (actions_addr, _) = world.dns(@"actions").unwrap();
-        let actions = IActionsDispatcher { contract_address: actions_addr };
-
-        set_caller_address(caller);
-        sharding.register_policies();
-        actions.spawn();
-
-        let player_felt: felt252 = caller.into();
-        sharding.request_shard([player_felt].span());
-
-        // First settle succeeds
-        settle_as_owner(world_address, mock_verifier, 1, [].span());
-
-        // Second settle on same shard_id — shard state already cleared
-        settle_as_owner(world_address, mock_verifier, 1, [].span());
-    }
-
-    /// end_shard does NOT unlock entities — they stay locked until settle or cancel.
-    /// end_shard only emits ShardFinished event to signal the operator.
-    #[test]
-    #[should_panic(expected: ('Shard: entity locked',))]
-    fn test_end_shard_does_not_unlock() {
-        let mut world = setup_world();
-        let caller = dojo_snf_test::get_default_caller_address();
-
-        let (sharding_addr, _) = world.dns(@"sharding_systems").unwrap();
-        let sharding = IShardingSystemsDispatcher { contract_address: sharding_addr };
-        let (actions_addr, _) = world.dns(@"actions").unwrap();
-        let actions = IActionsDispatcher { contract_address: actions_addr };
-
-        set_caller_address(caller);
-        sharding.register_policies();
-        actions.spawn();
-
-        let player_felt: felt252 = caller.into();
-        sharding.request_shard([player_felt].span());
-
-        // end_shard signals the operator but does NOT unlock
-        sharding.end_shard(1);
-
-        // Entity is STILL locked — write panics
-        world.write_model_test(
-            @Moves { player: caller, remaining: 50, last_direction: Direction::None },
-        );
-    }
-
-    /// Read always works — even for locked entities.
-    #[test]
-    fn test_read_works_during_shard() {
-        let mut world = setup_world();
-        let caller = dojo_snf_test::get_default_caller_address();
-
-        let (sharding_addr, _) = world.dns(@"sharding_systems").unwrap();
-        let sharding = IShardingSystemsDispatcher { contract_address: sharding_addr };
-        let (actions_addr, _) = world.dns(@"actions").unwrap();
-        let actions = IActionsDispatcher { contract_address: actions_addr };
-
-        set_caller_address(caller);
-        sharding.register_policies();
-        actions.spawn();
-
-        let player_felt: felt252 = caller.into();
-        sharding.request_shard([player_felt].span());
-
-        // Read should work fine — only writes are blocked
-        let moves: Moves = world.read_model(caller);
-        assert(moves.remaining == 99, 'read works');
-        let pos: Position = world.read_model(caller);
-        assert(pos.vec.x == 10, 'read pos works');
+        // Both players can play again on mainnet
+        set_caller_address(alice);
+        actions.move(Direction::Up);
+        let after: Moves = world.read_model(alice);
+        assert(after.remaining == 88, 'alice: can move');
     }
 }

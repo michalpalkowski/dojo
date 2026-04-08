@@ -15,7 +15,7 @@ starknet = "2.13"
 
 armory = { path = "../game-lib/armory" }
 bestiary = { path = "../game-lib/bestiary" }
-dojo = { path = "../../crates/dojo/core" }
+dojo = { path = "../../crates/dojo/core", features = ["sharding", "dev"] }
 dojo_cairo_macros = { path = "../../crates/dojo/macros" }
 
 [dev-dependencies]
