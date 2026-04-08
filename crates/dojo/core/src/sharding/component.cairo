@@ -45,7 +45,7 @@ pub trait IContractComponent<TContractState> {
         model_selector: felt252,
     ) -> (felt252, Span<ShardField>);
 
-    /// Configure the sharding proxy address (event bus). One-shot.
+    /// Configure the sharding proxy address (event bus). Mutable when no active shards.
     fn set_sharding_proxy(ref self: TContractState, proxy: ContractAddress);
 
     /// Settle changed slots with StorageCommitment verification.
@@ -60,7 +60,7 @@ pub trait IContractComponent<TContractState> {
         initial_proof: super::request::InitialProof,
     );
 
-    /// Configure StorageCommitment verifier contract. One-shot.
+    /// Configure StorageCommitment verifier contract. Mutable when no active shards.
     fn set_storage_commitment_registry(ref self: TContractState, registry: ContractAddress);
 
     /// Cancel shard: unlock entities without applying changes.
@@ -120,7 +120,7 @@ pub mod sharding_component {
         next_shard_id: felt252,
         /// Address of StorageCommitment verifier (0 = not configured).
         storage_commitment_registry: ContractAddress,
-        /// Address of the sharding proxy contract (event bus). Set once by owner.
+        /// Address of the sharding proxy contract
         sharding_proxy: ContractAddress,
         /// Default CRDT variant for a model: model_selector → encoded CRDVariant (0=unset→SetLock, 1=Set, 2=Add, 3=Lock, 4=SetLock).
         model_default_crdt: Map<felt252, felt252>,
@@ -429,14 +429,14 @@ pub mod sharding_component {
         fn set_storage_commitment_registry(
             ref self: ComponentState<TContractState>, registry: ContractAddress,
         ) {
+            assert(self.active_shard_count.read() == 0, 'Shard: active shards exist');
             self.storage_commitment_registry.write(registry);
         }
 
         fn set_sharding_proxy(
             ref self: ComponentState<TContractState>, proxy: ContractAddress,
         ) {
-            let current = self.sharding_proxy.read();
-            assert(current == core::num::traits::Zero::zero(), 'Shard: proxy already set');
+            assert(self.active_shard_count.read() == 0, 'Shard: active shards exist');
             self.sharding_proxy.write(proxy);
         }
 
